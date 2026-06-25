@@ -1,0 +1,8 @@
+target/
+.ldgr/
+.researchcore/
+.pi/
+.claude/
+.codex/
+.env
+.DS_Store

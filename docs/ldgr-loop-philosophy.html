@@ -1,0 +1,371 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>LDGR: Durable Agent Loop Philosophy</title>
+  <style>
+    :root {
+      --bg: #0b1020;
+      --panel: rgba(255,255,255,.08);
+      --panel-strong: rgba(255,255,255,.13);
+      --text: #edf2ff;
+      --muted: #aeb9d8;
+      --line: rgba(255,255,255,.18);
+      --blue: #78a8ff;
+      --cyan: #5eead4;
+      --green: #9afc7f;
+      --yellow: #ffd166;
+      --pink: #ff7ab6;
+      --red: #ff6b6b;
+      --shadow: 0 30px 80px rgba(0,0,0,.35);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      color: var(--text);
+      background:
+        radial-gradient(circle at 15% 10%, rgba(120,168,255,.35), transparent 28rem),
+        radial-gradient(circle at 85% 20%, rgba(94,234,212,.22), transparent 22rem),
+        radial-gradient(circle at 60% 85%, rgba(255,122,182,.16), transparent 26rem),
+        var(--bg);
+      min-height: 100vh;
+    }
+
+    header {
+      padding: 72px 24px 36px;
+      text-align: center;
+    }
+
+    .eyebrow {
+      color: var(--cyan);
+      text-transform: uppercase;
+      letter-spacing: .16em;
+      font-size: .78rem;
+      font-weight: 800;
+    }
+
+    h1 {
+      margin: 14px auto;
+      max-width: 1040px;
+      font-size: clamp(2.25rem, 6vw, 5.4rem);
+      line-height: .95;
+      letter-spacing: -.06em;
+    }
+
+    .lead {
+      max-width: 900px;
+      margin: 0 auto;
+      color: var(--muted);
+      font-size: clamp(1.05rem, 2vw, 1.35rem);
+      line-height: 1.65;
+    }
+
+    main { max-width: 1180px; margin: 0 auto; padding: 24px; }
+
+    .grid { display: grid; gap: 18px; }
+    .two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    @media (max-width: 860px) { .two, .three { grid-template-columns: 1fr; } }
+
+    .card {
+      background: linear-gradient(180deg, var(--panel-strong), var(--panel));
+      border: 1px solid var(--line);
+      border-radius: 24px;
+      padding: 24px;
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(16px);
+    }
+
+    h2 { margin: 0 0 14px; font-size: 1.65rem; letter-spacing: -.03em; }
+    h3 { margin: 0 0 8px; font-size: 1.05rem; }
+    p { color: var(--muted); line-height: 1.65; }
+    ul { color: var(--muted); padding-left: 20px; line-height: 1.55; }
+    li { margin: 8px 0; }
+
+    .loop-stage {
+      position: relative;
+      min-height: 460px;
+      overflow: hidden;
+    }
+
+    .orbit {
+      position: absolute;
+      inset: 38px;
+      border: 1px dashed rgba(255,255,255,.26);
+      border-radius: 50%;
+      animation: spin 26s linear infinite;
+    }
+
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .center-ledger {
+      position: absolute;
+      inset: 50%;
+      transform: translate(-50%, -50%);
+      width: 210px;
+      height: 210px;
+      border-radius: 50%;
+      display: grid;
+      place-items: center;
+      text-align: center;
+      background: radial-gradient(circle, rgba(94,234,212,.28), rgba(120,168,255,.14));
+      border: 1px solid rgba(94,234,212,.45);
+      box-shadow: 0 0 60px rgba(94,234,212,.16);
+      padding: 24px;
+    }
+
+    .node {
+      position: absolute;
+      width: 170px;
+      min-height: 112px;
+      border-radius: 20px;
+      padding: 16px;
+      background: rgba(10,16,35,.78);
+      border: 1px solid var(--line);
+    }
+
+    .node b { display: block; margin-bottom: 6px; color: var(--text); }
+    .node span { color: var(--muted); font-size: .9rem; line-height: 1.4; }
+
+    .n1 { top: 16px; left: 50%; transform: translateX(-50%); border-color: var(--blue); }
+    .n2 { top: 130px; right: 24px; border-color: var(--cyan); }
+    .n3 { bottom: 24px; right: 150px; border-color: var(--green); }
+    .n4 { bottom: 24px; left: 150px; border-color: var(--yellow); }
+    .n5 { top: 130px; left: 24px; border-color: var(--pink); }
+
+    @media (max-width: 720px) {
+      .loop-stage { min-height: auto; }
+      .orbit, .center-ledger { display: none; }
+      .node { position: static; transform: none; width: auto; margin: 12px 0; }
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 8px 12px;
+      color: var(--muted);
+      background: rgba(255,255,255,.06);
+      margin: 4px;
+      font-size: .92rem;
+    }
+
+    .quote {
+      font-size: clamp(1.35rem, 3vw, 2.25rem);
+      line-height: 1.25;
+      color: var(--text);
+      letter-spacing: -.04em;
+      margin: 0;
+    }
+
+    .callout {
+      border-left: 5px solid var(--cyan);
+      background: rgba(94,234,212,.08);
+    }
+
+    .terminal {
+      background: rgba(0,0,0,.42);
+      border: 1px solid rgba(255,255,255,.15);
+      border-radius: 18px;
+      padding: 18px;
+      color: #d7ffe9;
+      overflow: auto;
+      font: 500 .92rem/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    .principle {
+      border-left: 3px solid var(--cyan);
+      padding-left: 16px;
+    }
+
+    .number {
+      width: 38px; height: 38px; border-radius: 50%;
+      display: grid; place-items: center;
+      background: rgba(120,168,255,.16);
+      border: 1px solid rgba(120,168,255,.45);
+      color: var(--blue);
+      font-weight: 900;
+      margin-bottom: 12px;
+    }
+
+    .bad h3 { color: var(--red); }
+    .good h3 { color: var(--green); }
+    .warning { border-color: rgba(255,209,102,.38); background: rgba(255,209,102,.08); }
+    .warning h2 { color: var(--yellow); }
+
+    footer { text-align: center; padding: 36px 24px 70px; color: var(--muted); }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="eyebrow">LDGR / ResearchCore</div>
+    <h1>A system for making agents do less, remember better, and prove what changed.</h1>
+    <p class="lead">
+      LDGR is a durable coordination layer for AI work. It keeps the model focused on bounded reasoning while
+      the ledger preserves state, evidence, decisions, unresolved issues, and the next concrete action.
+    </p>
+  </header>
+
+  <main class="grid">
+    <section class="card loop-stage" aria-label="LDGR loop visualization">
+      <div class="orbit"></div>
+      <div class="center-ledger">
+        <div>
+          <h2>Durable Ledger</h2>
+          <p>SQLite-backed project memory, not chat memory.</p>
+        </div>
+      </div>
+      <div class="node n1"><b>1. Work item</b><span>Define one bounded piece of work.</span></div>
+      <div class="node n2"><b>2. Run</b><span>Render context and hand it to an agent.</span></div>
+      <div class="node n3"><b>3. Observe</b><span>Record findings, tests, changes, and risks.</span></div>
+      <div class="node n4"><b>4. Attach</b><span>Preserve logs, reports, screenshots, outputs, and diffs.</span></div>
+      <div class="node n5"><b>5. Decide</b><span>Close, continue, split, hold, or queue next work.</span></div>
+    </section>
+
+    <section class="grid two">
+      <article class="card">
+        <h2>The problem LDGR is built around</h2>
+        <p>
+          LLMs are good at local reasoning, synthesis, and implementation. They are weak at maintaining durable
+          state across long tasks. When a task grows, the model starts carrying too much implicit context in its
+          own conversation.
+        </p>
+        <p>
+          That creates predictable failure modes: forgotten constraints, invented requirements, repeated investigation,
+          false completion, and optimizing for the wrong target.
+        </p>
+      </article>
+
+      <article class="card callout">
+        <p class="quote">The model should reason inside the task. It should not be trusted to be the task manager, memory store, judge, and historian at the same time.</p>
+      </article>
+    </section>
+
+    <section class="card">
+      <h2>Core belief</h2>
+      <p>
+        LDGR splits responsibility. The model can propose, inspect, implement, and explain. The system preserves
+        state, defines boundaries, records evidence, and forces continuation through explicit work items.
+      </p>
+      <p>
+        This matters because the most dangerous failures are quiet: an agent thinks it completed the assignment when
+        it only completed a convenient substitute, or it makes up constraints that disable itself, or it loses the
+        original reason a decision was made.
+      </p>
+    </section>
+
+    <section class="grid three">
+      <article class="card principle"><div class="number">1</div><h2>Bound the work</h2><p>Each run should complete one coherent work item. Not the whole project. Not a vague pile of progress.</p></article>
+      <article class="card principle"><div class="number">2</div><h2>Externalize memory</h2><p>Important facts, observations, artifacts, and decisions live outside model context so they survive restart and handoff.</p></article>
+      <article class="card principle"><div class="number">3</div><h2>Record evidence</h2><p>The system preserves what was observed and how it was validated. A claim without evidence is weak.</p></article>
+      <article class="card principle"><div class="number">4</div><h2>Separate discovery</h2><p>Agents should not rush into code just because code feels productive. When uncertainty is high, investigation is the work.</p></article>
+      <article class="card principle"><div class="number">5</div><h2>Leave a next step</h2><p>A completed run should either close the larger objective or create the next actionable work item.</p></article>
+      <article class="card principle"><div class="number">∞</div><h2>Repeat safely</h2><p>`--max-iterations` lets the loop continue, but interventions, failures, unfinished work, and no-pending-work gates stop drift.</p></article>
+    </section>
+
+    <section class="grid two">
+      <article class="card bad">
+        <h2>What LDGR is deliberately not</h2>
+        <h3>Not this</h3>
+        <ul>
+          <li>A giant prompt that tries to control everything.</li>
+          <li>A benchmark-specific hack that only works once.</li>
+          <li>A fully autonomous agent trusted to decide its own rules.</li>
+          <li>A replacement for human judgment.</li>
+          <li>A system where model-generated summaries become unquestioned truth.</li>
+        </ul>
+      </article>
+      <article class="card good">
+        <h2>&nbsp;</h2>
+        <h3>But this</h3>
+        <ul>
+          <li>A small durable structure around agent work.</li>
+          <li>A loop for reducing uncertainty before acting.</li>
+          <li>A provenance layer for what happened and why.</li>
+          <li>A way to keep progress moving across long tasks.</li>
+          <li>A guardrail against drift, false completion, and context collapse.</li>
+        </ul>
+      </article>
+    </section>
+
+    <section class="grid two">
+      <article class="card">
+        <h2>Typical command flow</h2>
+        <pre class="terminal"><code>ldgr init
+
+ldgr notice add --kind observation \
+  --body "Build a durable, testable feature."
+
+ldgr work create first-slice \
+  --title "First slice" \
+  --description "Small bounded task."
+
+ldgr loop run \
+  --prompt prompts/loop-prompt.md \
+  --agent-argv '["codex", "exec", "..."]' \
+  --max-iterations 10 \
+  --stream-agent-output
+
+ldgr decision record first-slice \
+  --outcome continue \
+  --rationale "Done; next gap found." \
+  --next-slug next-slice \
+  --next-title "Next slice" \
+  --next-description "Follow-up task."</code></pre>
+      </article>
+
+      <article class="card">
+        <h2>Why evidence can be submitted from anywhere</h2>
+        <p>
+          LDGR-generated loop artifacts go under `.ldgr/artifacts`. When you submit an external report, screenshot,
+          log, dataset, generated file, or output, LDGR records a managed copy under the artifact root so the evidence
+          remains durable and safely served by the cockpit.
+        </p>
+        <div>
+          <span class="pill">work items</span>
+          <span class="pill">runs</span>
+          <span class="pill">observations</span>
+          <span class="pill">managed artifacts</span>
+          <span class="pill">decisions</span>
+          <span class="pill">issues</span>
+          <span class="pill">interventions</span>
+        </div>
+      </article>
+    </section>
+
+    <section class="card warning">
+      <h2>The failure LDGR is specifically trying to avoid</h2>
+      <p>
+        The biggest trap is treating model output as authoritative state. A model can summarize incorrectly, invent
+        rules, overweight recent context, or silently mutate the goal. If those outputs are fed back into the system as
+        unquestioned instructions, the system starts enforcing hallucinations.
+      </p>
+      <p>
+        LDGR’s answer is to make state explicit, inspectable, and tied to evidence. The structure makes it clear what is
+        an observation, what is a decision, what is an artifact, what is an unresolved issue, and what is merely a proposed
+        next step.
+      </p>
+    </section>
+
+    <section class="card">
+      <p class="quote">
+        LDGR is not trying to make agents magical. It is trying to make their work accountable.
+      </p>
+      <p>
+        Most organizations do not need magical AI autonomy. They need reliable, inspectable work automation. The value is
+        that an agent can do one bounded thing, prove what happened, and hand off the next thing cleanly.
+      </p>
+    </section>
+  </main>
+
+  <footer>
+    Prepared as a partner-facing explanation of the LDGR system philosophy.
+  </footer>
+</body>
+</html>

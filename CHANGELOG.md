@@ -1,0 +1,35 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/).
+
+## [Unreleased]
+
+## [0.1.0] - 2026-06-11
+
+Initial open-source release.
+
+### Added
+
+- Durable SQLite ledger of work items, runs, observations, artifacts,
+  decisions, global notices, prompt records, prompt bundles, validation records,
+  event logs, and loop interventions.
+- Core bounded loop runtime (`ldgr loop run`) with the built-in `codex` preset,
+  custom `--agent-argv` processes, dry runs, streamed output, prompt provenance,
+  and adjustable agent timeouts.
+- Web cockpit (`ldgr web`) with live dashboard, context/artifact viewer, loop
+  controls, conduct wave visibility, and token-gated mutating routes.
+- Core CLI workflow for init, work, runs, observations, artifacts, decisions,
+  validation records, notices, context, status, prompts, bundles, loop control,
+  and audit/status rendering.
+- Bundled SQLite schema version 1 for the production core ledger shape.
+
+### Changed
+
+- Research/readiness surfaces such as facts, expectations, failures, blockers,
+  milestones, tools, skills, chat, profiles, coverage, and evidence live outside
+  this crate in the research/adapter layer.
+- OpenAI-compatible REST agent integration is no longer part of `ldgr-core`; use
+  `--agent-argv` to run agentctl or another external agent process.

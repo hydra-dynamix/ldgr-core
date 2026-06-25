@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LDGR Operations Cockpit</title>
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar" aria-label="Primary">
+      <div class="brand">
+        <span class="brand-mark">ldgr</span>
+        <span id="project-label" class="brand-subtitle">Operations cockpit</span>
+      </div>
+      <nav class="primary-nav">
+        <button type="button" class="nav-button active" data-action="set-view" data-view="current">Current</button>
+        <button type="button" class="nav-button" data-action="set-view" data-view="decisions">Decisions</button>
+        <button type="button" class="nav-button" data-action="set-view" data-view="artifacts">Artifacts</button>
+        <button type="button" class="nav-button" data-action="set-view" data-view="waves">Waves</button>
+        <button type="button" class="nav-button" data-action="set-inspector" data-inspector="runs">Runs</button>
+      </nav>
+      <details class="nav-controls" id="operator-controls-details">
+        <summary>
+          <span>Operator controls</span>
+          <span id="control-count" class="pill compact">0</span>
+        </summary>
+        <div id="operator-controls"></div>
+      </details>
+    </aside>
+
+    <main class="workspace">
+      <header class="status-band" aria-label="Current LDGR status">
+        <div class="status-title">
+          <span id="loop-state-dot" class="state-dot"></span>
+          <div>
+            <h1>Operations cockpit</h1>
+            <p id="status-summary">Loading LDGR state...</p>
+          </div>
+        </div>
+        <div id="status-strip" class="status-strip"></div>
+      </header>
+
+      <section id="view-current" class="view active-view" aria-labelledby="current-heading">
+        <div class="view-heading">
+          <div>
+            <p class="eyebrow">Where are we?</p>
+            <h2 id="current-heading">Current State</h2>
+          </div>
+          <span id="last-refresh" class="pill">Loading...</span>
+        </div>
+        <div class="current-grid cockpit-grid">
+          <section class="main-stack state-stack" aria-label="Current state fields">
+            <article class="panel selectable-panel" data-action="set-inspector" data-inspector="next-work" tabindex="0">
+              <div class="panel-head">
+                <h3>Next Work</h3>
+                <span id="next-work-state" class="panel-stat">none</span>
+              </div>
+              <div id="next-work"></div>
+            </article>
+            <article class="panel selectable-panel" data-action="set-inspector" data-inspector="active-run" tabindex="0">
+              <div class="panel-head">
+                <h3>Active Run</h3>
+                <span id="active-run-state" class="panel-stat">none</span>
+              </div>
+              <div id="active-run"></div>
+            </article>
+            <article class="panel selectable-panel" data-action="set-inspector" data-inspector="latest-observation" tabindex="0">
+              <div class="panel-head">
+                <h3>Latest Observation</h3>
+              </div>
+              <div id="latest-observation"></div>
+            </article>
+            <article class="panel selectable-panel" data-action="set-inspector" data-inspector="recent-decision" tabindex="0">
+              <div class="panel-head">
+                <h3>Recent Decision</h3>
+              </div>
+              <div id="recent-decision"></div>
+            </article>
+          </section>
+          <aside class="inspector-stack current-inspector" aria-label="Inspector">
+            <article class="panel inspector-panel">
+              <div class="panel-head">
+                <h3 id="inspector-heading">Inspector</h3>
+                <span id="inspector-state" class="pill compact">current</span>
+              </div>
+              <div id="current-inspector-body"></div>
+            </article>
+          </aside>
+        </div>
+      </section>
+
+      <section id="view-decisions" class="view" aria-labelledby="decisions-heading">
+        <div class="view-heading">
+          <div>
+            <p class="eyebrow">Why are we here?</p>
+            <h2 id="decisions-heading">Decision Trail</h2>
+          </div>
+          <div class="toolbar">
+            <input id="decision-filter" type="search" placeholder="Filter work, outcome, rationale">
+          </div>
+        </div>
+        <div id="decision-trail" class="ledger-list"></div>
+      </section>
+
+      <section id="view-artifacts" class="view" aria-labelledby="artifacts-heading">
+        <div class="view-heading">
+          <div>
+            <p class="eyebrow">What should I inspect?</p>
+            <h2 id="artifacts-heading">Artifact Reader</h2>
+          </div>
+          <div class="toolbar">
+            <input id="artifact-search" type="search" placeholder="Search artifacts and content">
+          </div>
+        </div>
+        <div class="artifact-reader-layout">
+          <div id="artifact-list" class="artifact-list"></div>
+          <article class="panel reader-panel">
+            <div class="panel-head">
+              <h3 id="reader-title">Artifact Reader</h3>
+              <a id="reader-raw-link" class="text-link" href="#" hidden>Raw</a>
+            </div>
+            <div id="artifact-reader"><p class="muted">Select an artifact to inspect durable context.</p></div>
+          </article>
+        </div>
+      </section>
+
+      <section id="view-waves" class="view" aria-labelledby="waves-heading">
+        <div class="view-heading">
+          <div>
+            <p class="eyebrow">What are the conduct workers doing?</p>
+            <h2 id="waves-heading">Wave Management</h2>
+          </div>
+          <span class="pill">read-only</span>
+        </div>
+        <div id="wave-management" class="wave-management"><p class="muted">Loading conduct wave state...</p></div>
+      </section>
+
+      <section class="panel detail-panel" id="detail-panel">
+        <div class="panel-head">
+          <h3>Detail log</h3>
+          <a href="/logs" class="text-link">Open durable log</a>
+        </div>
+        <div id="detail-log"><pre>Select an artifact, work item, run, or log route.</pre></div>
+      </section>
+    </main>
+  </div>
+  <script src="/app.js"></script>
+</body>
+</html>
