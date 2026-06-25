@@ -160,7 +160,7 @@ You can inspect the current handoff at any time with `ldgr status` or
 
 ## License
 
-Licensed under the [Apache License, Version 2.0](LICENSE-APACHE).
+Licensed under the [Apache License, Version 2.0](LICENSE).
 
 Unless you explicitly state otherwise, any contribution intentionally submitted
 for inclusion in this work by you, as defined in the Apache-2.0 license, shall
