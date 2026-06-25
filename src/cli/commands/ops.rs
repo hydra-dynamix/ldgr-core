@@ -270,8 +270,8 @@ fn resolve_loop_agent(args: &LoopRunArgs) -> anyhow::Result<LoopAgent> {
         }
         return Ok(LoopAgent::Argv(parse_argv_json(agent_argv)?));
     }
-    match args.agent.unwrap_or(CliLoopAgent::Codex) {
-        CliLoopAgent::Codex => Ok(LoopAgent::Codex),
+    match args.agent.unwrap_or(CliLoopAgent::Agentctl) {
+        CliLoopAgent::Agentctl => Ok(LoopAgent::Agentctl),
     }
 }
 

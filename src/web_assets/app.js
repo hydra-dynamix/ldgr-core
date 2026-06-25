@@ -129,10 +129,10 @@ function controlDraft() {
     promptSlug: $('loop-prompt-slug') ? $('loop-prompt-slug').value : '',
     bundle: $('loop-bundle') ? $('loop-bundle').value : '',
     promptRole: $('loop-prompt-role') ? $('loop-prompt-role').value : '',
-    agent: $('loop-agent') ? $('loop-agent').value : 'codex',
+    agent: $('loop-agent') ? $('loop-agent').value : 'agentctl',
     agentArgv: $('loop-agent-argv') ? $('loop-agent-argv').value : '',
     agentTimeoutSeconds: $('loop-agent-timeout-seconds') ? $('loop-agent-timeout-seconds').value : '43200',
-    auditArgv: $('loop-audit-argv') ? $('loop-audit-argv').value : '["codex","exec","--sandbox","workspace-write"]',
+    auditArgv: $('loop-audit-argv') ? $('loop-audit-argv').value : '["agentctl","run"]',
     dryRun: $('loop-dry-run') ? $('loop-dry-run').checked : false,
     streamAgentOutput: $('loop-stream-agent-output') ? $('loop-stream-agent-output').checked : false,
     maxIterations: $('loop-max-iterations') ? $('loop-max-iterations').value : '1',
@@ -605,8 +605,8 @@ function renderLoopStart(draft, dryRunChecked, projectCompleteChecked) {
     <label for="loop-prompt-slug">Prompt slug</label><input id="loop-prompt-slug" value="${esc(draft.promptSlug)}">
     <label for="loop-bundle">Bundle slug</label><input id="loop-bundle" value="${esc(draft.bundle)}">
     <label for="loop-prompt-role">Bundle prompt role</label><input id="loop-prompt-role" value="${esc(draft.promptRole)}">
-    <label for="loop-agent">Agent</label><select id="loop-agent"><option value="codex"${draft.agent === 'codex' ? ' selected' : ''}>codex</option></select>
-    <label for="loop-agent-argv">Agent argv JSON</label><textarea id="loop-agent-argv" placeholder='optional, e.g. ["agentctl","run"]'>${esc(draft.agentArgv)}</textarea>
+    <label for="loop-agent">Agent</label><select id="loop-agent"><option value="agentctl"${draft.agent === 'agentctl' ? ' selected' : ''}>agentctl</option></select>
+    <label for="loop-agent-argv">Agent argv JSON</label><textarea id="loop-agent-argv" placeholder='optional, e.g. ["my-agent"]'>${esc(draft.agentArgv)}</textarea>
     <label for="loop-agent-timeout-seconds">Agent timeout seconds</label><input id="loop-agent-timeout-seconds" type="number" min="1" step="1" value="${esc(draft.agentTimeoutSeconds)}">
     <label for="loop-audit-argv">Audit argv JSON</label><textarea id="loop-audit-argv">${esc(draft.auditArgv)}</textarea>
     <label for="loop-max-iterations">Max iterations</label><input id="loop-max-iterations" type="number" min="1" step="1" value="${esc(draft.maxIterations)}">

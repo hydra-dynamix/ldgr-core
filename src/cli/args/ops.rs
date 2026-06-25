@@ -65,7 +65,7 @@ pub struct WebArgs {
 
 #[derive(Debug, Args)]
 #[command(
-    after_help = "Examples:\n  ldgr loop run --prompt prompts/loop-prompt.md --agent codex\n  ldgr loop run --prompt prompts/loop-prompt.md --dry-run\n  ldgr loop run --prompt prompts/loop-prompt.md --agent-argv '[\"my-agent\"]'\n\nLoop run executes one or more bounded cycles from the next pending work item."
+    after_help = "Examples:\n  ldgr loop run --prompt prompts/loop-prompt.md --agent agentctl\n  ldgr loop run --prompt prompts/loop-prompt.md --dry-run\n  ldgr loop run --prompt prompts/loop-prompt.md --agent-argv '[\"my-agent\"]'\n\nLoop run executes one or more bounded cycles from the next pending work item."
 )]
 pub struct LoopArgs {
     #[command(subcommand)]
@@ -96,7 +96,7 @@ pub struct LoopRunArgs {
     #[arg(long, requires = "bundle")]
     pub prompt_role: Option<String>,
 
-    /// Built-in agent preset. Values: codex. Use --agent-argv for other agents.
+    /// Built-in agent preset. Values: agentctl. Use --agent-argv for custom commands.
     #[arg(long, value_enum)]
     pub agent: Option<CliLoopAgent>,
 
@@ -131,5 +131,5 @@ pub struct LoopRunArgs {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum CliLoopAgent {
-    Codex,
+    Agentctl,
 }

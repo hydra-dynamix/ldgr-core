@@ -73,11 +73,10 @@ cycles; the loop stops early when work is blocked, no pending work remains, or a
 subprocess fails.
 
 ```sh
-ldgr loop run --prompt prompts/loop-prompt.md --agent codex       # pipe prompt file to codex
-ldgr loop run --prompt-slug surface --agent codex          # use an active stored prompt
+ldgr loop run --prompt prompts/loop-prompt.md --agent agentctl    # pipe prompt file to agentctl
+ldgr loop run --prompt-slug surface --agent agentctl       # use an active stored prompt
 ldgr loop run --bundle cleanroom --prompt-role surface-loop # use a sealed bundle
-ldgr loop run --prompt prompts/loop-prompt.md --agent-argv '["agentctl","run"]' # any command that reads the prompt on stdin
-ldgr loop run --prompt prompts/loop-prompt.md --agent-argv '["my-agent"]'
+ldgr loop run --prompt prompts/loop-prompt.md --agent-argv '["my-agent"]' # any command that reads the prompt on stdin
 ldgr loop run --prompt prompts/loop-prompt.md --dry-run            # render artifacts without spawning anything
 ```
 

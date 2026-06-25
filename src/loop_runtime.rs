@@ -39,7 +39,7 @@ pub struct LoopRuntimeOptions {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LoopAgent {
     Argv(Vec<String>),
-    Codex,
+    Agentctl,
     DryRun,
 }
 
@@ -59,7 +59,7 @@ impl LoopAgent {
     pub fn command_label(&self) -> String {
         match self {
             Self::Argv(argv) => render_command(argv),
-            Self::Codex => "codex".to_owned(),
+            Self::Agentctl => "agentctl".to_owned(),
             Self::DryRun => "dry-run".to_owned(),
         }
     }
@@ -311,8 +311,8 @@ fn run_loop_after_start(
             process_output_paths(artifact_root, run_id, "agent")?,
             options.agent_timeout,
         )?,
-        LoopAgent::Codex => {
-            let argv = default_codex_argv();
+        LoopAgent::Agentctl => {
+            let argv = default_agentctl_argv();
             run_process_with_stdin(
                 &argv,
                 &rendered_prompt,
@@ -502,7 +502,7 @@ pub fn render_prompt_document(
 ) -> anyhow::Result<String> {
     let job_complete_policy = "Job completion policy: complete exactly one bounded work item, queue concrete follow-up LDGR work when gaps are found, ensure a pending next task exists unless no useful work remains, and never self-certify whole-project completion.";
     let audit_instruction = if project_complete_requested {
-        "Project completion was requested. A fresh external Codex audit must inspect mocked/incomplete code, maintainability, quality, tests, edge cases, complexity, smells, and risks. Act on findings and decompose extensive findings into queued LDGR work."
+        "Project completion was requested. A fresh external audit must inspect mocked/incomplete code, maintainability, quality, tests, edge cases, complexity, smells, and risks. Act on findings and decompose extensive findings into queued LDGR work."
     } else {
         "Project completion was not requested. Do not claim whole-project completion; focus on the next bounded LDGR work item."
     };
@@ -573,7 +573,7 @@ fn append_steering_section(
 
 fn render_completion_audit_prompt(rendered_prompt: &str) -> String {
     format!(
-        "You are a fresh Codex audit process for LDGR project completion. Inspect for mocked or incomplete code, maintainability, code quality, test coverage, edge cases, complexity, code smells, and other risks. Produce concrete findings and recommended queued work; do not certify completion unless no material risks remain.\n\nOriginal loop prompt:\n\n{rendered_prompt}"
+        "You are a fresh external audit process for LDGR project completion. Inspect for mocked or incomplete code, maintainability, code quality, test coverage, edge cases, complexity, code smells, and other risks. Produce concrete findings and recommended queued work; do not certify completion unless no material risks remain.\n\nOriginal loop prompt:\n\n{rendered_prompt}"
     )
 }
 
@@ -632,19 +632,14 @@ impl ProcessCapture {
     }
 }
 
-fn default_codex_argv() -> Vec<String> {
-    vec![
-        "codex".to_owned(),
-        "exec".to_owned(),
-        "--sandbox".to_owned(),
-        "workspace-write".to_owned(),
-    ]
+fn default_agentctl_argv() -> Vec<String> {
+    vec!["agentctl".to_owned(), "run".to_owned()]
 }
 
 fn agent_output_argv(agent: &LoopAgent) -> Vec<String> {
     match agent {
         LoopAgent::Argv(argv) => argv.clone(),
-        LoopAgent::Codex => default_codex_argv(),
+        LoopAgent::Agentctl => default_agentctl_argv(),
         LoopAgent::DryRun => Vec::new(),
     }
 }

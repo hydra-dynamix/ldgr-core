@@ -581,9 +581,9 @@ fn serve_loop_start(
     let stream_agent_output = optional_form_value(form, "stream_agent_output") == Some("true");
     let project_complete_requested =
         optional_form_value(form, "project_complete_requested") == Some("true");
-    let agent = optional_nonempty_form_value(form, "agent").unwrap_or("codex");
-    if agent != "codex" {
-        bail!("agent must be codex; use agent_argv for custom agents");
+    let agent = optional_nonempty_form_value(form, "agent").unwrap_or("agentctl");
+    if agent != "agentctl" {
+        bail!("agent must be agentctl; use agent_argv for custom agents");
     }
     let agent_argv = optional_nonempty_form_value(form, "agent_argv");
     if agent_argv.is_some() && optional_nonempty_form_value(form, "agent").is_some() {

@@ -32,7 +32,7 @@ pub(crate) const CLI_DEFAULT_HELP_SECTIONS: &str = r#"Core loop:
   context
 
 Autonomous loop:
-  loop run --prompt prompts/loop-prompt.md --agent codex
+  loop run --prompt prompts/loop-prompt.md --agent agentctl
 
 Default help shows the day-one workflow. Run `ldgr --full` for the core command map.
 "#;
