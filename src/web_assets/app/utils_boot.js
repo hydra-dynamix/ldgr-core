@@ -46,12 +46,14 @@ function artifactName(path) {
   return parts[parts.length - 1] || text(path);
 }
 
-function setView(view) {
+function setView(view, options = {}) {
   currentView = view;
   document.querySelectorAll('.nav-button').forEach(button => button.classList.toggle('active', button.dataset.view === view));
+  document.querySelectorAll('.nav-section').forEach(section => section.classList.toggle('active', section.querySelector(`[data-view="${view}"]`) != null || (view === 'current' && section.querySelector('[data-inspector]') != null)));
   document.querySelectorAll('.view').forEach(section => section.classList.toggle('active-view', section.id === `view-${view}`));
   if (location.pathname === '/' || location.pathname === '/index.html') $('detail-panel').classList.remove('visible');
-  if (location.hash !== `#${view}`) history.replaceState(null, '', `#${view}`);
+  if (options.updateHash !== false && location.hash !== `#${view}` && (location.pathname === '/' || location.pathname === '/index.html')) history.replaceState(null, '', `#${view}`);
+  if (options.scroll !== false) window.scrollTo({top: 0, behavior: 'smooth'});
   if (view === 'waves') {
     renderWaveManagement(lastConduct || {available: false, message: 'Loading conduct wave state...', batches: [], feeds: []});
     loadConduct();
@@ -60,7 +62,7 @@ function setView(view) {
 
 function initialViewFromHash() {
   const candidate = location.hash.replace('#', '');
-  return ['current', 'decisions', 'artifacts', 'waves'].includes(candidate) ? candidate : 'current';
+  return ['current', 'decisions', 'artifacts', 'waves', 'controls'].includes(candidate) ? candidate : 'current';
 }
 
 function renderMissionLog() {
@@ -95,7 +97,10 @@ async function renderRoute() {
   if (path === '/logs') return detailJson('/api/logs', 'Durable event log');
   if (path.startsWith('/runs/')) return detailJson('/api/runs/' + encodedRouteSegment('/runs/'), 'Run detail');
   if (path.startsWith('/work/')) return detailJson('/api/work/' + encodedRouteSegment('/work/'), 'Work item detail');
-  if (path.startsWith('/artifacts/')) return openArtifact(encodedRouteSegment('/artifacts/'), {showDetail: true});
+  if (path.startsWith('/artifacts/')) {
+    setView('artifacts', {updateHash: false, scroll: false});
+    return openArtifact(encodedRouteSegment('/artifacts/'), {showDetail: true, replaceHistory: false});
+  }
 }
 
 async function detailJson(url, title) {
@@ -115,9 +120,17 @@ document.addEventListener('click', event => {
   else if (action === 'set-inspector') setInspector(button.dataset.inspector);
   else if (action === 'select-artifact' || action === 'open-artifact') {
     setView('artifacts');
-    openArtifact(button.dataset.artifactId, {replaceHistory: false});
+    openArtifact(button.dataset.artifactId);
+  } else if (action === 'open-run-detail') {
+    setInspector('runs');
+    history.replaceState(null, '', `/runs/${route(button.dataset.runId)}`);
+    renderRoute();
   } else if (action === 'set-mission-filter') {
+    decisionFilterTerm = button.dataset.filter || '';
+    const filter = $('decision-filter');
+    if (filter) filter.value = decisionFilterTerm;
     setView('decisions');
+    renderDecisionTrail(lastMissionLog || {entries: []});
   } else if (action === 'request-intervention') requestIntervention(button.dataset.intervention);
   else if (action === 'start-loop') startLoop();
   else if (action === 'clear-intervention') clearIntervention(button.dataset.interventionId);
@@ -137,6 +150,6 @@ updateSearch('decision-filter', value => { decisionFilterTerm = value; });
 load().catch(error => {
   $('status-summary').innerHTML = '<span class="muted">Failed to load cockpit: ' + esc(error) + '</span>';
 });
-setView(currentView);
+setView(currentView, {scroll: false});
 window.addEventListener('hashchange', () => setView(initialViewFromHash()));
 setInterval(load, 5000);

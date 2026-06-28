@@ -100,6 +100,70 @@ code {
   gap: 8px;
 }
 
+.nav-section {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.02);
+  overflow: hidden;
+}
+
+.nav-section > summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-weight: 800;
+  padding: 11px 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-size: 11px;
+}
+
+.nav-section.active > summary,
+.nav-section > summary:hover {
+  background: rgba(96, 165, 250, 0.08);
+  color: var(--text);
+}
+
+.nav-section-items {
+  display: grid;
+  gap: 6px;
+  padding: 0 8px 10px;
+}
+
+.nav-subitem {
+  width: 100%;
+  border: 0;
+  border-radius: 9px;
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+  display: grid;
+  gap: 2px;
+  padding: 8px;
+  text-align: left;
+}
+
+.nav-subitem:hover {
+  background: rgba(148, 163, 184, 0.08);
+}
+
+.nav-subitem strong,
+.nav-subitem span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.nav-subitem span,
+.nav-empty {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.nav-empty {
+  margin: 0;
+  padding: 8px;
+}
+
 .compat-labels {
   position: absolute;
   width: 1px;
@@ -250,6 +314,19 @@ h4 {
   padding: 12px;
 }
 
+button.status-cell {
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+}
+
+button.status-cell:hover,
+button.status-cell:focus {
+  border-color: rgba(96, 165, 250, 0.65);
+  outline: none;
+}
+
 .status-cell span,
 .now-label,
 .panel-stat,
@@ -306,6 +383,15 @@ h4 {
   gap: 18px;
 }
 
+.inspector-centered {
+  display: block;
+}
+
+.inspector-centered .current-inspector {
+  max-width: 80ch;
+  margin: 0 auto;
+}
+
 .cockpit-grid {
   align-items: start;
 }
@@ -330,6 +416,29 @@ h4 {
 .inspector-panel {
   position: sticky;
   top: 28px;
+}
+
+.readable-panel,
+.ledger-list,
+.reader-panel,
+.detail-panel,
+.markdown-reader,
+.decision-card,
+.inspector-panel,
+.feed-card pre,
+pre {
+  max-width: 80ch;
+}
+
+.readable-panel p,
+.decision-body p,
+.inspector-panel p,
+.markdown-reader p,
+.context-line,
+.timeline-row p,
+.compact-record p,
+.worker-card p {
+  max-width: 80ch;
 }
 
 .inspector-section + .inspector-section {
@@ -627,8 +736,9 @@ textarea {
 
 .artifact-reader-layout {
   display: grid;
-  grid-template-columns: 340px minmax(0, 1fr);
+  grid-template-columns: 340px minmax(0, 80ch);
   gap: 18px;
+  align-items: start;
 }
 
 .artifact-list {

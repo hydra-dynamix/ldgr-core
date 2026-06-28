@@ -915,13 +915,13 @@ fn hex_value(byte: u8) -> anyhow::Result<u8> {
 }
 
 fn serve_conduct_waves(stream: &mut TcpStream, db_path: &Path) -> anyhow::Result<()> {
-    let root = std::env::current_dir()?.join(".ldgr-conduct");
+    let root = std::env::current_dir()?.join(".ldgr/.conduct");
     if !root.is_dir() {
         return write_json(
             stream,
             &serde_json::json!({
                 "available": false,
-                "message": ".ldgr-conduct directory not found",
+                "message": ".ldgr/.conduct directory not found",
                 "batches": [],
                 "feeds": []
             }),

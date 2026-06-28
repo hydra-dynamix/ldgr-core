@@ -139,12 +139,39 @@ requires `--unsafe-expose` together with an explicit `--control-token`.
 The `ldgr-core` crate also exposes Rust modules for applications that want to
 build on the same ledger:
 
+- `adapter_manifest` for public adapter manifest parsing and validation,
+  including optional command namespace declarations.
 - `store` for the SQLite-backed work, run, observation, artifact, decision,
   prompt, notice, event, and context records.
 - `loop_runtime` for bounded autonomous loop execution.
 - `cli` for the command runner used by the `ldgr` binary.
 - `web` for the local cockpit server.
 - `tool_runner` for command rendering and argv parsing helpers.
+
+### Adapter command manifests
+
+Open adapter manifests may omit command extensions. When an adapter wants core
+to expose an adapter-owned command namespace, declare one or more `[[commands]]`
+tables:
+
+```toml
+[[commands]]
+namespace = "community-sample"
+argv = ["community-sample"]
+aliases = ["sample", "community"]
+title = "Community sample commands"
+description = "Commands exposed through the core LDGR command surface."
+capabilities = ["dispatch", "help"]
+
+[commands.help]
+usage = "ldgr community-sample <command> [options]"
+summary = "Run community sample adapter commands."
+details = "Arguments after the namespace are forwarded to the adapter executable."
+```
+
+`ldgr::adapter_manifest::parse_adapter_manifest` validates namespace syntax,
+duplicate command aliases, empty `argv`, and malformed command declarations with
+clear errors while preserving existing manifest digest behavior.
 
 ## Where data lives
 

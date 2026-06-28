@@ -4,10 +4,12 @@ pub(crate) mod render;
 
 use std::ffi::OsString;
 use std::path::PathBuf;
+use std::process::Command as ProcessCommand;
 
 use anyhow::bail;
 use clap::{error::ErrorKind, CommandFactory, Parser, Subcommand};
 
+use crate::adapter_registry::{AdapterCommandNamespace, AdapterRegistry};
 use crate::store::open_store;
 
 use args::*;
@@ -33,6 +35,11 @@ pub(crate) const CLI_DEFAULT_HELP_SECTIONS: &str = r#"Core loop:
 
 Autonomous loop:
   loop run --prompt prompts/loop-prompt.md --agent agentctl
+
+Adapters:
+  adapter list
+  adapter show <slug-or-alias>
+  <adapter-namespace> <args...>    # dynamically dispatched from installed adapter.toml
 
 Default help shows the day-one workflow. Run `ldgr --full` for the core command map.
 "#;
@@ -79,6 +86,10 @@ pub(crate) const CLI_FULL_HELP_SECTIONS: &str = r#"Core command tree:
   bundle
     create
     seal
+  adapter
+    list
+    show
+    dispatch
   notice
     list
     add
@@ -123,6 +134,8 @@ struct Cli {
 enum Command {
     /// Initialize local SQLite storage and print the on-ramp.
     Init,
+    /// Install LDGR harness integrations and record ~/.ldgr config.
+    Install(InstallArgs),
     /// Manage durable work items.
     Work(WorkArgs),
     /// Manage global observations and notifications for out-of-run steering.
@@ -149,6 +162,8 @@ enum Command {
     Web(WebArgs),
     /// Run the prompt-driven autonomous event loop runtime.
     Loop(LoopArgs),
+    /// Discover installed adapter manifests and command metadata.
+    Adapter(AdapterArgs),
     /// Print the next pending work item.
     Next,
 }
@@ -172,9 +187,16 @@ where
             ) =>
         {
             error.print()?;
+            if matches!(error.kind(), ErrorKind::DisplayHelp) {
+                print_dynamic_adapter_help();
+            }
             return Ok(());
         }
         Err(error) => {
+            if try_dispatch_adapter_namespace(&args)? {
+                return Ok(());
+            }
+            maybe_print_adapter_command_hint(&args);
             print_parse_error_with_help(error, args.into_iter().skip(1).collect())?;
             std::process::exit(2);
         }
@@ -194,10 +216,12 @@ fn handle_cli(cli: Cli) -> anyhow::Result<()> {
     let Some(command) = cli.command else {
         Cli::command().print_help()?;
         println!();
+        print_dynamic_adapter_help();
         return Ok(());
     };
     match command {
         Command::Init => commands::ops::handle_init(&cli.db, &cli.artifact_root),
+        Command::Install(args) => commands::ops::handle_install(args),
         Command::Work(args) => commands::work::handle_work(&open_store(&cli.db)?, args),
         Command::Notice(args) => commands::work::handle_notice(&open_store(&cli.db)?, args),
         Command::Run(args) => commands::runs::handle_run(&open_store(&cli.db)?, args),
@@ -217,7 +241,98 @@ fn handle_cli(cli: Cli) -> anyhow::Result<()> {
         Command::Loop(args) => {
             commands::ops::handle_loop(&open_store(&cli.db)?, &cli.artifact_root, args)
         }
+        Command::Adapter(args) => commands::adapters::handle_adapter(args),
         Command::Next => commands::work::handle_next(&open_store(&cli.db)?),
+    }
+}
+
+fn try_dispatch_adapter_namespace(args: &[OsString]) -> anyhow::Result<bool> {
+    let Some((namespace, remaining)) = first_command_token(args) else {
+        return Ok(false);
+    };
+    let registry = AdapterRegistry::discover();
+    let Some(command) = registry.resolve_namespace(&namespace) else {
+        return Ok(false);
+    };
+    dispatch_adapter_namespace(command, remaining)?;
+    Ok(true)
+}
+
+fn first_command_token(args: &[OsString]) -> Option<(String, Vec<OsString>)> {
+    let mut index = 1;
+    while index < args.len() {
+        let token = args[index].to_str()?;
+        if token == "--db" || token == "--artifact-root" {
+            index += 2;
+            continue;
+        }
+        if token.starts_with('-') {
+            index += 1;
+            continue;
+        }
+        return Some((
+            token.to_owned(),
+            args.iter().skip(index + 1).cloned().collect(),
+        ));
+    }
+    None
+}
+
+fn dispatch_adapter_namespace(
+    command: &AdapterCommandNamespace,
+    remaining: Vec<OsString>,
+) -> anyhow::Result<()> {
+    if command.argv.is_empty() {
+        bail!("adapter namespace `{}` has empty argv", command.namespace);
+    }
+    let mut process = ProcessCommand::new(&command.argv[0]);
+    process.args(&command.argv[1..]).args(remaining);
+    let status = process.status()?;
+    if !status.success() {
+        std::process::exit(status.code().unwrap_or(1));
+    }
+    Ok(())
+}
+
+fn print_dynamic_adapter_help() {
+    let registry = AdapterRegistry::discover();
+    if registry.adapters.is_empty() {
+        return;
+    }
+    println!();
+    println!("Installed adapter control surface:");
+    for adapter in &registry.adapters {
+        println!("  {} — {}", adapter.slug, adapter.title);
+        for namespace in &adapter.command_namespaces {
+            let description = namespace
+                .summary
+                .as_ref()
+                .or(namespace.description.as_ref())
+                .map(|text| format!(" — {text}"))
+                .unwrap_or_default();
+            println!("    ldgr {} <args...>{}", namespace.namespace, description);
+        }
+        for profile in &adapter.target_profiles {
+            println!("    profile {} — {}", profile.slug, profile.title);
+        }
+    }
+}
+
+fn maybe_print_adapter_command_hint(args: &[OsString]) {
+    let mut tokens = args.iter().skip(1);
+    while let Some(token) = tokens.next() {
+        let Some(token) = token.to_str() else {
+            return;
+        };
+        if token == "--db" || token == "--artifact-root" {
+            let _ = tokens.next();
+            continue;
+        }
+        if token.starts_with('-') {
+            continue;
+        }
+        commands::adapters::print_adapter_command_hint(token);
+        return;
     }
 }
 

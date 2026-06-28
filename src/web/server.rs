@@ -69,7 +69,9 @@ pub fn serve(
                 break;
             };
             if let Err(error) = handle_connection(stream, &db_path, &artifact_root, &options) {
-                eprintln!("web cockpit request failed: {error:#}");
+                if !is_broken_pipe_error(&error) {
+                    eprintln!("web cockpit request failed: {error:#}");
+                }
             }
         });
     }
@@ -92,6 +94,14 @@ pub fn serve(
         }
     }
     Ok(())
+}
+
+fn is_broken_pipe_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io_error| io_error.kind() == std::io::ErrorKind::BrokenPipe)
+    })
 }
 
 fn validate_exposure_options(host: &str, options: &WebOptions) -> anyhow::Result<()> {

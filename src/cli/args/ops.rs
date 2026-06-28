@@ -2,6 +2,55 @@ use std::path::PathBuf;
 
 use clap::{Args, Subcommand, ValueEnum};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum HarnessKind {
+    Pi,
+    Codex,
+    Claude,
+    Openclaw,
+}
+
+#[derive(Debug, Args)]
+#[command(
+    after_help = "Examples:\n  ldgr install\n  ldgr install --harness pi --harness claude --yes\n  ldgr install adapter code --yes\n\nWithout --harness, the installer asks interactively and defaults to Pi. Multiple harnesses may be selected. The selected harness config is recorded under ~/.ldgr/."
+)]
+pub struct InstallArgs {
+    #[command(subcommand)]
+    pub command: Option<InstallCommand>,
+
+    /// Harness to install LDGR integration into. Repeatable.
+    #[arg(long, value_enum)]
+    pub harness: Vec<HarnessKind>,
+
+    /// Accept defaults and do not prompt. Defaults to Pi when --harness is omitted.
+    #[arg(long)]
+    pub yes: bool,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum InstallCommand {
+    /// Install an open-source adapter bundle into ~/.ldgr/<adapter>.
+    Adapter(InstallAdapterArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct InstallAdapterArgs {
+    /// Adapter name, e.g. code, bench, explore, research, security, example.
+    pub name: String,
+
+    /// Source checkout root containing adapter crates. Defaults to the current directory or an ancestor.
+    #[arg(long)]
+    pub source_root: Option<PathBuf>,
+
+    /// Exact install directory. Defaults to ~/.ldgr/<adapter>.
+    #[arg(long)]
+    pub install_root: Option<PathBuf>,
+
+    /// Accept defaults and do not prompt.
+    #[arg(long)]
+    pub yes: bool,
+}
+
 #[derive(Debug, Args)]
 #[command(
     after_help = "Examples:\n  ldgr context --brief\n  ldgr context --json\n\nContext is the expanded handoff view. Start with `ldgr status`; use context when you need deeper history."

@@ -96,6 +96,80 @@ fn web_help_documents_default_loopback_port() -> anyhow::Result<()> {
 }
 
 #[test]
+fn adapter_list_show_and_dispatch_use_core_registry_metadata() -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    let db_path = project.path().join(".ldgr/ldgr.db");
+    let artifact_root = project.path().join(".ldgr/artifacts");
+    let adapter_root = project.path().join("adapters");
+    write_adapter_fixture(&adapter_root.join("sample"), "community-sample", "sample")?;
+    fs::create_dir_all(adapter_root.join("broken"))?;
+    fs::write(adapter_root.join("broken/adapter.toml"), "[adapter\n")?;
+
+    command(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        ["adapter", "list"],
+    )?
+    .env("LDGR_ADAPTER_PATH", &adapter_root)
+    .assert()
+    .success()
+    .stdout(predicate::str::contains(
+        "adapter=community-sample title=community-sample title",
+    ))
+    .stdout(predicate::str::contains("command=community-sample-check"))
+    .stderr(predicate::str::contains(
+        "warning: skipped adapter manifest",
+    ))
+    .stderr(predicate::str::contains("failed to parse adapter manifest"));
+
+    command(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        ["adapter", "show", "sample"],
+    )?
+    .env("LDGR_ADAPTER_PATH", &adapter_root)
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("adapter: community-sample"))
+    .stdout(predicate::str::contains("aliases: sample"))
+    .stdout(predicate::str::contains(
+        "loop_prompt_path: prompts/loop.md",
+    ));
+
+    command(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        ["adapter", "dispatch", "community-sample-check"],
+    )?
+    .env("LDGR_ADAPTER_PATH", &adapter_root)
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("command: community-sample-check"))
+    .stdout(predicate::str::contains("argv: community-sample check"));
+
+    command(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        ["community-sample-check"],
+    )?
+    .env("LDGR_ADAPTER_PATH", &adapter_root)
+    .assert()
+    .failure()
+    .stderr(predicate::str::contains(
+        "Adapter command `community-sample-check` is installed but is not a core command.",
+    ))
+    .stderr(predicate::str::contains(
+        "Inspect it with `ldgr adapter dispatch community-sample-check`.",
+    ));
+
+    Ok(())
+}
+
+#[test]
 fn init_prints_setup_prompt_and_command_workflow() -> anyhow::Result<()> {
     let project = TempDir::new()?;
     let db_path = project.path().join(".ldgr/ldgr.db");
@@ -3051,4 +3125,36 @@ fn command<const ARG_COUNT: usize>(
         .arg(artifact_root)
         .args(args);
     Ok(command)
+}
+
+fn write_adapter_fixture(dir: &Path, slug: &str, alias: &str) -> anyhow::Result<()> {
+    fs::create_dir_all(dir.join("prompts"))?;
+    fs::create_dir_all(dir.join("templates"))?;
+    fs::write(dir.join("prompts/loop.md"), "loop")?;
+    fs::write(dir.join("templates/milestones.md"), "milestones")?;
+    fs::write(dir.join("templates/spec.md"), "spec")?;
+    fs::write(
+        dir.join("adapter.toml"),
+        format!(
+            r#"
+[adapter]
+slug = "{slug}"
+title = "{slug} title"
+core_version = "0.1"
+aliases = ["{alias}"]
+
+[profile]
+loop_prompt_path = "prompts/loop.md"
+default_milestone_template = "templates/milestones.md"
+spec_artifact_path = "templates/spec.md"
+readiness_policy = "ready"
+
+[[tools]]
+name = "{slug}-check"
+argv = ["{slug}", "check"]
+description = "Run a check."
+"#
+        ),
+    )?;
+    Ok(())
 }

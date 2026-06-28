@@ -1,11 +1,11 @@
 fn serve_conduct_waves(stream: &mut TcpStream, db_path: &Path) -> anyhow::Result<()> {
-    let root = std::env::current_dir()?.join(".ldgr-conduct");
+    let root = std::env::current_dir()?.join(".ldgr/.conduct");
     if !root.is_dir() {
         return write_json(
             stream,
             &serde_json::json!({
                 "available": false,
-                "message": ".ldgr-conduct directory not found",
+                "message": ".ldgr/.conduct directory not found",
                 "batches": [],
                 "feeds": []
             }),
@@ -15,12 +15,13 @@ fn serve_conduct_waves(stream: &mut TcpStream, db_path: &Path) -> anyhow::Result
     let worktree_root = root.join("worktrees");
     let mut batches = Vec::new();
     for batch_entry in read_dir_sorted(&worker_root)? {
-        if !batch_entry.path().is_dir() {
+        let batch_path = batch_entry.path();
+        if !batch_path.is_dir() {
             continue;
         }
         let batch_id = batch_entry.file_name().to_string_lossy().to_string();
         let mut workers = Vec::new();
-        for worker_entry in read_dir_sorted(&batch_entry.path())? {
+        for worker_entry in read_dir_sorted(&batch_path)? {
             if !worker_entry.path().is_dir() {
                 continue;
             }
@@ -33,12 +34,23 @@ fn serve_conduct_waves(stream: &mut TcpStream, db_path: &Path) -> anyhow::Result
                 &worker_entry.path(),
             ));
         }
-        batches.push(serde_json::json!({
-            "batch_id": batch_id,
-            "workers": workers,
-            "worker_count": workers.len(),
-        }));
+        let modified_sort = modified_sort_key(&batch_path);
+        batches.push((
+            modified_sort,
+            serde_json::json!({
+                "batch_id": batch_id,
+                "workers": workers,
+                "worker_count": workers.len(),
+                "modified_sort": modified_sort,
+            }),
+        ));
     }
+    batches.sort_by(|left, right| right.0.cmp(&left.0));
+    let batches = batches
+        .into_iter()
+        .take(8)
+        .map(|(_, batch)| batch)
+        .collect::<Vec<_>>();
     let feeds = collect_conduct_feeds(&root, 16)?;
     write_json(
         stream,
@@ -114,6 +126,15 @@ fn worker_db_summary(worker_db: &Path) -> serde_json::Value {
         }
         Err(error) => serde_json::json!({"readable": false, "error": format!("{error:#}")}),
     }
+}
+
+fn modified_sort_key(path: &Path) -> u64 {
+    fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
 }
 
 fn read_dir_sorted(path: &Path) -> anyhow::Result<Vec<std::fs::DirEntry>> {

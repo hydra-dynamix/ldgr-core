@@ -7,7 +7,9 @@ function render() {
   renderDecisionTrail(missionLog);
   renderArtifactView(missionLog);
   renderWaveManagement(lastConduct);
+  renderSidebar(context, missionLog, lastConduct);
   $('operator-controls').innerHTML = renderOperatorControls(controlDraft());
+  $('controls-status').textContent = `${pendingInterventions(context).length} pending`;
 }
 
 function pendingInterventions(context) {
@@ -32,41 +34,91 @@ function renderShell(context) {
   $('loop-state-dot').className = `state-dot ${loopStatus.className}`;
   const work = loopState.work_slug || (context.next_work_item && context.next_work_item.slug) || 'no active work';
   $('status-summary').innerHTML = `${status(loopStatus.label)} <span>${esc(loopState.current_phase || 'idle')}</span> <span>work: ${esc(work)}</span>`;
+  const activeRun = (context.active_runs || [])[0];
+  const latestDecision = context.latest_decision;
+  const latestArtifact = context.latest_artifacts && context.latest_artifacts[0];
+  const latestObservation = context.latest_observations && context.latest_observations[0];
   $('status-strip').innerHTML = [
-    ['Run', loopState.run_id ? `<a href="/runs/${route(loopState.run_id)}">${esc(loopState.run_id)}</a>` : 'none'],
-    ['Next work', context.next_work_item ? `<a href="/work/${route(context.next_work_item.slug)}">${esc(context.next_work_item.slug)}</a>` : 'none'],
-    ['Decision', context.latest_decision ? esc(context.latest_decision.outcome) : 'none'],
-    ['Artifact', context.latest_artifacts && context.latest_artifacts[0] ? `<button type="button" class="link-button" data-action="select-artifact" data-artifact-id="${esc(context.latest_artifacts[0].artifact_id)}">${esc(artifactName(context.latest_artifacts[0].path))}</button>` : 'none']
-  ].map(([label, value]) => `<div class="status-cell"><span>${esc(label)}</span><strong>${value}</strong></div>`).join('');
+    ['Active run', activeRun ? `run ${esc(activeRun.run_id)} · ${esc(activeRun.work_slug)}` : esc(loopState.current_phase || 'none'), 'active-run'],
+    ['Latest decision', latestDecision ? `${esc(latestDecision.outcome)} · ${esc(latestDecision.work_slug)}` : 'none', 'recent-decision'],
+    ['Latest artifact', latestArtifact ? `${esc(latestArtifact.kind)} · ${esc(artifactName(latestArtifact.path))}` : 'none', 'artifacts'],
+    ['Latest observation', latestObservation ? `${esc(latestObservation.created_at)} · ${esc(latestObservation.body)}` : 'none', 'latest-observation']
+  ].map(([label, value, inspector]) => `<button type="button" class="status-cell" data-action="set-inspector" data-inspector="${esc(inspector)}"><span>${esc(label)}</span><strong>${value}</strong></button>`).join('');
   $('inspector-state').className = `pill compact ${loopStatus.className}`;
   $('inspector-state').textContent = loopStatus.label;
   $('control-count').textContent = String(pendingInterventions(context).length);
 }
 
 function renderCurrent(context, missionLog) {
-  const next = context.next_work_item;
-  $('next-work-state').textContent = next ? text(next.status) : 'none';
-  $('next-work').innerHTML = next
-    ? `<div class="record-title"><a href="/work/${route(next.slug)}">${esc(next.slug)}</a>${status(next.status)}</div><p>${esc(next.title)}</p><details class="inline-details"><summary>More about this work</summary><p class="muted">${esc(next.description)}</p></details>`
-    : `<p class="muted">No pending work item. The ledger is waiting for new scope or operator direction.</p>`;
-
-  const activeRun = (context.active_runs || [])[0];
-  const loopState = context.loop_state || {};
-  $('active-run-state').textContent = activeRun ? `run ${activeRun.run_id}` : text(loopState.current_phase || 'none');
-  $('active-run').innerHTML = activeRun
-    ? renderActiveRun(activeRun)
-    : renderCompletedLoop(loopState);
-
-  const latestObservation = (context.latest_observations || [])[0];
-  $('latest-observation').innerHTML = latestObservation
-    ? `<div class="record-title"><a href="/runs/${latestObservation.run_id}">observation ${esc(latestObservation.observation_id)}</a><span class="muted">${esc(latestObservation.created_at)}</span></div><p>“${esc(latestObservation.body)}”</p><details class="inline-details"><summary>Observation history</summary>${renderObservationHistory(context.latest_observations || [])}</details>`
-    : '<p class="muted">No observations recorded.</p>';
-
-  $('recent-decision').innerHTML = context.latest_decision
-    ? renderCompactDecision(context.latest_decision)
-    : '<p class="muted">No decisions recorded.</p>';
-
   renderCurrentInspector(context, missionLog);
+}
+
+function renderSidebar(context, missionLog, conduct) {
+  renderSidebarCurrent(context);
+  renderSidebarDecisions(missionLog);
+  renderSidebarArtifacts(missionLog);
+  renderSidebarWaves(conduct);
+  renderSidebarRuns(missionLog);
+}
+
+function renderSidebarCurrent(context) {
+  const activeRun = (context.active_runs || [])[0];
+  const latestDecision = context.latest_decision;
+  const latestArtifact = context.latest_artifacts && context.latest_artifacts[0];
+  const latestObservation = context.latest_observations && context.latest_observations[0];
+  $('nav-current').innerHTML = [
+    navButton('Active run', activeRun ? `run ${activeRun.run_id}` : 'none', 'set-inspector', {'inspector': 'active-run'}),
+    navButton('Latest decision', latestDecision ? latestDecision.work_slug : 'none', 'set-inspector', {'inspector': 'recent-decision'}),
+    navButton('Latest artifact', latestArtifact ? artifactName(latestArtifact.path) : 'none', 'set-inspector', {'inspector': 'artifacts'}),
+    navButton('Latest observation', latestObservation ? latestObservation.created_at : 'none', 'set-inspector', {'inspector': 'latest-observation'})
+  ].join('');
+}
+
+function renderSidebarDecisions(missionLog) {
+  const decisions = allDecisions(missionLog)
+    .sort((left, right) => text(right.decision.created_at).localeCompare(text(left.decision.created_at)))
+    .slice(0, 8);
+  $('nav-decisions').innerHTML = decisions.length
+    ? decisions.map(item => navButton(item.decision.outcome, item.decision.work_slug, 'set-mission-filter', {'filter': item.entry.slug})).join('')
+    : '<p class="muted nav-empty">No decisions.</p>';
+}
+
+function renderSidebarArtifacts(missionLog) {
+  const artifacts = allArtifacts(missionLog).slice(0, 12);
+  $('nav-artifacts').innerHTML = artifacts.length
+    ? artifacts.map(item => navButton(artifactName(item.artifact.path), `${item.artifact.kind} · run ${item.run.run_id}`, 'select-artifact', {'artifact-id': item.artifact.artifact_id})).join('')
+    : '<p class="muted nav-empty">No artifacts.</p>';
+}
+
+function renderSidebarWaves(conduct) {
+  if (!conduct || !conduct.available) {
+    $('nav-waves').innerHTML = navButton('Wave management', 'loading', 'set-view', {'view': 'waves'});
+    return;
+  }
+  const batches = (conduct.batches || []).slice(0, 8);
+  $('nav-waves').innerHTML = batches.length
+    ? batches.map(batch => navButton(batch.batch_id, `${batch.worker_count || (batch.workers || []).length} workers`, 'set-view', {'view': 'waves'})).join('')
+    : '<p class="muted nav-empty">No waves.</p>';
+}
+
+function renderSidebarRuns(missionLog) {
+  const runs = allRuns(missionLog).slice(0, 10);
+  $('nav-runs').innerHTML = runs.length
+    ? runs.map(item => navButton(`run ${item.run.run_id}`, item.entry.slug, 'open-run-detail', {'run-id': item.run.run_id})).join('')
+    : '<p class="muted nav-empty">No runs.</p>';
+}
+
+function navButton(title, meta, action, dataset) {
+  const attrs = Object.entries(dataset || {})
+    .map(([key, value]) => ` data-${key}="${esc(value)}"`)
+    .join('');
+  return `<button type="button" class="nav-subitem" data-action="${esc(action)}"${attrs}><strong>${esc(title)}</strong><span>${esc(meta)}</span></button>`;
+}
+
+function allRuns(missionLog) {
+  return (missionLog.entries || [])
+    .flatMap(entry => (entry.runs || []).map(run => ({entry, run})))
+    .sort((left, right) => text(right.run.started_at || right.run.finished_at).localeCompare(text(left.run.started_at || left.run.finished_at)));
 }
 
 function renderCompactDecision(decision) {

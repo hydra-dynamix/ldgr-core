@@ -13,20 +13,29 @@
         <span class="brand-mark">ldgr</span>
         <span id="project-label" class="brand-subtitle">Operations cockpit</span>
       </div>
-      <nav class="primary-nav">
-        <button type="button" class="nav-button active" data-action="set-view" data-view="current">Current</button>
-        <button type="button" class="nav-button" data-action="set-view" data-view="decisions">Decisions</button>
-        <button type="button" class="nav-button" data-action="set-view" data-view="artifacts">Artifacts</button>
-        <button type="button" class="nav-button" data-action="set-view" data-view="waves">Waves</button>
-        <button type="button" class="nav-button" data-action="set-inspector" data-inspector="runs">Runs</button>
+      <nav class="primary-nav" id="sidebar-nav">
+        <details class="nav-section" open>
+          <summary>Current</summary>
+          <div id="nav-current" class="nav-section-items" data-view="current"></div>
+        </details>
+        <details class="nav-section">
+          <summary>Decisions</summary>
+          <div id="nav-decisions" class="nav-section-items" data-view="decisions"></div>
+        </details>
+        <details class="nav-section">
+          <summary>Artifacts</summary>
+          <div id="nav-artifacts" class="nav-section-items" data-view="artifacts"></div>
+        </details>
+        <details class="nav-section">
+          <summary>Waves</summary>
+          <div id="nav-waves" class="nav-section-items" data-view="waves"></div>
+        </details>
+        <details class="nav-section">
+          <summary>Runs</summary>
+          <div id="nav-runs" class="nav-section-items" data-view="runs"></div>
+        </details>
+        <button type="button" class="nav-button" data-action="set-view" data-view="controls">Operator controls <span id="control-count" class="pill compact">0</span></button>
       </nav>
-      <details class="nav-controls" id="operator-controls-details">
-        <summary>
-          <span>Operator controls</span>
-          <span id="control-count" class="pill compact">0</span>
-        </summary>
-        <div id="operator-controls"></div>
-      </details>
     </aside>
 
     <main class="workspace">
@@ -49,37 +58,9 @@
           </div>
           <span id="last-refresh" class="pill">Loading...</span>
         </div>
-        <div class="current-grid cockpit-grid">
-          <section class="main-stack state-stack" aria-label="Current state fields">
-            <article class="panel selectable-panel" data-action="set-inspector" data-inspector="next-work" tabindex="0">
-              <div class="panel-head">
-                <h3>Next Work</h3>
-                <span id="next-work-state" class="panel-stat">none</span>
-              </div>
-              <div id="next-work"></div>
-            </article>
-            <article class="panel selectable-panel" data-action="set-inspector" data-inspector="active-run" tabindex="0">
-              <div class="panel-head">
-                <h3>Active Run</h3>
-                <span id="active-run-state" class="panel-stat">none</span>
-              </div>
-              <div id="active-run"></div>
-            </article>
-            <article class="panel selectable-panel" data-action="set-inspector" data-inspector="latest-observation" tabindex="0">
-              <div class="panel-head">
-                <h3>Latest Observation</h3>
-              </div>
-              <div id="latest-observation"></div>
-            </article>
-            <article class="panel selectable-panel" data-action="set-inspector" data-inspector="recent-decision" tabindex="0">
-              <div class="panel-head">
-                <h3>Recent Decision</h3>
-              </div>
-              <div id="recent-decision"></div>
-            </article>
-          </section>
+        <div class="current-grid cockpit-grid inspector-centered">
           <aside class="inspector-stack current-inspector" aria-label="Inspector">
-            <article class="panel inspector-panel">
+            <article class="panel inspector-panel readable-panel">
               <div class="panel-head">
                 <h3 id="inspector-heading">Inspector</h3>
                 <span id="inspector-state" class="pill compact">current</span>
@@ -134,6 +115,19 @@
           <span class="pill">read-only</span>
         </div>
         <div id="wave-management" class="wave-management"><p class="muted">Loading conduct wave state...</p></div>
+      </section>
+
+      <section id="view-controls" class="view" aria-labelledby="controls-heading">
+        <div class="view-heading">
+          <div>
+            <p class="eyebrow">Operator intervention</p>
+            <h2 id="controls-heading">Operator Controls</h2>
+          </div>
+          <span id="controls-status" class="pill">0 pending</span>
+        </div>
+        <article class="panel readable-panel">
+          <div id="operator-controls"></div>
+        </article>
       </section>
 
       <section class="panel detail-panel" id="detail-panel">

@@ -1,3 +1,5 @@
+pub mod adapter_manifest;
+pub mod adapter_registry;
 pub mod claims;
 pub mod cli;
 pub mod loop_runtime;

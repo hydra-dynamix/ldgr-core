@@ -103,7 +103,7 @@ async function loadConduct() {
   if (conductLoadInFlight) return;
   conductLoadInFlight = true;
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 2500);
+  const timeout = setTimeout(() => controller.abort('conduct wave request timeout'), 15000);
   try {
     lastConduct = await apiJson('/api/conduct/waves', {signal: controller.signal});
   } catch (error) {

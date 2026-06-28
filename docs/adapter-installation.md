@@ -1,73 +1,56 @@
 # Adapter installation and discovery
 
-LDGR adapter profiles are declarative bundles for `ldgr-research` or adapter-owned tooling. A bundle contains `adapter.toml` plus any relative files it references, such as loop prompts and templates. The research layer or adapter-owned wrapper resolves those paths relative to the manifest directory.
+LDGR adapter profiles are declarative bundles installed under the user LDGR home. A bundle contains `adapter.toml` plus relative files it references, such as prompts, templates, docs, scripts, skills, or extensions.
 
-Current boundary: `ldgr-core` does not own adapter discovery or profile application commands. It only provides narrow reusable helpers such as manifest digest verification; discovery and profile application are implemented by `ldgr-research` and adapter-owned tools.
+`ldgr-core` discovers installed bundles and extends the `ldgr` control surface from their manifests.
 
 ## User adapter root
 
 Install adapter bundles under:
 
 ```text
-~/.ldgr/adapters/<slug>/adapter.toml
+~/.ldgr/<adapter>/adapter.toml
 ```
 
 Example:
 
 ```text
-~/.ldgr/adapters/code/adapter.toml
-~/.ldgr/adapters/code/prompts/ldgr-loop-next-work.md
-~/.ldgr/adapters/code/templates/task-spec.md
+~/.ldgr/code/adapter.toml
+~/.ldgr/code/prompts/ldgr-loop-next-work.md
+~/.ldgr/code/templates/task-spec.md
 ```
 
-`ldgr-research` also reads `LDGR_HOME/adapters` when `LDGR_HOME` is set. For development and tests, set `LDGR_ADAPTER_PATH` to one or more adapter roots separated by the platform path separator. Each root should contain `<slug>/adapter.toml`.
+Discovery reads `LDGR_ADAPTER_PATH`, project `.ldgr` for explicit development overrides, `LDGR_HOME`, and `~/.ldgr`. Each adapter root should contain `<slug>/adapter.toml`, or a direct `adapter.toml` for single-bundle roots.
 
-## Discover and apply
+## Install
 
 ```bash
-ldgr-research profile discover          # list installed manifests and exact apply commands
-ldgr-research profile apply code        # auto-load and apply ~/.ldgr/adapters/code/adapter.toml
+ldgr install adapter code
+ldgr install adapter security
 ```
 
-Explicit manifest paths still work:
+Open-source adapter installs currently call the adapter package's own installer and write the bundle to `~/.ldgr/<adapter>`. Adapter-owned skills/extensions are copied into configured harness locations when present.
 
-```bash
-ldgr-research profile create ./adapter.toml
-ldgr-research profile apply code
-```
+## Dynamic command surface
 
-## Aliases
-
-Adapters may declare optional aliases for friendlier application names:
+Adapters declare namespaces in `adapter.toml`:
 
 ```toml
-[adapter]
-slug = "code"
-title = "Coding adapter"
-aliases = ["coding", "ldgr-code"]
+[[commands]]
+namespace = "code"
+argv = ["ldgr-code"]
+aliases = ["coding"]
+
+[commands.help]
+usage = "ldgr code <command> [options]"
+summary = "Run coding adapter workflows from the LDGR control surface."
 ```
 
-`ldgr-research profile apply` accepts exact slugs, aliases, case-insensitive normalized
-matches, and unambiguous title words from discovered manifests. The canonical
-stored profile slug remains the manifest `slug`.
-
-## Binary-backed adapters
-
-Adapter tools should invoke binaries by command name, not by source-checkout paths:
-
-```toml
-[[tools]]
-name = "code-check-all"
-argv = ["ldgr-code", "check", "all"]
-```
-
-Install the executable through the adapter's normal package channel, for example:
+After install, core dispatches through the namespace:
 
 ```bash
-cargo install ldgr-code
+ldgr code --help
+ldgr code check all
 ```
 
-Then install/copy the bundle to `~/.ldgr/adapters/code`. A source checkout is not required after the adapter bundle is installed and the binary is on `PATH`.
-
-Adapter templates and domain-specific examples live with the research/adapter
-package that owns those records, not in the core `ldgr` crate.
+Core help, status, and context include installed adapter profiles and commands.

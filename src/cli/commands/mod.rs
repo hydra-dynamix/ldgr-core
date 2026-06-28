@@ -1,3 +1,4 @@
+pub mod adapters;
 pub mod audit;
 pub mod ops;
 pub mod prompts;
