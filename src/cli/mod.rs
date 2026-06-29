@@ -6,7 +6,7 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::Command as ProcessCommand;
 
-use anyhow::bail;
+use anyhow::{bail, Context};
 use clap::{error::ErrorKind, CommandFactory, Parser, Subcommand};
 
 use crate::adapter_registry::{AdapterCommandNamespace, AdapterRegistry};
@@ -165,7 +165,7 @@ enum Command {
     /// Discover installed adapter manifests and command metadata.
     Adapter(AdapterArgs),
     /// Print the next pending work item.
-    Next,
+    Next(NextArgs),
 }
 
 pub fn run() -> anyhow::Result<()> {
@@ -235,59 +235,108 @@ fn handle_cli(cli: Cli) -> anyhow::Result<()> {
         Command::Decision(args) => commands::audit::handle_decision(&open_store(&cli.db)?, args),
         Command::Prompt(args) => commands::prompts::handle_prompt(&open_store(&cli.db)?, args),
         Command::Bundle(args) => commands::prompts::handle_bundle(&open_store(&cli.db)?, args),
-        Command::Status(args) => commands::ops::handle_status(&open_store(&cli.db)?, args),
-        Command::Context(args) => commands::ops::handle_context(&open_store(&cli.db)?, args),
+        Command::Status(args) => {
+            commands::ops::handle_status(&open_store(&cli.db)?, &cli.artifact_root, args)
+        }
+        Command::Context(args) => {
+            commands::ops::handle_context(&open_store(&cli.db)?, &cli.artifact_root, args)
+        }
         Command::Web(args) => commands::ops::handle_web(&cli.db, &cli.artifact_root, args),
         Command::Loop(args) => {
             commands::ops::handle_loop(&open_store(&cli.db)?, &cli.artifact_root, args)
         }
         Command::Adapter(args) => commands::adapters::handle_adapter(args),
-        Command::Next => commands::work::handle_next(&open_store(&cli.db)?),
+        Command::Next(args) => commands::work::handle_next(&open_store(&cli.db)?, args),
     }
 }
 
 fn try_dispatch_adapter_namespace(args: &[OsString]) -> anyhow::Result<bool> {
-    let Some((namespace, remaining)) = first_command_token(args) else {
+    let Some(request) = adapter_namespace_request(args) else {
         return Ok(false);
     };
     let registry = AdapterRegistry::discover();
-    let Some(command) = registry.resolve_namespace(&namespace) else {
+    let Some(command) = registry.resolve_namespace(&request.namespace) else {
         return Ok(false);
     };
-    dispatch_adapter_namespace(command, remaining)?;
+    dispatch_adapter_namespace(command, request)?;
     Ok(true)
 }
 
-fn first_command_token(args: &[OsString]) -> Option<(String, Vec<OsString>)> {
+struct AdapterNamespaceRequest {
+    db: PathBuf,
+    artifact_root: PathBuf,
+    namespace: String,
+    remaining: Vec<OsString>,
+}
+
+fn adapter_namespace_request(args: &[OsString]) -> Option<AdapterNamespaceRequest> {
+    let mut db = PathBuf::from(DEFAULT_DB_PATH);
+    let mut artifact_root = PathBuf::from(DEFAULT_ARTIFACT_ROOT);
     let mut index = 1;
     while index < args.len() {
         let token = args[index].to_str()?;
-        if token == "--db" || token == "--artifact-root" {
-            index += 2;
+        if token == "--db" {
+            index += 1;
+            db = PathBuf::from(args.get(index)?);
+            index += 1;
             continue;
+        }
+        if let Some(value) = token.strip_prefix("--db=") {
+            db = PathBuf::from(value);
+            index += 1;
+            continue;
+        }
+        if token == "--artifact-root" {
+            index += 1;
+            artifact_root = PathBuf::from(args.get(index)?);
+            index += 1;
+            continue;
+        }
+        if let Some(value) = token.strip_prefix("--artifact-root=") {
+            artifact_root = PathBuf::from(value);
+            index += 1;
+            continue;
+        }
+        if token == "--full" {
+            return None;
         }
         if token.starts_with('-') {
             index += 1;
             continue;
         }
-        return Some((
-            token.to_owned(),
-            args.iter().skip(index + 1).cloned().collect(),
-        ));
+        return Some(AdapterNamespaceRequest {
+            db,
+            artifact_root,
+            namespace: token.to_owned(),
+            remaining: args.iter().skip(index + 1).cloned().collect(),
+        });
     }
     None
 }
 
 fn dispatch_adapter_namespace(
     command: &AdapterCommandNamespace,
-    remaining: Vec<OsString>,
+    request: AdapterNamespaceRequest,
 ) -> anyhow::Result<()> {
     if command.argv.is_empty() {
         bail!("adapter namespace `{}` has empty argv", command.namespace);
     }
+    let working_dir = std::env::current_dir().context("failed to resolve current directory")?;
     let mut process = ProcessCommand::new(&command.argv[0]);
-    process.args(&command.argv[1..]).args(remaining);
-    let status = process.status()?;
+    process
+        .args(&command.argv[1..])
+        .args(request.remaining)
+        .env("LDGR_DB", &request.db)
+        .env("LDGR_ARTIFACT_ROOT", &request.artifact_root)
+        .env("LDGR_WORKING_DIR", working_dir)
+        .env("LDGR_ADAPTER_SLUG", &command.adapter_slug)
+        .env("LDGR_ADAPTER_NAMESPACE", &request.namespace);
+    let status = process.status().with_context(|| {
+        format!(
+            "failed to execute adapter `{}` namespace `{}` command `{}`",
+            command.adapter_slug, command.namespace, command.argv[0]
+        )
+    })?;
     if !status.success() {
         std::process::exit(status.code().unwrap_or(1));
     }

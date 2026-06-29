@@ -115,6 +115,47 @@ pub(crate) fn print_context(context: &StoreContext) {
         }
     }
 
+    if let Some(summary) = &context.conduct_lifecycle {
+        println!(
+            "conduct_lifecycle: batch_id={} status={} current_wave={} blocked_count={}",
+            summary.batch_id,
+            summary.status,
+            summary.current_wave.as_deref().unwrap_or("none"),
+            summary.blocked_count
+        );
+        println!(
+            "conduct_workers: total={} complete={} active={} blocked={} terminal={}",
+            summary.worker_counts.total,
+            summary.worker_counts.complete,
+            summary.worker_counts.active,
+            summary.worker_counts.blocked,
+            summary.worker_counts.terminal
+        );
+        println!(
+            "conduct_artifacts: graph={} ticket_index={} batch_state={}",
+            summary
+                .graph_artifact_id
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| "unknown".to_owned()),
+            summary
+                .ticket_index_artifact_id
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| "unknown".to_owned()),
+            summary
+                .batch_state_artifact_id
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| "unknown".to_owned())
+        );
+        println!("conduct_next_valid_action: {}", summary.next_valid_action);
+        if let Some(warning) = &summary.stale_next_work {
+            println!("conduct_warning: {}", warning.message);
+            println!("conduct_warning_commands:");
+            for command in &warning.suggested_commands {
+                println!("- {command}");
+            }
+        }
+    }
+
     if context.global_observations.is_empty() {
         println!("global_observations: none");
     } else {

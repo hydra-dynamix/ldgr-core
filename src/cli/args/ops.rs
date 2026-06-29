@@ -12,7 +12,7 @@ pub enum HarnessKind {
 
 #[derive(Debug, Args)]
 #[command(
-    after_help = "Examples:\n  ldgr install\n  ldgr install --harness pi --harness claude --yes\n  ldgr install adapter code --yes\n\nWithout --harness, the installer asks interactively and defaults to Pi. Multiple harnesses may be selected. The selected harness config is recorded under ~/.ldgr/."
+    after_help = "Examples:\n  ldgr install\n  ldgr install --harness pi --harness claude --yes\n  ldgr install --yes --no-agentctl\n  ldgr install adapter code --yes\n\nWithout --harness, the installer asks interactively and defaults to Pi. Multiple harnesses may be selected. The selected harness config is recorded under ~/.ldgr/. agentctl is installed when missing unless --no-agentctl is passed."
 )]
 pub struct InstallArgs {
     #[command(subcommand)]
@@ -25,6 +25,10 @@ pub struct InstallArgs {
     /// Accept defaults and do not prompt. Defaults to Pi when --harness is omitted.
     #[arg(long)]
     pub yes: bool,
+
+    /// Do not install agentctl even if it is missing from PATH.
+    #[arg(long)]
+    pub no_agentctl: bool,
 }
 
 #[derive(Debug, Subcommand)]

@@ -304,8 +304,41 @@ pub struct StoreContext {
     pub latest_validations: Vec<ValidationSummary>,
     pub global_observations: Vec<GlobalObservation>,
     pub latest_artifacts: Vec<ArtifactSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conduct_lifecycle: Option<ConductLifecycleSummary>,
     pub loop_interventions: Vec<LoopIntervention>,
     pub latest_events: Vec<EventLogSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ConductLifecycleSummary {
+    pub batch_id: String,
+    pub status: String,
+    pub worker_counts: ConductWorkerCounts,
+    pub graph_artifact_id: Option<i64>,
+    pub ticket_index_artifact_id: Option<i64>,
+    pub batch_state_artifact_id: Option<i64>,
+    pub current_wave: Option<String>,
+    pub blocked_count: usize,
+    pub next_valid_action: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stale_next_work: Option<ConductStaleNextWorkWarning>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ConductWorkerCounts {
+    pub total: usize,
+    pub complete: usize,
+    pub active: usize,
+    pub blocked: usize,
+    pub terminal: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ConductStaleNextWorkWarning {
+    pub work_slug: String,
+    pub message: String,
+    pub suggested_commands: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

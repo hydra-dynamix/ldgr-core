@@ -1,7 +1,7 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use anyhow::bail;
@@ -12,7 +12,7 @@ use crate::loop_runtime::{
     run_loop_once, LoopAgent, LoopPromptSource, LoopRuntimeOptions, LoopRuntimeOutcome,
     LoopRuntimeResult,
 };
-use crate::store::{init_store, read_context};
+use crate::store::{init_store, read_context_with_conduct_lifecycle};
 use crate::tool_runner::parse_argv_json;
 use crate::web::{generate_control_token, serve, WebOptions};
 
@@ -29,6 +29,7 @@ use super::super::render::text::print_loop_result;
 use super::super::{CLI_DEFAULT_HELP_SECTIONS, INIT_PROJECT_SETUP_PROMPT};
 
 const LDGR_CONTEXT_EXTENSION: &str = include_str!("../../../extensions/ldgr-context.ts");
+const AGENTCTL_REPO: &str = "https://github.com/hydra-dynamix/agentctl";
 
 pub fn handle_init(db: &Path, artifact_root: &Path) -> anyhow::Result<()> {
     let existing_database = db.exists();
@@ -74,12 +75,14 @@ pub fn handle_install(args: InstallArgs) -> anyhow::Result<()> {
     for harness in &harnesses {
         installed.push(install_harness(*harness, &home)?);
     }
+    let agentctl = ensure_agentctl_dependency(args.no_agentctl)?;
 
     let config = serde_json::json!({
         "schema_version": 1,
         "default_harness": harnesses.first().map(|harness| harness_name(*harness)).unwrap_or("pi"),
         "selected_harnesses": harnesses.iter().map(|harness| harness_name(*harness)).collect::<Vec<_>>(),
         "installed": installed,
+        "agentctl": agentctl,
         "adapter_files": {
             "default_global_path": "~/.ldgr/<adapter>",
             "note": "Adapter bundle files install globally under ~/.ldgr/<adapter>; adapter-owned skills/extensions install into the configured harness locations."
@@ -166,6 +169,7 @@ fn open_source_adapter_package(adapter: &str) -> Option<&'static str> {
         "bench" => Some("ldgr-bench"),
         "explore" => Some("ldgr-explore"),
         "security" => Some("ldgr-security"),
+        "conduct" => Some("ldgr-conduct"),
         _ => None,
     }
 }
@@ -304,6 +308,58 @@ fn install_harness(harness: HarnessKind, home: &Path) -> anyhow::Result<serde_js
         HarnessKind::Claude => install_claude_harness(home),
         HarnessKind::Openclaw => install_openclaw_harness(home),
     }
+}
+
+fn ensure_agentctl_dependency(skip: bool) -> anyhow::Result<serde_json::Value> {
+    if skip {
+        println!("├─ Skipped agentctl install (--no-agentctl)");
+        return Ok(serde_json::json!({
+            "required": true,
+            "installed_by_ldgr": false,
+            "status": "skipped",
+            "install_hint": format!("cargo install --git {AGENTCTL_REPO}")
+        }));
+    }
+    if command_on_path("agentctl") {
+        println!("├─ agentctl already available on PATH");
+        return Ok(serde_json::json!({
+            "required": true,
+            "installed_by_ldgr": false,
+            "status": "already_on_path",
+            "command": "agentctl"
+        }));
+    }
+
+    println!("├─ Installing agentctl from {AGENTCTL_REPO}");
+    let status = Command::new("cargo")
+        .arg("install")
+        .arg("--git")
+        .arg(AGENTCTL_REPO)
+        .stdin(Stdio::null())
+        .status()
+        .map_err(|error| anyhow::anyhow!("failed to start cargo install for agentctl: {error}"))?;
+    if !status.success() {
+        bail!(
+            "agentctl install failed with status {status}; install it with `cargo install --git {AGENTCTL_REPO}` or rerun `ldgr install --no-agentctl` to manage it yourself"
+        );
+    }
+    Ok(serde_json::json!({
+        "required": true,
+        "installed_by_ldgr": true,
+        "status": "installed",
+        "command": "agentctl",
+        "source": AGENTCTL_REPO
+    }))
+}
+
+fn command_on_path(command: &str) -> bool {
+    Command::new(command)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok()
 }
 
 fn install_pi_harness(home: &Path) -> anyhow::Result<serde_json::Value> {
@@ -449,8 +505,12 @@ const CLAUDE_LDGR_COMMAND: &str = r#"Run `ldgr $ARGUMENTS` in the current projec
 const CLAW_LDGR_COMMAND: &str = r#"Run `ldgr $ARGUMENTS` in the current project and report stdout/stderr back to the conversation. If no arguments are provided, run `ldgr context --brief`.
 "#;
 
-pub fn handle_status(connection: &rusqlite::Connection, args: StatusArgs) -> anyhow::Result<()> {
-    let context = read_context(connection)?;
+pub fn handle_status(
+    connection: &rusqlite::Connection,
+    artifact_root: &Path,
+    args: StatusArgs,
+) -> anyhow::Result<()> {
+    let context = read_context_with_conduct_lifecycle(connection, artifact_root)?;
     let brief = brief_context(&context, brief_options(args.recent, args.width));
     emit(args.json, &brief, print_brief_context)?;
     if !args.json {
@@ -459,8 +519,12 @@ pub fn handle_status(connection: &rusqlite::Connection, args: StatusArgs) -> any
     Ok(())
 }
 
-pub fn handle_context(connection: &rusqlite::Connection, args: ContextArgs) -> anyhow::Result<()> {
-    let context = read_context(connection)?;
+pub fn handle_context(
+    connection: &rusqlite::Connection,
+    artifact_root: &Path,
+    args: ContextArgs,
+) -> anyhow::Result<()> {
+    let context = read_context_with_conduct_lifecycle(connection, artifact_root)?;
     if args.brief {
         let brief = brief_context(&context, brief_options(args.recent, args.width));
         return emit(args.json, &brief, print_brief_context);

@@ -170,6 +170,384 @@ fn adapter_list_show_and_dispatch_use_core_registry_metadata() -> anyhow::Result
 }
 
 #[test]
+fn adapter_namespace_dispatch_preserves_argv_and_exports_context() -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    let db_path = project.path().join(".ldgr/ldgr.db");
+    let artifact_root = project.path().join(".ldgr/artifacts");
+    let adapter_root = project.path().join("adapters");
+    let record_dir = project.path().join("records");
+    fs::create_dir_all(&record_dir)?;
+    write_adapter_namespace_fixture(
+        &adapter_root.join("example"),
+        "example",
+        "reference",
+        r#"["sh", "-c", '''printf "%s\n" "$@" > "$ADAPTER_RECORD_DIR/argv.txt"; env | grep "^LDGR_" | sort > "$ADAPTER_RECORD_DIR/env.txt"; echo adapter-stdout; echo adapter-stderr >&2''', "adapter-fixture"]"#,
+    )?;
+
+    command(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        ["reference", "--flag", "two words", "tail"],
+    )?
+    .env("LDGR_ADAPTER_PATH", &adapter_root)
+    .env("ADAPTER_RECORD_DIR", &record_dir)
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("adapter-stdout"))
+    .stderr(predicate::str::contains("adapter-stderr"));
+
+    assert_eq!(
+        fs::read_to_string(record_dir.join("argv.txt"))?,
+        "--flag\ntwo words\ntail\n"
+    );
+    let env = fs::read_to_string(record_dir.join("env.txt"))?;
+    assert!(
+        env.contains(&format!("LDGR_DB={}", db_path.display())),
+        "{env}"
+    );
+    assert!(
+        env.contains(&format!("LDGR_ARTIFACT_ROOT={}", artifact_root.display())),
+        "{env}"
+    );
+    assert!(
+        env.contains(&format!("LDGR_WORKING_DIR={}", project.path().display())),
+        "{env}"
+    );
+    assert!(env.contains("LDGR_ADAPTER_SLUG=example"), "{env}");
+    assert!(env.contains("LDGR_ADAPTER_NAMESPACE=reference"), "{env}");
+
+    Ok(())
+}
+
+#[test]
+fn adapter_namespace_dispatch_propagates_nonzero_exit_status_and_stderr() -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    let db_path = project.path().join(".ldgr/ldgr.db");
+    let artifact_root = project.path().join(".ldgr/artifacts");
+    let adapter_root = project.path().join("adapters");
+    write_adapter_namespace_fixture(
+        &adapter_root.join("failer"),
+        "failer",
+        "failer",
+        r#"["sh", "-c", '''echo failing-stdout; echo failing-stderr >&2; exit 7''']"#,
+    )?;
+
+    command(project.path(), &db_path, &artifact_root, ["failer"])?
+        .env("LDGR_ADAPTER_PATH", &adapter_root)
+        .assert()
+        .code(7)
+        .stdout(predicate::str::contains("failing-stdout"))
+        .stderr(predicate::str::contains("failing-stderr"));
+
+    Ok(())
+}
+
+#[test]
+fn adapter_namespace_dispatch_reports_failure_to_execute() -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    let db_path = project.path().join(".ldgr/ldgr.db");
+    let artifact_root = project.path().join(".ldgr/artifacts");
+    let adapter_root = project.path().join("adapters");
+    write_adapter_namespace_fixture(
+        &adapter_root.join("missing"),
+        "missing",
+        "missing",
+        r#"["ldgr-definitely-missing-adapter-command-for-test"]"#,
+    )?;
+
+    command(project.path(), &db_path, &artifact_root, ["missing"])?
+        .env("LDGR_ADAPTER_PATH", &adapter_root)
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("failed to execute adapter `missing` namespace `missing`")
+                .and(predicate::str::contains(
+                    "ldgr-definitely-missing-adapter-command-for-test",
+                )),
+        );
+
+    Ok(())
+}
+
+#[test]
+fn core_builtin_commands_take_precedence_over_adapter_namespaces() -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    let db_path = project.path().join(".ldgr/ldgr.db");
+    let artifact_root = project.path().join(".ldgr/artifacts");
+    let adapter_root = project.path().join("adapters");
+    let marker = project.path().join("adapter-ran.txt");
+    run(project.path(), &db_path, &artifact_root, ["init"])?;
+    write_adapter_namespace_fixture(
+        &adapter_root.join("status"),
+        "status-adapter",
+        "status",
+        r#"["sh", "-c", "touch adapter-ran.txt"]"#,
+    )?;
+
+    command(project.path(), &db_path, &artifact_root, ["status"])?
+        .env("LDGR_ADAPTER_PATH", &adapter_root)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("LDGR brief context"));
+
+    assert!(
+        !marker.exists(),
+        "built-in status should not dispatch adapter"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn status_and_next_commands_include_conduct_adapter_suggestions() -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    let db_path = project.path().join(".ldgr/ldgr.db");
+    let artifact_root = project.path().join(".ldgr/artifacts");
+    let adapter_root = project.path().join("adapters");
+    write_adapter_fixture(&adapter_root.join("conduct"), "conduct", "cd")?;
+
+    run(project.path(), &db_path, &artifact_root, ["init"])?;
+    run(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        [
+            "work",
+            "create",
+            "conduct-next",
+            "--title",
+            "Conduct next",
+            "--description",
+            "Inspect conduct batch_id: batch-042 before launching another wave.",
+        ],
+    )?;
+
+    command(project.path(), &db_path, &artifact_root, ["--help"])?
+        .env("LDGR_ADAPTER_PATH", &adapter_root)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Installed adapter control surface:",
+        ))
+        .stdout(predicate::str::contains("ldgr conduct <args...>"));
+
+    command(project.path(), &db_path, &artifact_root, ["status"])?
+        .env("LDGR_ADAPTER_PATH", &adapter_root)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("installed_adapter_namespaces:"))
+        .stdout(predicate::str::contains(
+            "adapter=conduct namespace=conduct command=ldgr conduct",
+        ))
+        .stdout(predicate::str::contains("next_commands:"))
+        .stdout(predicate::str::contains("ldgr conduct status"))
+        .stdout(predicate::str::contains(
+            "ldgr conduct batch status --batch-id batch-042 --json",
+        ))
+        .stdout(predicate::str::contains(
+            "ldgr run start conduct-next --command <what-ran>",
+        ));
+
+    command(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        ["status", "--json"],
+    )?
+    .env("LDGR_ADAPTER_PATH", &adapter_root)
+    .assert()
+    .success()
+    .stdout(predicate::str::contains(
+        r#""installed_adapter_namespaces""#,
+    ))
+    .stdout(predicate::str::contains(r#""namespace": "conduct""#))
+    .stdout(predicate::str::contains(
+        r#""ldgr conduct batch launch --graph <graph.md> --batch-id batch-042"#,
+    ));
+
+    command(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        ["next", "--commands"],
+    )?
+    .env("LDGR_ADAPTER_PATH", &adapter_root)
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("ldgr conduct status"))
+    .stdout(predicate::str::contains(
+        "ldgr conduct batch refresh --batch-id batch-042",
+    ))
+    .stdout(predicate::str::contains(
+        "ldgr conduct batch launch --graph <graph.md> --batch-id batch-042",
+    ))
+    .stdout(predicate::str::contains(
+        "ldgr run start conduct-next --command <what-ran>",
+    ));
+
+    command(project.path(), &db_path, &artifact_root, ["next"])?
+        .env("LDGR_ADAPTER_PATH", &adapter_root)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("conduct-next Conduct next"))
+        .stdout(predicate::str::contains("ldgr conduct").not());
+
+    Ok(())
+}
+
+#[test]
+fn status_surfaces_referenced_conduct_batch_lifecycle() -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    let db_path = project.path().join(".ldgr/ldgr.db");
+    let artifact_root = project.path().join(".ldgr/artifacts");
+
+    run(project.path(), &db_path, &artifact_root, ["init"])?;
+    run(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        [
+            "work",
+            "create",
+            "setup",
+            "--title",
+            "Setup",
+            "--description",
+            "Record conduct fixture artifacts.",
+        ],
+    )?;
+    run(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        ["run", "start", "setup"],
+    )?;
+    run(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        [
+            "work",
+            "create",
+            "conduct-lifecycle",
+            "--title",
+            "Conduct lifecycle",
+            "--description",
+            "Launch the next conduct wave for batch_id: batch-042.",
+        ],
+    )?;
+
+    let state_path = project.path().join("batch-state.md");
+    fs::write(
+        &state_path,
+        r#"---
+ldgr_doc: 1
+kind: batch_state
+id: batch-042
+schema: ldgr.batch_state.v1
+status: accepted
+---
+
+# Batch State: batch-042
+
+```ldgr-batch-state yaml
+batch_id: batch-042
+graph_artifact_id: artifact:41
+ticket_index_artifact_id: artifact:42
+status: wave_complete
+current_wave: wave-001
+waves:
+  - wave_id: wave-001
+    node_ids:
+      - ticket.alpha
+    worker_ids:
+      - worker-001
+    status: wave_complete
+workers:
+  - worker_id: worker-001
+    ticket_id: ticket.alpha
+    work_item_id: work:alpha
+    worktree_path: path:.ldgr/.conduct/worktrees/batch-042/worker-001-alpha
+    worker_db_path: db:.ldgr/.conduct/workers/batch-042/worker-001/ldgr.db
+    status: complete
+blocked:
+  - ticket_id: ticket.beta
+    reason: waiting for dependencies ticket.alpha
+```
+"#,
+    )?;
+    run(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        [
+            "artifact",
+            "add",
+            "1",
+            "--kind",
+            "report",
+            "--path",
+            state_path.to_str().expect("artifact path is UTF-8"),
+            "--description",
+            "LDGR batch_state artifact batch_id=batch-042.",
+        ],
+    )?;
+
+    command(project.path(), &db_path, &artifact_root, ["status"])?
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "conduct_lifecycle: batch_id=batch-042 status=wave_complete",
+        ))
+        .stdout(predicate::str::contains(
+            "workers=total:1 complete:1 active:0 blocked:0 terminal:1",
+        ))
+        .stdout(predicate::str::contains(
+            "conduct_artifacts: graph=41 ticket_index=42 batch_state=1",
+        ))
+        .stdout(predicate::str::contains(
+            "next_valid_action=ldgr conduct batch launch --batch-id batch-042 --graph <graph.md>",
+        ))
+        .stdout(predicate::str::contains(
+            "conduct_warning: next work conduct-lifecycle references conduct batch batch-042",
+        ))
+        .stdout(predicate::str::contains(
+            "ldgr work status set conduct-lifecycle done --reason \"stale conduct work; batch batch-042 is wave_complete\"",
+        ))
+        .stdout(predicate::str::contains(
+            "ldgr work status set conduct-lifecycle held --reason \"stale conduct work; batch batch-042 is wave_complete\"",
+        ))
+        .stdout(predicate::str::contains(
+            "ldgr conduct batch launch --batch-id batch-042 --graph <graph.md>",
+        ));
+
+    command(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        ["context", "--json"],
+    )?
+    .assert()
+    .success()
+    .stdout(predicate::str::contains(r#""conduct_lifecycle""#))
+    .stdout(predicate::str::contains(r#""batch_id": "batch-042""#))
+    .stdout(predicate::str::contains(r#""status": "wave_complete""#))
+    .stdout(predicate::str::contains(r#""graph_artifact_id": 41"#))
+    .stdout(predicate::str::contains(
+        r#""ticket_index_artifact_id": 42"#,
+    ))
+    .stdout(predicate::str::contains(r#""blocked_count": 1"#))
+    .stdout(predicate::str::contains(r#""stale_next_work""#))
+    .stdout(predicate::str::contains(r#""work_slug": "conduct-lifecycle""#))
+    .stdout(predicate::str::contains(
+        r#""ldgr work status set conduct-lifecycle done --reason \"stale conduct work; batch batch-042 is wave_complete\"""#,
+    ));
+
+    Ok(())
+}
+
+#[test]
 fn init_prints_setup_prompt_and_command_workflow() -> anyhow::Result<()> {
     let project = TempDir::new()?;
     let db_path = project.path().join(".ldgr/ldgr.db");
@@ -3153,6 +3531,45 @@ readiness_policy = "ready"
 name = "{slug}-check"
 argv = ["{slug}", "check"]
 description = "Run a check."
+"#
+        ),
+    )?;
+    Ok(())
+}
+
+fn write_adapter_namespace_fixture(
+    dir: &Path,
+    slug: &str,
+    namespace: &str,
+    argv: &str,
+) -> anyhow::Result<()> {
+    fs::create_dir_all(dir.join("prompts"))?;
+    fs::create_dir_all(dir.join("templates"))?;
+    fs::write(dir.join("prompts/loop.md"), "loop")?;
+    fs::write(dir.join("templates/milestones.md"), "milestones")?;
+    fs::write(dir.join("templates/spec.md"), "spec")?;
+    fs::write(
+        dir.join("adapter.toml"),
+        format!(
+            r#"
+[adapter]
+slug = "{slug}"
+title = "{slug} title"
+core_version = "0.1"
+
+[profile]
+loop_prompt_path = "prompts/loop.md"
+default_milestone_template = "templates/milestones.md"
+spec_artifact_path = "templates/spec.md"
+readiness_policy = "ready"
+
+[[commands]]
+namespace = "{namespace}"
+argv = {argv}
+
+[commands.help]
+usage = "ldgr {namespace} <args...>"
+summary = "Run {namespace} adapter commands."
 "#
         ),
     )?;

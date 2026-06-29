@@ -25,7 +25,7 @@ fn handle_get(
         ),
         "/api/context" => {
             let connection = open_store(db_path)?;
-            let context = read_context(&connection)?;
+            let context = read_context_with_conduct_lifecycle(&connection, artifact_root)?;
             write_json(stream, &context)
         }
         "/api/mission-log" => {
@@ -530,4 +530,3 @@ fn hex_value(byte: u8) -> anyhow::Result<u8> {
         _ => bail!("invalid percent-encoded path component"),
     }
 }
-

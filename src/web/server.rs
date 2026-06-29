@@ -16,8 +16,8 @@ use serde_json::json;
 use crate::store::{
     add_global_observation, clear_loop_intervention, get_artifact, get_run, get_work_item_by_slug,
     list_artifacts, list_decisions, list_event_logs, list_observations, list_runs, open_store,
-    read_context, read_mission_log, request_loop_intervention, resume_loop, ArtifactKind,
-    GlobalObservationKind, LoopInterventionAction,
+    read_context_with_conduct_lifecycle, read_mission_log, request_loop_intervention, resume_loop,
+    ArtifactKind, GlobalObservationKind, LoopInterventionAction,
 };
 
 const MAX_HEADER_BYTES: usize = 16 * 1024;
@@ -198,4 +198,3 @@ impl WebApiError {
         }
     }
 }
-

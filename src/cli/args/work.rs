@@ -13,6 +13,16 @@ pub struct WorkArgs {
     pub command: WorkCommand,
 }
 
+#[derive(Debug, Args)]
+#[command(
+    after_help = "Examples:\n  ldgr next\n  ldgr next --commands\n\nUse --commands to print exact suggested control-surface commands for the current adapter-aware handoff."
+)]
+pub struct NextArgs {
+    /// Print suggested next commands instead of only the next work item.
+    #[arg(long)]
+    pub commands: bool,
+}
+
 #[derive(Debug, Subcommand)]
 pub enum WorkCommand {
     /// List work items.

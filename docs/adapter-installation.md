@@ -53,4 +53,22 @@ ldgr code --help
 ldgr code check all
 ```
 
+Core lifecycle commands keep precedence over adapter namespaces. If a top-level
+token is not a built-in command, LDGR matches it against installed namespace
+names and aliases, executes the declared `argv`, and appends the remaining user
+arguments exactly.
+
+The adapter process inherits stdout and stderr. A nonzero adapter exit status is
+returned by `ldgr`, and failure to start the adapter process is reported with the
+adapter slug, namespace, and command. LDGR also exports the selected core context
+through environment variables:
+
+```text
+LDGR_DB
+LDGR_ARTIFACT_ROOT
+LDGR_WORKING_DIR
+LDGR_ADAPTER_SLUG
+LDGR_ADAPTER_NAMESPACE
+```
+
 Core help, status, and context include installed adapter profiles and commands.

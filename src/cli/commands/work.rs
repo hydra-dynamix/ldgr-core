@@ -6,9 +6,11 @@ use crate::store::{
 };
 
 use super::super::args::{
-    CliGlobalObservationStatus, NoticeArgs, NoticeCommand, WorkArgs, WorkCommand, WorkStatusCommand,
+    CliGlobalObservationStatus, NextArgs, NoticeArgs, NoticeCommand, WorkArgs, WorkCommand,
+    WorkStatusCommand,
 };
 use super::super::checked_limit;
+use super::super::render::brief_context::suggested_next_commands;
 use super::super::render::emit;
 use super::super::render::text::{print_global_observations, print_work_item, print_work_items};
 
@@ -117,7 +119,14 @@ pub fn handle_notice(connection: &rusqlite::Connection, args: NoticeArgs) -> any
     Ok(())
 }
 
-pub fn handle_next(connection: &rusqlite::Connection) -> anyhow::Result<()> {
+pub fn handle_next(connection: &rusqlite::Connection, args: NextArgs) -> anyhow::Result<()> {
+    if args.commands {
+        let context = crate::store::read_context(connection)?;
+        for command in suggested_next_commands(&context) {
+            println!("{command}");
+        }
+        return Ok(());
+    }
     if let Some(work_item) = next_pending_work_item(connection)? {
         println!("{} {}", work_item.slug, work_item.title);
     } else {

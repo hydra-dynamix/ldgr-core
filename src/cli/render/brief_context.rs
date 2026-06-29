@@ -1,6 +1,7 @@
 use serde::Serialize;
 
-use crate::store::StoreContext;
+use crate::adapter_registry::{AdapterCommandNamespace, AdapterRegistry};
+use crate::store::{ConductLifecycleSummary, StoreContext};
 
 use super::display_optional_id;
 
@@ -22,6 +23,8 @@ pub(crate) struct BriefContext {
     pub latest_decision: Option<BriefDecision>,
     pub latest_observations: Vec<BriefObservation>,
     pub latest_validations: Vec<BriefValidation>,
+    pub installed_adapter_namespaces: Vec<BriefAdapterNamespace>,
+    pub conduct_lifecycle: Option<ConductLifecycleSummary>,
     pub handoff: BriefHandoff,
     pub next_commands: Vec<String>,
     pub brief_context_command: String,
@@ -86,6 +89,14 @@ pub(crate) struct BriefValidation {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub(crate) struct BriefAdapterNamespace {
+    pub adapter: String,
+    pub namespace: String,
+    pub command: String,
+    pub summary: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub(crate) struct BriefHandoff {
     pub has_active_run: bool,
     pub has_next_work: bool,
@@ -94,6 +105,8 @@ pub(crate) struct BriefHandoff {
 
 pub(crate) fn brief_context(context: &StoreContext, options: BriefContextOptions) -> BriefContext {
     let handoff = brief_handoff(context);
+    let registry = AdapterRegistry::discover();
+    let installed_adapter_namespaces = installed_adapter_namespaces(&registry);
     BriefContext {
         work_items: BriefWorkCounts {
             pending: context.pending_work_items,
@@ -176,8 +189,10 @@ pub(crate) fn brief_context(context: &StoreContext, options: BriefContextOptions
                     .map(|rationale| compact_text(rationale, options.width)),
             })
             .collect(),
+        installed_adapter_namespaces,
+        conduct_lifecycle: context.conduct_lifecycle.clone(),
         handoff: handoff.clone(),
-        next_commands: next_commands(context, &handoff),
+        next_commands: next_commands_with_registry(context, &handoff, &registry),
         brief_context_command: "ldgr status".to_owned(),
         full_context_command: "ldgr context".to_owned(),
     }
@@ -213,6 +228,8 @@ pub(crate) fn print_brief_context(context: &BriefContext) {
     print_latest_decision(context.latest_decision.as_ref());
     print_latest_observations(&context.latest_observations);
     print_latest_validations(&context.latest_validations);
+    print_adapter_namespaces(&context.installed_adapter_namespaces);
+    print_conduct_lifecycle(context.conduct_lifecycle.as_ref());
     print_next_commands(&context.next_commands);
     println!("brief_context: {}", context.brief_context_command);
     println!("full_context: {}", context.full_context_command);
@@ -227,31 +244,155 @@ fn brief_handoff(context: &StoreContext) -> BriefHandoff {
     }
 }
 
-fn next_commands(context: &StoreContext, handoff: &BriefHandoff) -> Vec<String> {
+pub(crate) fn suggested_next_commands(context: &StoreContext) -> Vec<String> {
+    let handoff = brief_handoff(context);
+    let registry = AdapterRegistry::discover();
+    next_commands_with_registry(context, &handoff, &registry)
+}
+
+fn next_commands_with_registry(
+    context: &StoreContext,
+    handoff: &BriefHandoff,
+    registry: &AdapterRegistry,
+) -> Vec<String> {
+    let adapter_commands = adapter_next_commands(context, registry);
     if handoff.needs_decision {
         if let Some(run) = context.active_runs.first() {
-            return vec![
+            let mut commands = adapter_commands;
+            commands.extend([
                 format!("ldgr observation add {} --body <evidence>", run.run_id),
                 format!(
                     "ldgr run close {} --status <success|partial|failed> --outcome <continue|stop> --rationale <why>",
                     run.run_id
                 ),
-            ];
+            ]);
+            return dedup_commands(commands);
         }
         if let Some(work_slug) = &context.loop_state.work_slug {
-            return vec![format!(
+            let mut commands = adapter_commands;
+            commands.push(format!(
                 "ldgr decision record {work_slug} --outcome <continue|stop> --rationale <why>"
-            )];
+            ));
+            return dedup_commands(commands);
         }
-        return Vec::new();
+        return adapter_commands;
     }
     if let Some(work_item) = &context.next_work_item {
-        return vec![format!(
+        let mut commands = adapter_commands;
+        commands.push(format!(
             "ldgr run start {} --command <what-ran>",
             work_item.slug
-        )];
+        ));
+        return dedup_commands(commands);
     }
-    vec!["ldgr work create <slug> --title <title> --description <description>".to_owned()]
+    let mut commands = adapter_commands;
+    commands.push("ldgr work create <slug> --title <title> --description <description>".to_owned());
+    dedup_commands(commands)
+}
+
+fn adapter_next_commands(context: &StoreContext, registry: &AdapterRegistry) -> Vec<String> {
+    let Some(conduct) = conduct_namespace(registry) else {
+        return Vec::new();
+    };
+    let prefix = format!("ldgr {}", conduct.namespace);
+    let batch_id = infer_batch_id(context).unwrap_or_else(|| "<batch-id>".to_owned());
+    vec![
+        format!("{prefix} status"),
+        format!("{prefix} batch status --batch-id {batch_id} --json"),
+        format!("{prefix} batch refresh --batch-id {batch_id}"),
+        format!("{prefix} batch launch --graph <graph.md> --batch-id {batch_id} --graph-artifact <graph-artifact-id> --ticket-index-artifact <index-artifact-id> --agent-command <worker-agent-command>"),
+    ]
+}
+
+fn conduct_namespace(registry: &AdapterRegistry) -> Option<&AdapterCommandNamespace> {
+    registry
+        .adapters
+        .iter()
+        .flat_map(|adapter| &adapter.command_namespaces)
+        .find(|namespace| {
+            namespace.namespace == "conduct"
+                || namespace.adapter_slug.contains("conduct")
+                || namespace
+                    .argv
+                    .first()
+                    .is_some_and(|argv| argv.contains("ldgr-conduct"))
+        })
+}
+
+fn infer_batch_id(context: &StoreContext) -> Option<String> {
+    let mut fields = Vec::new();
+    if let Some(work_item) = &context.next_work_item {
+        fields.push(work_item.slug.as_str());
+        fields.push(work_item.title.as_str());
+        fields.push(work_item.description.as_str());
+    }
+    if let Some(work_slug) = &context.loop_state.work_slug {
+        fields.push(work_slug.as_str());
+    }
+    fields.push(context.loop_state.progress_report.as_str());
+    for run in &context.active_runs {
+        fields.push(run.work_slug.as_str());
+        if let Some(command) = &run.command {
+            fields.push(command.as_str());
+        }
+    }
+    for observation in &context.latest_observations {
+        fields.push(observation.body.as_str());
+    }
+    for observation in &context.global_observations {
+        fields.push(observation.body.as_str());
+    }
+    fields.into_iter().find_map(extract_batch_id)
+}
+
+fn extract_batch_id(text: &str) -> Option<String> {
+    for marker in ["--batch-id", "batch_id", "batch-id", "batch="] {
+        if let Some(index) = text.find(marker) {
+            let value = text[index + marker.len()..]
+                .trim_start_matches(|ch: char| ch == ':' || ch == '=' || ch.is_whitespace())
+                .trim_start_matches('`')
+                .chars()
+                .take_while(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '/'))
+                .collect::<String>()
+                .trim_end_matches(|ch| matches!(ch, '.' | ',' | ';' | ')' | ']'))
+                .to_owned();
+            if !value.is_empty() {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
+fn dedup_commands(commands: Vec<String>) -> Vec<String> {
+    let mut deduped = Vec::new();
+    for command in commands {
+        if !deduped.contains(&command) {
+            deduped.push(command);
+        }
+    }
+    deduped
+}
+
+fn installed_adapter_namespaces(registry: &AdapterRegistry) -> Vec<BriefAdapterNamespace> {
+    registry
+        .adapters
+        .iter()
+        .flat_map(|adapter| {
+            adapter
+                .command_namespaces
+                .iter()
+                .map(|namespace| BriefAdapterNamespace {
+                    adapter: adapter.slug.clone(),
+                    namespace: namespace.namespace.clone(),
+                    command: format!("ldgr {}", namespace.namespace),
+                    summary: namespace
+                        .summary
+                        .clone()
+                        .or_else(|| namespace.description.clone()),
+                })
+        })
+        .collect()
 }
 
 fn print_handoff(handoff: &BriefHandoff) {
@@ -320,6 +461,70 @@ fn print_latest_validations(validations: &[BriefValidation]) {
         }
         if let Some(rationale) = &validation.rationale {
             println!("  rationale: {rationale}");
+        }
+    }
+}
+
+fn print_adapter_namespaces(namespaces: &[BriefAdapterNamespace]) {
+    if namespaces.is_empty() {
+        println!("installed_adapter_namespaces: none");
+        return;
+    }
+    println!("installed_adapter_namespaces:");
+    for namespace in namespaces {
+        println!(
+            "- adapter={} namespace={} command={}",
+            namespace.adapter, namespace.namespace, namespace.command
+        );
+        if let Some(summary) = &namespace.summary {
+            println!("  summary: {}", compact_text(summary, COMMAND_WIDTH));
+        }
+    }
+}
+
+fn print_conduct_lifecycle(summary: Option<&ConductLifecycleSummary>) {
+    let Some(summary) = summary else {
+        return;
+    };
+    println!(
+        "conduct_lifecycle: batch_id={} status={} workers=total:{} complete:{} active:{} blocked:{} terminal:{} next_valid_action={}",
+        summary.batch_id,
+        summary.status,
+        summary.worker_counts.total,
+        summary.worker_counts.complete,
+        summary.worker_counts.active,
+        summary.worker_counts.blocked,
+        summary.worker_counts.terminal,
+        summary.next_valid_action
+    );
+    if let Some(current_wave) = &summary.current_wave {
+        println!("conduct_current_wave: {current_wave}");
+    }
+    if summary.graph_artifact_id.is_some()
+        || summary.ticket_index_artifact_id.is_some()
+        || summary.batch_state_artifact_id.is_some()
+    {
+        println!(
+            "conduct_artifacts: graph={} ticket_index={} batch_state={}",
+            summary
+                .graph_artifact_id
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| "unknown".to_owned()),
+            summary
+                .ticket_index_artifact_id
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| "unknown".to_owned()),
+            summary
+                .batch_state_artifact_id
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| "unknown".to_owned())
+        );
+    }
+    if let Some(warning) = &summary.stale_next_work {
+        println!("conduct_warning: {}", warning.message);
+        println!("conduct_warning_commands:");
+        for command in &warning.suggested_commands {
+            println!("- {command}");
         }
     }
 }
