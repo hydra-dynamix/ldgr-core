@@ -2,12 +2,26 @@ use anyhow::bail;
 
 use crate::adapter_registry::{AdapterCommand as RegistryCommand, AdapterRegistry};
 
-use super::super::args::{AdapterArgs, AdapterCommand};
+use super::super::args::{
+    AdapterArgs, AdapterCommand, InstallAdapterArgs as CoreInstallAdapterArgs,
+};
 
 pub fn handle_adapter(args: AdapterArgs) -> anyhow::Result<()> {
     let registry = AdapterRegistry::discover();
     print_warnings(&registry);
     match args.command {
+        AdapterCommand::Install(args) => {
+            if args.name == "list" {
+                super::ops::print_available_adapter_catalog();
+                return Ok(());
+            }
+            super::ops::handle_install_adapter(&CoreInstallAdapterArgs {
+                name: args.name,
+                source_root: args.source_root,
+                install_root: args.install_root,
+                yes: args.yes,
+            })
+        }
         AdapterCommand::List(args) => {
             if args.json {
                 println!("{}", serde_json::to_string_pretty(&registry)?);

@@ -25,11 +25,14 @@ Discovery reads `LDGR_ADAPTER_PATH`, project `.ldgr` for explicit development ov
 ## Install
 
 ```bash
-ldgr install adapter code
-ldgr install adapter security
+ldgr adapter install list
+ldgr adapter install conduct
+ldgr adapter install research
 ```
 
-Open-source adapter installs currently call the adapter package's own installer and write the bundle to `~/.ldgr/<adapter>`. Adapter-owned skills/extensions are copied into configured harness locations when present.
+`ldgr adapter install list` shows installable adapters and where they come from. Core installation acquires or runs the adapter binary, then delegates setup to the adapter-owned installer. The adapter writes its bundle to `~/.ldgr/<adapter>`, installs adapter-owned skills/extensions into configured harness locations, and records license paths in `~/.ldgr/config.json` when the adapter supports commercial licensing.
+
+The older `ldgr install adapter <slug>` path remains a compatibility alias for source-checkout installs.
 
 ## Dynamic command surface
 

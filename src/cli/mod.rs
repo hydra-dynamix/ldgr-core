@@ -37,6 +37,8 @@ Autonomous loop:
   loop run --prompt prompts/loop-prompt.md --agent agentctl
 
 Adapters:
+  adapter install list
+  adapter install <slug>
   adapter list
   adapter show <slug-or-alias>
   <adapter-namespace> <args...>    # dynamically dispatched from installed adapter.toml
@@ -87,6 +89,8 @@ pub(crate) const CLI_FULL_HELP_SECTIONS: &str = r#"Core command tree:
     create
     seal
   adapter
+    install
+      list | <slug>
     list
     show
     dispatch
@@ -188,6 +192,7 @@ where
         {
             error.print()?;
             if matches!(error.kind(), ErrorKind::DisplayHelp) {
+                commands::ops::print_available_adapter_catalog();
                 print_dynamic_adapter_help();
             }
             return Ok(());
@@ -216,6 +221,7 @@ fn handle_cli(cli: Cli) -> anyhow::Result<()> {
     let Some(command) = cli.command else {
         Cli::command().print_help()?;
         println!();
+        commands::ops::print_available_adapter_catalog();
         print_dynamic_adapter_help();
         return Ok(());
     };

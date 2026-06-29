@@ -117,10 +117,10 @@ pub fn handle_install(args: InstallArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn handle_install_adapter(args: &InstallAdapterArgs) -> anyhow::Result<()> {
+pub(crate) fn handle_install_adapter(args: &InstallAdapterArgs) -> anyhow::Result<()> {
     let adapter = normalize_adapter_name(&args.name);
     let Some(package) = open_source_adapter_package(&adapter) else {
-        bail!("unknown open-source adapter `{}`", args.name);
+        bail!("adapter `{}` is listed but not installable from this source checkout yet; run `ldgr adapter install list` for source/release information", args.name);
     };
     let home = home_dir()?;
     let install_root = args
@@ -162,16 +162,90 @@ fn normalize_adapter_name(name: &str) -> String {
 }
 
 fn open_source_adapter_package(adapter: &str) -> Option<&'static str> {
-    match adapter {
-        "example" => Some("ldgr-example-adapter"),
-        "research" => Some("ldgr-research"),
-        "code" => Some("ldgr-code"),
-        "bench" => Some("ldgr-bench"),
-        "explore" => Some("ldgr-explore"),
-        "security" => Some("ldgr-security"),
-        "conduct" => Some("ldgr-conduct"),
-        _ => None,
+    available_adapter_catalog()
+        .iter()
+        .find(|entry| entry.slug == adapter)
+        .and_then(|entry| entry.workspace_package)
+}
+
+struct AvailableAdapter {
+    slug: &'static str,
+    title: &'static str,
+    source: &'static str,
+    install: &'static str,
+    workspace_package: Option<&'static str>,
+}
+
+fn available_adapter_catalog() -> &'static [AvailableAdapter] {
+    &[
+        AvailableAdapter {
+            slug: "conduct",
+            title: "LDGR Conduct adapter",
+            source: "commercial release / local workspace",
+            install: "ldgr adapter install conduct",
+            workspace_package: Some("ldgr-conduct"),
+        },
+        AvailableAdapter {
+            slug: "research",
+            title: "Research adapter",
+            source: "https://github.com/hydra-dynamix/ldgr-research",
+            install: "ldgr adapter install research",
+            workspace_package: Some("ldgr-research"),
+        },
+        AvailableAdapter {
+            slug: "example",
+            title: "Public example adapter",
+            source: "https://github.com/hydra-dynamix/ldgr-example-adapter",
+            install: "ldgr adapter install example",
+            workspace_package: Some("ldgr-example-adapter"),
+        },
+        AvailableAdapter {
+            slug: "programbench",
+            title: "Clean-room ProgramBench adapter",
+            source: "https://github.com/hydra-dynamix/ldgr-programbench",
+            install: "ldgr adapter install programbench",
+            workspace_package: None,
+        },
+        AvailableAdapter {
+            slug: "code",
+            title: "Coding adapter",
+            source: "commercial release catalog",
+            install: "ldgr adapter install code",
+            workspace_package: None,
+        },
+        AvailableAdapter {
+            slug: "security",
+            title: "Security adapter",
+            source: "commercial release catalog",
+            install: "ldgr adapter install security",
+            workspace_package: None,
+        },
+        AvailableAdapter {
+            slug: "explore",
+            title: "Explore adapter",
+            source: "commercial release catalog",
+            install: "ldgr adapter install explore",
+            workspace_package: None,
+        },
+        AvailableAdapter {
+            slug: "bench",
+            title: "Bench adapter",
+            source: "commercial release catalog",
+            install: "ldgr adapter install bench",
+            workspace_package: None,
+        },
+    ]
+}
+
+pub(crate) fn print_available_adapter_catalog() {
+    println!("Available adapters:");
+    for entry in available_adapter_catalog() {
+        println!("  {} — {} [{}]", entry.slug, entry.title, entry.source);
+        println!("    install: {}", entry.install);
+        println!("    after install: ldgr {} --help", entry.slug);
     }
+    println!("  installed adapters: ldgr adapter list");
+    println!("  adapter details: ldgr adapter show <slug>");
 }
 
 fn find_source_root(start: PathBuf) -> anyhow::Result<PathBuf> {
@@ -765,6 +839,7 @@ fn timestamp_nanos() -> u128 {
 
 fn print_cli_hierarchy() {
     print!("{CLI_DEFAULT_HELP_SECTIONS}");
+    print_available_adapter_catalog();
     println!("Use `ldgr <command> --help` for flags, or `ldgr --full` for the core command map.");
 }
 

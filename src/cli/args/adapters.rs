@@ -1,6 +1,6 @@
 use clap::{Args, Subcommand};
 
-const ADAPTER_HELP: &str = "Examples:\n  ldgr adapter list\n  ldgr adapter show code\n  ldgr code --help\n  ldgr adapter dispatch code-check-all\n\nAdapters are discovered from LDGR_ADAPTER_PATH, .ldgr, LDGR_HOME, and ~/.ldgr. Core dynamically dispatches installed adapter namespaces declared by adapter.toml.";
+const ADAPTER_HELP: &str = "Examples:\n  ldgr adapter install list\n  ldgr adapter install conduct\n  ldgr adapter list\n  ldgr adapter show conduct\n  ldgr conduct --help\n  ldgr adapter dispatch conduct-batch-status\n\nAdapters are installed under ~/.ldgr/<adapter>/adapter.toml. Core dynamically dispatches installed adapter namespaces declared by adapter.toml.";
 
 #[derive(Debug, Args)]
 #[command(after_help = ADAPTER_HELP)]
@@ -11,12 +11,32 @@ pub struct AdapterArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum AdapterCommand {
+    /// Install an adapter or list adapters available to install.
+    Install(AdapterInstallArgs),
     /// List installed adapters.
     List(ListAdapterArgs),
     /// Show one installed adapter by slug or alias.
     Show(ShowAdapterArgs),
     /// Resolve advertised adapter command metadata without executing it.
     Dispatch(DispatchAdapterArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct AdapterInstallArgs {
+    /// Adapter slug to install, or `list` to show available adapters.
+    pub name: String,
+
+    /// Source checkout root containing adapter crates. Defaults to the current directory or an ancestor for source installs.
+    #[arg(long)]
+    pub source_root: Option<std::path::PathBuf>,
+
+    /// Exact install directory. Defaults to ~/.ldgr/<adapter>.
+    #[arg(long)]
+    pub install_root: Option<std::path::PathBuf>,
+
+    /// Accept defaults and do not prompt.
+    #[arg(long)]
+    pub yes: bool,
 }
 
 #[derive(Debug, Args)]
