@@ -13,7 +13,8 @@ use tempfile::TempDir;
 
 #[test]
 fn top_level_help_shows_core_loop_and_hides_mature_project_surface() -> anyhow::Result<()> {
-    let mut command = Command::cargo_bin("ldgr")?;
+    let project = TempDir::new()?;
+    let mut command = isolated_command(project.path())?;
     command.arg("--help");
     command.assert().success().stdout(
         predicate::str::contains("Core loop:")
@@ -36,7 +37,8 @@ fn top_level_help_shows_core_loop_and_hides_mature_project_surface() -> anyhow::
 
 #[test]
 fn full_help_shows_core_command_tree_and_research_split() -> anyhow::Result<()> {
-    let mut command = Command::cargo_bin("ldgr")?;
+    let project = TempDir::new()?;
+    let mut command = isolated_command(project.path())?;
     command.arg("--full");
     command.assert().success().stdout(
         predicate::str::contains("Core command tree:")
@@ -61,7 +63,8 @@ fn full_help_shows_core_command_tree_and_research_split() -> anyhow::Result<()> 
 
 #[test]
 fn invalid_command_input_prints_last_parsable_help() -> anyhow::Result<()> {
-    let mut command = Command::cargo_bin("ldgr")?;
+    let project = TempDir::new()?;
+    let mut command = isolated_command(project.path())?;
     command.args(["status", "update"]);
     command.assert().failure().stdout(
         predicate::str::contains("Examples:")
@@ -71,7 +74,7 @@ fn invalid_command_input_prints_last_parsable_help() -> anyhow::Result<()> {
             )),
     );
 
-    let mut command = Command::cargo_bin("ldgr")?;
+    let mut command = isolated_command(project.path())?;
     command.args(["work", "bogus"]);
     command
         .assert()
@@ -84,7 +87,8 @@ fn invalid_command_input_prints_last_parsable_help() -> anyhow::Result<()> {
 
 #[test]
 fn web_help_documents_default_loopback_port() -> anyhow::Result<()> {
-    let mut command = Command::cargo_bin("ldgr")?;
+    let project = TempDir::new()?;
+    let mut command = isolated_command(project.path())?;
     command.args(["web", "--help"]);
     command.assert().success().stdout(
         predicate::str::contains("--host <HOST>")
@@ -1273,8 +1277,12 @@ fn context_brief_prints_agent_on_ramp_without_full_cockpit_noise() -> anyhow::Re
         "ldgr observation add 1 --body <evidence>",
     ))
     .stdout(predicate::str::contains(
-        "ldgr run close 1 --status <success|partial|failed> --outcome <continue|stop> --rationale <why>",
+        "ldgr run close 1 --status <success|partial|failed> --outcome stop --rationale <why>",
     ))
+    .stdout(predicate::str::contains(
+        "ldgr run close 1 --status <success|partial|failed> --outcome continue --rationale <why> --next-slug <slug> --next-title <title> --next-description <description>",
+    ))
+    .stdout(predicate::str::contains("--outcome <continue|stop>").not())
     .stdout(predicate::str::contains("brief_context: ldgr status"))
     .stdout(predicate::str::contains("full_context: ldgr context"))
     .stdout(predicate::str::contains(
@@ -1293,6 +1301,9 @@ fn context_brief_prints_agent_on_ramp_without_full_cockpit_noise() -> anyhow::Re
     .stdout(predicate::str::contains(r#""loop_state""#))
     .stdout(predicate::str::contains(r#""work": "brief-next""#))
     .stdout(predicate::str::contains(r#""next_commands""#))
+    .stdout(predicate::str::contains(
+        r#""ldgr run close 1 --status <success|partial|failed> --outcome continue --rationale <why> --next-slug <slug> --next-title <title> --next-description <description>""#,
+    ))
     .stdout(predicate::str::contains(
         r#""brief_context_command": "ldgr status""#,
     ))
@@ -1318,6 +1329,68 @@ fn context_brief_prints_agent_on_ramp_without_full_cockpit_noise() -> anyhow::Re
     .success()
     .stdout(predicate::str::contains(r#""brief_context_command""#))
     .stdout(predicate::str::contains(r#""latest_events""#).not());
+
+    Ok(())
+}
+
+#[test]
+fn active_run_with_queued_next_work_prints_explicit_continue_next_slug() -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    let db_path = project.path().join(".ldgr/ldgr.db");
+    let artifact_root = project.path().join(".ldgr/artifacts");
+
+    run(project.path(), &db_path, &artifact_root, ["init"])?;
+    run(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        [
+            "work",
+            "create",
+            "active-work",
+            "--title",
+            "Active work",
+            "--description",
+            "Close this work with a queued next item.",
+        ],
+    )?;
+    run(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        [
+            "work",
+            "create",
+            "queued-work",
+            "--title",
+            "Queued work",
+            "--description",
+            "Already queued follow-up work.",
+        ],
+    )?;
+    run(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        ["run", "start", "active-work"],
+    )?;
+
+    command(project.path(), &db_path, &artifact_root, ["status"])?
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "handoff: active_run=true next_work=true needs_decision=true",
+        ))
+        .stdout(predicate::str::contains(
+            "ldgr observation add 1 --body <evidence>",
+        ))
+        .stdout(predicate::str::contains(
+            "ldgr run close 1 --status <success|partial|failed> --outcome continue --rationale <why> --next-slug queued-work",
+        ))
+        .stdout(predicate::str::contains(
+            "ldgr run close 1 --status <success|partial|failed> --outcome stop --rationale <why>",
+        ))
+        .stdout(predicate::str::contains("--outcome <continue|stop>").not());
 
     Ok(())
 }
@@ -3494,7 +3567,7 @@ fn command<const ARG_COUNT: usize>(
     artifact_root: &Path,
     args: [&str; ARG_COUNT],
 ) -> anyhow::Result<Command> {
-    let mut command = Command::cargo_bin("ldgr")?;
+    let mut command = isolated_command(project)?;
     command
         .current_dir(project)
         .arg("--db")
@@ -3502,6 +3575,18 @@ fn command<const ARG_COUNT: usize>(
         .arg("--artifact-root")
         .arg(artifact_root)
         .args(args);
+    Ok(command)
+}
+
+fn isolated_command(project: &Path) -> anyhow::Result<Command> {
+    let mut command = Command::cargo_bin("ldgr")?;
+    command
+        .env(
+            "LDGR_ADAPTER_PATH",
+            project.join(".ldgr/test-empty-adapters"),
+        )
+        .env("LDGR_HOME", project.join(".ldgr/test-empty-ldgr-home"))
+        .env("HOME", project.join(".ldgr/test-empty-home"));
     Ok(command)
 }
 
