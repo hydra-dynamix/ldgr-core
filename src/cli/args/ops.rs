@@ -173,8 +173,8 @@ pub struct LoopRunArgs {
     #[arg(long)]
     pub stream_agent_output: bool,
 
-    /// Maximum seconds to wait for each spawned agent process.
-    #[arg(long, default_value_t = 12 * 60 * 60, value_parser = clap::value_parser!(u64).range(1..))]
+    /// Maximum seconds to wait for each spawned agent process. Zero disables the wall-clock timeout.
+    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u64))]
     pub agent_timeout_seconds: u64,
 
     /// Maximum number of loop sessions to run before returning.

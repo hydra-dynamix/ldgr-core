@@ -76,6 +76,7 @@ pub fn handle_install(args: InstallArgs) -> anyhow::Result<()> {
         installed.push(install_harness(*harness, &home)?);
     }
     let agentctl = ensure_agentctl_dependency(args.no_agentctl)?;
+    let agentctl_config = install_agentctl_config(&home, &harnesses)?;
 
     let config = serde_json::json!({
         "schema_version": 1,
@@ -83,6 +84,7 @@ pub fn handle_install(args: InstallArgs) -> anyhow::Result<()> {
         "selected_harnesses": harnesses.iter().map(|harness| harness_name(*harness)).collect::<Vec<_>>(),
         "installed": installed,
         "agentctl": agentctl,
+        "agentctl_config": agentctl_config,
         "adapter_files": {
             "default_global_path": "~/.ldgr/<adapter>",
             "note": "Adapter bundle files install globally under ~/.ldgr/<adapter>; adapter-owned skills/extensions install into the configured harness locations."
@@ -424,6 +426,84 @@ fn ensure_agentctl_dependency(skip: bool) -> anyhow::Result<serde_json::Value> {
         "command": "agentctl",
         "source": AGENTCTL_REPO
     }))
+}
+
+fn install_agentctl_config(
+    home: &Path,
+    harnesses: &[HarnessKind],
+) -> anyhow::Result<serde_json::Value> {
+    let config_path = home.join(".ldgr/agentctl/harness.toml");
+    let config = render_agentctl_config(harnesses);
+    write_file(&config_path, &config)?;
+    println!("├─ agentctl config {}", config_path.display());
+    Ok(serde_json::json!({
+        "path": config_path,
+        "agents": harnesses.iter().map(|harness| harness_name(*harness)).collect::<Vec<_>>(),
+        "task": "ldgr-loop",
+        "note": "agentctl is the canonical LDGR agent control plane; ldgr loop run --agent agentctl uses this global harness config."
+    }))
+}
+
+fn render_agentctl_config(harnesses: &[HarnessKind]) -> String {
+    let primary = harnesses.first().copied().unwrap_or(HarnessKind::Pi);
+    let mut commands = Vec::<Vec<&'static str>>::new();
+    for harness in harnesses {
+        commands.extend(agentctl_commands_for_harness(*harness));
+    }
+    commands.sort();
+    commands.dedup();
+    let allowed = commands
+        .iter()
+        .filter_map(|command| command.first().copied())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .map(|command| format!("\"{command}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut rendered = format!(
+        "allowed_commands = [{allowed}]\nallowed_builtins = [\"read\"]\nenv_allowlist = [\"PATH\", \"HOME\", \"ANTHROPIC_API_KEY\", \"ANTHROPIC_OAUTH_TOKEN\", \"OPENAI_API_KEY\", \"CODEX_HOME\", \"PI_CODING_AGENT_DIR\"]\n\n"
+    );
+    rendered.push_str("[tasks.ldgr-loop]\ncommands = [");
+    rendered.push_str(&render_agentctl_command(&agentctl_primary_command(primary)));
+    rendered.push_str("]\n\n");
+    for harness in harnesses {
+        rendered.push_str(&format!(
+            "[tasks.ldgr-loop-{}]\ncommands = [",
+            harness_name(*harness)
+        ));
+        rendered.push_str(&render_agentctl_command(&agentctl_primary_command(
+            *harness,
+        )));
+        rendered.push_str("]\n\n");
+    }
+    rendered
+}
+
+fn agentctl_commands_for_harness(harness: HarnessKind) -> Vec<Vec<&'static str>> {
+    match harness {
+        HarnessKind::Pi => vec![vec!["pi", "-p"]],
+        HarnessKind::Codex => vec![vec!["codex", "exec", "--sandbox", "workspace-write"]],
+        HarnessKind::Claude => vec![vec!["claude", "-p"]],
+        HarnessKind::Openclaw => vec![vec!["openclaw", "run"], vec!["opencode", "run"]],
+    }
+}
+
+fn agentctl_primary_command(harness: HarnessKind) -> Vec<&'static str> {
+    agentctl_commands_for_harness(harness)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| vec!["pi", "-p"])
+}
+
+fn render_agentctl_command(command: &[&str]) -> String {
+    format!(
+        "[{}]",
+        command
+            .iter()
+            .map(|part| format!("\"{part}\""))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
 }
 
 fn command_on_path(command: &str) -> bool {

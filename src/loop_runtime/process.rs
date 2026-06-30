@@ -54,7 +54,23 @@ impl ProcessCapture {
 }
 
 fn default_agentctl_argv() -> Vec<String> {
-    vec!["agentctl".to_owned(), "run".to_owned()]
+    let config = std::env::var_os("LDGR_AGENTCTL_CONFIG")
+        .map(PathBuf::from)
+        .unwrap_or_else(global_agentctl_config_path);
+    vec![
+        "agentctl".to_owned(),
+        "--config".to_owned(),
+        config.display().to_string(),
+        "run".to_owned(),
+        std::env::var("LDGR_AGENTCTL_TASK").unwrap_or_else(|_| "ldgr-loop".to_owned()),
+    ]
+}
+
+fn global_agentctl_config_path() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("~"))
+        .join(".ldgr/agentctl/harness.toml")
 }
 
 fn agent_output_argv(agent: &LoopAgent) -> Vec<String> {
@@ -401,7 +417,7 @@ fn wait_child_with_timeout(
         {
             return Ok(status);
         }
-        if started.elapsed() >= timeout {
+        if !timeout.is_zero() && started.elapsed() >= timeout {
             terminate_child_process_tree(child, process_tree);
             bail!(
                 "process `{command}` timed out after {} seconds",

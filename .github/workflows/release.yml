@@ -1,0 +1,109 @@
+name: Binary release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Semantic version to release, e.g. 0.1.1. Defaults to Cargo.toml version."
+        required: false
+        type: string
+      prerelease:
+        description: "Mark the GitHub release as prerelease"
+        required: true
+        default: true
+        type: boolean
+      runs_on:
+        description: "Runner label"
+        required: true
+        default: "self-hosted"
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux:
+    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runs_on || 'self-hosted' }}
+    env:
+      PACKAGE: ldgr-core
+      BINARY: ldgr
+      RELEASE_NAME: ldgr-core
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Resolve version and platform
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ github.event_name == 'workflow_dispatch' && inputs.version || '' }}"
+          if [[ -z "$version" ]]; then
+            version="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; data=json.load(sys.stdin); print(next(p["version"] for p in data["packages"] if p["name"]=="ldgr-core"))')"
+          fi
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "version must be semantic version syntax" >&2
+            exit 1
+          fi
+          case "$(uname -m)" in
+            x86_64|amd64) platform='linux-x86_64' ;;
+            aarch64|arm64) platform='linux-aarch64' ;;
+            *) echo "unsupported runner architecture: $(uname -m)" >&2; exit 1 ;;
+          esac
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "platform=$platform" >> "$GITHUB_OUTPUT"
+
+      - name: Build binary
+        run: cargo build --release -p "$PACKAGE"
+
+      - name: Package archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.meta.outputs.version }}"
+          platform="${{ steps.meta.outputs.platform }}"
+          staging="dist/${RELEASE_NAME}-${version}/${platform}"
+          archive="dist/${RELEASE_NAME}-${version}-${platform}.tar.gz"
+          mkdir -p "$staging"
+          cp "target/release/${BINARY}" "$staging/${BINARY}"
+          chmod +x "$staging/${BINARY}"
+          cp README.md LICENSE "dist/${RELEASE_NAME}-${version}/"
+          cat > "dist/${RELEASE_NAME}-${version}/RELEASE-METADATA.json" <<JSON
+          {
+            "schema_version": 1,
+            "package": "${PACKAGE}",
+            "binary": "${BINARY}",
+            "version": "${version}",
+            "platform": "${platform}",
+            "commit": "${GITHUB_SHA}",
+            "source_repository": "${GITHUB_REPOSITORY}"
+          }
+          JSON
+          tar -C dist -czf "$archive" "${RELEASE_NAME}-${version}"
+          sha256sum "$archive" > "${archive}.sha256"
+
+      - name: Create or update GitHub release
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.meta.outputs.version }}"
+          tag="v${version}"
+          title="${RELEASE_NAME} v${version}"
+          prerelease_flag=""
+          if [[ "${{ github.event_name == 'workflow_dispatch' && inputs.prerelease || 'true' }}" == "true" ]]; then
+            prerelease_flag="--prerelease"
+          fi
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" --title "$title" --notes "${RELEASE_NAME} ${version} binary release from ${GITHUB_SHA}." $prerelease_flag
+          fi
+          gh release upload "$tag" dist/${RELEASE_NAME}-${version}-*.tar.gz dist/${RELEASE_NAME}-${version}-*.tar.gz.sha256 --clobber
