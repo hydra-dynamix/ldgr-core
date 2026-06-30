@@ -31,6 +31,7 @@ jobs:
       PACKAGE: ldgr-core
       BINARY: ldgr
       RELEASE_NAME: ldgr-core
+      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
         with:
