@@ -79,6 +79,7 @@ jobs:
           cp "target/release/${BINARY}" "$staging/${BINARY}"
           chmod +x "$staging/${BINARY}"
           cp README.md LICENSE "dist/${RELEASE_NAME}-${version}/"
+          if [[ -f scripts/install.sh ]]; then mkdir -p "dist/${RELEASE_NAME}-${version}/scripts"; cp scripts/install.sh "dist/${RELEASE_NAME}-${version}/scripts/install.sh"; fi
           cat > "dist/${RELEASE_NAME}-${version}/RELEASE-METADATA.json" <<JSON
           {
             "schema_version": 1,

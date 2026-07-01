@@ -24,15 +24,28 @@ See `docs/ldgr-loop-philosophy.html` for the longer explanation of the loop.
 ## Install
 
 ```sh
-cargo install --git https://github.com/hydra-dynamix/ldgr-core ldgr-core
+curl -fsSL https://raw.githubusercontent.com/hydra-dynamix/ldgr-core/main/scripts/install.sh | sh
+```
+
+The installer detects the current OS/CPU, downloads the matching release archive,
+verifies its SHA-256 checksum when checksum tooling is available, and installs
+`ldgr` to `~/.local/bin` by default. Override with:
+
+```sh
+LDGR_VERSION=0.1.1 LDGR_INSTALL_DIR="$HOME/bin" sh -c "$(curl -fsSL https://raw.githubusercontent.com/hydra-dynamix/ldgr-core/main/scripts/install.sh)"
+```
+
+Source install remains available:
+
+```sh
+cargo install --git https://github.com/hydra-dynamix/ldgr-core --locked --force --package ldgr-core
 # or, from a source checkout:
 git clone https://github.com/hydra-dynamix/ldgr-core
 cd ldgr-core
 cargo install --path .
 ```
 
-Requires a recent stable Rust toolchain. SQLite is bundled; no system
-dependencies are needed.
+SQLite is bundled; source fallback requires a recent stable Rust toolchain.
 
 ## Quick start
 

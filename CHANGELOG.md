@@ -7,9 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Add `scripts/install.sh`, an OS/architecture-aware release installer for clean `curl | sh` installation of `ldgr`.
+
 ### Fixed
 
 - Suggest likely adapter names for `ldgr adapter install <adapter>` typos without silently executing fuzzy matches.
+- Install adapter skills only into Pi's configured global skill directory instead of also writing duplicate global `~/.agents/skills` copies.
 
 ## [0.1.0] - 2026-06-11
 

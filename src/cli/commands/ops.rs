@@ -698,13 +698,7 @@ fn install_adapter_harness_assets(
     if skills.is_dir() {
         let pi_skills = home.join(".pi/agent/skills");
         copy_directory_children(&skills, &pi_skills)?;
-        let portable_skills = home.join(".agents/skills");
-        copy_directory_children(&skills, &portable_skills)?;
-        println!(
-            "├─ Harness skills {} and {}",
-            pi_skills.display(),
-            portable_skills.display()
-        );
+        println!("├─ Harness skills {}", pi_skills.display());
     }
     let extensions = install_root.join("extensions");
     if extensions.is_dir() {
@@ -987,7 +981,7 @@ fn install_pi_harness(home: &Path) -> anyhow::Result<serde_json::Value> {
     Ok(serde_json::json!({
         "harness": "pi",
         "extension_paths": [extension],
-        "skill_paths": [home.join(".pi/agent/skills"), home.join(".agents/skills")],
+        "skill_paths": [home.join(".pi/agent/skills")],
         "reload": "Run /reload in Pi, then use /ldgr <args> or /ldgr-context."
     }))
 }
