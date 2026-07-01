@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Use Cargo's positional crate argument for git adapter installs so release fallback can install open adapters such as `ldgr-research`.
 - Suggest likely adapter names for `ldgr adapter install <adapter>` typos without silently executing fuzzy matches.
 - Install adapter skills only into Pi's configured global skill directory instead of also writing duplicate global `~/.agents/skills` copies.
 

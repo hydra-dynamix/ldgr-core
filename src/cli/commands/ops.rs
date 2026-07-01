@@ -475,18 +475,21 @@ fn install_adapter_from_git(
     install_root: &Path,
 ) -> anyhow::Result<()> {
     println!("├─ Git source {}", git.repo);
-    run_checked(
-        Command::new("cargo")
-            .arg("install")
-            .arg("--git")
-            .arg(git.repo)
-            .arg("--locked")
-            .arg("--force")
-            .arg("--package")
-            .arg(git.package),
-        &format!("cargo install {}", git.package),
-    )?;
+    let mut command = cargo_install_git_command(git);
+    run_checked(&mut command, &format!("cargo install {}", git.package))?;
     run_adapter_binary_installer(git.binary, entry.slug, install_root)
+}
+
+fn cargo_install_git_command(git: GitAdapterSource) -> Command {
+    let mut command = Command::new("cargo");
+    command
+        .arg("install")
+        .arg("--git")
+        .arg(git.repo)
+        .arg("--locked")
+        .arg("--force")
+        .arg(git.package);
+    command
 }
 
 fn run_adapter_binary_installer(
@@ -1454,5 +1457,30 @@ mod tests {
     #[test]
     fn edit_distance_counts_single_deletion() {
         assert_eq!(edit_distance("coduct", "conduct"), 1);
+    }
+
+    #[test]
+    fn cargo_git_install_uses_positional_crate_name() {
+        let command = cargo_install_git_command(GitAdapterSource {
+            repo: "https://github.com/hydra-dynamix/ldgr-research",
+            package: "ldgr-research",
+            binary: "ldgr-research",
+        });
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            vec![
+                "install".to_string(),
+                "--git".to_string(),
+                "https://github.com/hydra-dynamix/ldgr-research".to_string(),
+                "--locked".to_string(),
+                "--force".to_string(),
+                "ldgr-research".to_string(),
+            ]
+        );
+        assert!(!args.iter().any(|arg| arg == "--package"));
     }
 }
