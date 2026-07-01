@@ -367,7 +367,7 @@ static AVAILABLE_ADAPTERS: &[AvailableAdapter] = &[
     AvailableAdapter {
         slug: "code",
         title: "Coding adapter",
-        source: "commercial release catalog",
+        source: "",
         install: "ldgr adapter install code",
         workspace_package: None,
         git: None,
@@ -376,7 +376,7 @@ static AVAILABLE_ADAPTERS: &[AvailableAdapter] = &[
     AvailableAdapter {
         slug: "security",
         title: "Security adapter",
-        source: "commercial release catalog",
+        source: "",
         install: "ldgr adapter install security",
         workspace_package: None,
         git: None,
@@ -385,7 +385,7 @@ static AVAILABLE_ADAPTERS: &[AvailableAdapter] = &[
     AvailableAdapter {
         slug: "explore",
         title: "Explore adapter",
-        source: "commercial release catalog",
+        source: "",
         install: "ldgr adapter install explore",
         workspace_package: None,
         git: None,
@@ -394,7 +394,7 @@ static AVAILABLE_ADAPTERS: &[AvailableAdapter] = &[
     AvailableAdapter {
         slug: "bench",
         title: "Bench adapter",
-        source: "commercial release catalog",
+        source: "",
         install: "ldgr adapter install bench",
         workspace_package: None,
         git: None,
@@ -419,7 +419,11 @@ const fn commercial_release(adapter: &'static str, binary: &'static str) -> Rele
 pub(crate) fn print_available_adapter_catalog() {
     println!("Available adapters:");
     for entry in available_adapter_catalog() {
-        println!("  {} — {} [{}]", entry.slug, entry.title, entry.source);
+        if entry.source.is_empty() {
+            println!("  {} — {}", entry.slug, entry.title);
+        } else {
+            println!("  {} — {} [{}]", entry.slug, entry.title, entry.source);
+        }
         println!("    install: {}", entry.install);
         println!("    after install: ldgr {} --help", entry.slug);
     }
@@ -817,7 +821,13 @@ fn select_adapters(args: &InstallArgs) -> anyhow::Result<Vec<String>> {
     let entries = available_adapter_catalog();
     let items = entries
         .iter()
-        .map(|entry| format!("{} — {} [{}]", entry.slug, entry.title, entry.source))
+        .map(|entry| {
+            if entry.source.is_empty() {
+                format!("{} — {}", entry.slug, entry.title)
+            } else {
+                format!("{} — {} [{}]", entry.slug, entry.title, entry.source)
+            }
+        })
         .collect::<Vec<_>>();
     let theme = ColorfulTheme::default();
     let Some(selections) = MultiSelect::with_theme(&theme)

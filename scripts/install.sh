@@ -80,6 +80,10 @@ require tar
 require curl
 
 PLATFORM="$(platform_tag)"
+BINARY_FILE="$BINARY"
+case "$PLATFORM" in
+  windows-*) BINARY_FILE="$BINARY.exe" ;;
+esac
 if [ -z "$VERSION" ]; then
   VERSION="$(latest_version)"
   [ -n "$VERSION" ] || fail "could not resolve latest $REPO release version"
@@ -101,14 +105,14 @@ curl -fsSL "$CHECKSUM_URL" -o "$TMP_DIR/$ARCHIVE.sha256"
 sha256_check "$TMP_DIR/$ARCHIVE.sha256" "$TMP_DIR/$ARCHIVE"
 
 tar -xzf "$TMP_DIR/$ARCHIVE" -C "$TMP_DIR"
-SRC="$TMP_DIR/$PACKAGE-$VERSION/$PLATFORM/$BINARY"
-[ -f "$SRC" ] || fail "archive did not contain expected binary: $PACKAGE-$VERSION/$PLATFORM/$BINARY"
+SRC="$TMP_DIR/$PACKAGE-$VERSION/$PLATFORM/$BINARY_FILE"
+[ -f "$SRC" ] || fail "archive did not contain expected binary: $PACKAGE-$VERSION/$PLATFORM/$BINARY_FILE"
 mkdir -p "$INSTALL_DIR"
-cp "$SRC" "$INSTALL_DIR/$BINARY"
-chmod +x "$INSTALL_DIR/$BINARY"
-log "Installed $BINARY to $INSTALL_DIR/$BINARY"
+cp "$SRC" "$INSTALL_DIR/$BINARY_FILE"
+chmod +x "$INSTALL_DIR/$BINARY_FILE"
+log "Installed $BINARY_FILE to $INSTALL_DIR/$BINARY_FILE"
 case ":$PATH:" in
   *":$INSTALL_DIR:"*) ;;
   *) log "Add $INSTALL_DIR to PATH if needed." ;;
 esac
-"$INSTALL_DIR/$BINARY" --version
+"$INSTALL_DIR/$BINARY_FILE" --version

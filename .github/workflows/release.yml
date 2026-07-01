@@ -15,18 +15,30 @@ on:
         required: true
         default: true
         type: boolean
-      runs_on:
-        description: "Runner label"
-        required: true
-        default: "self-hosted"
-        type: string
 
 permissions:
   contents: write
 
 jobs:
-  build-linux:
-    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runs_on || 'self-hosted' }}
+  build:
+    name: Build ${{ matrix.platform }} binary release
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux-x86_64
+            binary_ext: ""
+          - os: macos-13
+            platform: macos-x86_64
+            binary_ext: ""
+          - os: macos-14
+            platform: macos-aarch64
+            binary_ext: ""
+          - os: windows-latest
+            platform: windows-x86_64
+            binary_ext: ".exe"
     env:
       PACKAGE: ldgr-core
       BINARY: ldgr
@@ -43,7 +55,7 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      - name: Resolve version and platform
+      - name: Resolve version
         id: meta
         shell: bash
         run: |
@@ -56,28 +68,24 @@ jobs:
             echo "version must be semantic version syntax" >&2
             exit 1
           fi
-          case "$(uname -m)" in
-            x86_64|amd64) platform='linux-x86_64' ;;
-            aarch64|arm64) platform='linux-aarch64' ;;
-            *) echo "unsupported runner architecture: $(uname -m)" >&2; exit 1 ;;
-          esac
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "platform=$platform" >> "$GITHUB_OUTPUT"
 
       - name: Build binary
         run: cargo build --release -p "$PACKAGE"
+        shell: bash
 
       - name: Package archive
         shell: bash
         run: |
           set -euo pipefail
           version="${{ steps.meta.outputs.version }}"
-          platform="${{ steps.meta.outputs.platform }}"
+          platform="${{ matrix.platform }}"
+          binary_file="${BINARY}${{ matrix.binary_ext }}"
           staging="dist/${RELEASE_NAME}-${version}/${platform}"
           archive="dist/${RELEASE_NAME}-${version}-${platform}.tar.gz"
           mkdir -p "$staging"
-          cp "target/release/${BINARY}" "$staging/${BINARY}"
-          chmod +x "$staging/${BINARY}"
+          cp "target/release/${binary_file}" "$staging/${binary_file}"
+          chmod +x "$staging/${binary_file}" || true
           cp README.md LICENSE "dist/${RELEASE_NAME}-${version}/"
           if [[ -f scripts/install.sh ]]; then mkdir -p "dist/${RELEASE_NAME}-${version}/scripts"; cp scripts/install.sh "dist/${RELEASE_NAME}-${version}/scripts/install.sh"; fi
           cat > "dist/${RELEASE_NAME}-${version}/RELEASE-METADATA.json" <<JSON
@@ -92,7 +100,11 @@ jobs:
           }
           JSON
           tar -C dist -czf "$archive" "${RELEASE_NAME}-${version}"
-          sha256sum "$archive" > "${archive}.sha256"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$archive" > "${archive}.sha256"
+          else
+            shasum -a 256 "$archive" > "${archive}.sha256"
+          fi
 
       - name: Create or update GitHub release
         shell: bash
