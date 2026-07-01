@@ -10,7 +10,7 @@ const CONTEXT_LATEST_EVENT_LIMIT: i64 = 10;
 const CONTEXT_RUN_NARRATIVE_LIMIT: i64 = 6;
 
 pub fn read_context(connection: &Connection) -> anyhow::Result<StoreContext> {
-    Ok(base_context(connection)?)
+    base_context(connection)
 }
 
 pub fn read_context_with_conduct_lifecycle(
@@ -302,7 +302,7 @@ fn conduct_next_valid_action(
 fn infer_conduct_batch_id(context: &StoreContext) -> Option<String> {
     conduct_context_fields(context)
         .into_iter()
-        .find_map(|field| extract_conduct_batch_id(field))
+        .find_map(extract_conduct_batch_id)
 }
 
 fn context_mentions_conduct(context: &StoreContext) -> bool {
@@ -346,7 +346,7 @@ fn extract_conduct_batch_id(text: &str) -> Option<String> {
                 .chars()
                 .take_while(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '/'))
                 .collect::<String>()
-                .trim_end_matches(|ch| matches!(ch, '.' | ',' | ';' | ')' | ']'))
+                .trim_end_matches(['.', ',', ';', ')', ']'])
                 .to_owned();
             if !value.is_empty() {
                 return Some(value);

@@ -92,13 +92,10 @@ impl AdapterRegistry {
             .adapters
             .iter()
             .flat_map(|adapter| {
-                adapter.commands.iter().filter_map(move |tool| {
-                    if tool.name == command {
-                        Some(tool)
-                    } else {
-                        None
-                    }
-                })
+                adapter
+                    .commands
+                    .iter()
+                    .filter(move |tool| tool.name == command)
             })
             .collect::<Vec<_>>();
         commands.sort_by(|left, right| {

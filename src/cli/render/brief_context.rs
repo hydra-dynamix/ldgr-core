@@ -374,7 +374,7 @@ fn extract_batch_id(text: &str) -> Option<String> {
                 .chars()
                 .take_while(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '/'))
                 .collect::<String>()
-                .trim_end_matches(|ch| matches!(ch, '.' | ',' | ';' | ')' | ']'))
+                .trim_end_matches(['.', ',', ';', ')', ']'])
                 .to_owned();
             if !value.is_empty() {
                 return Some(value);

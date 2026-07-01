@@ -45,7 +45,7 @@ fn serve_conduct_waves(stream: &mut TcpStream, db_path: &Path) -> anyhow::Result
             }),
         ));
     }
-    batches.sort_by(|left, right| right.0.cmp(&left.0));
+    batches.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
     let batches = batches
         .into_iter()
         .take(8)
@@ -161,7 +161,7 @@ fn find_worker_worktree(worktree_root: &Path, batch_id: &str, worker_id: &str) -
 fn collect_conduct_feeds(root: &Path, limit: usize) -> anyhow::Result<Vec<serde_json::Value>> {
     let mut candidates = Vec::new();
     collect_feed_candidates(&root.join("logs"), &mut candidates)?;
-    candidates.sort_by(|left, right| right.modified.cmp(&left.modified));
+    candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.modified));
     Ok(candidates
         .into_iter()
         .take(limit)
@@ -173,7 +173,7 @@ fn collect_worker_feeds_fast(root: &Path, limit: usize) -> anyhow::Result<Vec<se
     let mut candidates = Vec::new();
     collect_shallow_feed_candidates(&root.join("process"), &mut candidates, 2)?;
     collect_shallow_feed_candidates(&root.join("agent-output"), &mut candidates, 2)?;
-    candidates.sort_by(|left, right| right.modified.cmp(&left.modified));
+    candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.modified));
     Ok(candidates
         .into_iter()
         .filter(|candidate| {
