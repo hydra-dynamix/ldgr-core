@@ -191,7 +191,9 @@ where
             ) =>
         {
             error.print()?;
-            if matches!(error.kind(), ErrorKind::DisplayHelp) {
+            if matches!(error.kind(), ErrorKind::DisplayHelp)
+                && should_print_adapter_help_for_display_help(&args)
+            {
                 commands::ops::print_available_adapter_catalog();
                 print_dynamic_adapter_help();
             }
@@ -254,6 +256,33 @@ fn handle_cli(cli: Cli) -> anyhow::Result<()> {
         Command::Adapter(args) => commands::adapters::handle_adapter(args),
         Command::Next(args) => commands::work::handle_next(&open_store(&cli.db)?, args),
     }
+}
+
+fn should_print_adapter_help_for_display_help(args: &[OsString]) -> bool {
+    let mut index = 1;
+    while index < args.len() {
+        let Some(token) = args[index].to_str() else {
+            index += 1;
+            continue;
+        };
+        if matches!(token, "--help" | "-h") {
+            return true;
+        }
+        if token == "--db" || token == "--artifact-root" {
+            index += 2;
+            continue;
+        }
+        if token.starts_with("--db=") || token.starts_with("--artifact-root=") {
+            index += 1;
+            continue;
+        }
+        if token.starts_with('-') {
+            index += 1;
+            continue;
+        }
+        return token == "adapter";
+    }
+    true
 }
 
 fn try_dispatch_adapter_namespace(args: &[OsString]) -> anyhow::Result<bool> {

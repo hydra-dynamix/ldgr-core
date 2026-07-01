@@ -36,6 +36,33 @@ fn top_level_help_shows_core_loop_and_hides_mature_project_surface() -> anyhow::
 }
 
 #[test]
+fn focused_subcommand_help_omits_adapter_discovery_blocks() -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    let mut command = isolated_command(project.path())?;
+    command.args(["work", "create", "--help"]);
+    command.assert().success().stdout(
+        predicate::str::contains("Create a pending work item")
+            .and(predicate::str::contains("Usage: ldgr work create"))
+            .and(predicate::str::contains("Available adapters:").not())
+            .and(predicate::str::contains("Installed adapter control surface:").not()),
+    );
+    Ok(())
+}
+
+#[test]
+fn adapter_focused_help_keeps_adapter_discovery_blocks() -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    let mut command = isolated_command(project.path())?;
+    command.args(["adapter", "--help"]);
+    command.assert().success().stdout(
+        predicate::str::contains("Discover installed adapter manifests")
+            .and(predicate::str::contains("Available adapters:"))
+            .and(predicate::str::contains("ldgr adapter install conduct")),
+    );
+    Ok(())
+}
+
+#[test]
 fn full_help_shows_core_command_tree_and_research_split() -> anyhow::Result<()> {
     let project = TempDir::new()?;
     let mut command = isolated_command(project.path())?;

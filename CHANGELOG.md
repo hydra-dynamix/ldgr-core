@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Keep focused subcommand help concise by limiting adapter discovery blocks to top-level and adapter-focused help.
 - Report an actionable `ldgr init` hint when the ledger parent directory is missing instead of surfacing only a low-level SQLite open error.
 - Append the latest matching agentctl raw log to failed `ldgr loop run --agent agentctl` output artifacts so child-agent auth/config errors are visible in LDGR evidence.
 - Make source-root adapter installs patch adapter command argv to a cargo source runner so `ldgr <adapter>` works immediately without requiring the adapter binary on `PATH`.
