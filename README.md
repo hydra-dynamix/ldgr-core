@@ -86,12 +86,16 @@ cycles; the loop stops early when work is blocked, no pending work remains, or a
 subprocess fails.
 
 ```sh
-ldgr loop run --prompt prompts/loop-prompt.md --agent agentctl    # pipe prompt file to agentctl
+ldgr loop run --prompt prompts/loop-prompt.md --agent agentctl    # use the ldgr-loop agentctl entry from ldgr install
 ldgr loop run --prompt-slug surface --agent agentctl       # use an active stored prompt
 ldgr loop run --bundle cleanroom --prompt-role surface-loop # use a sealed bundle
 ldgr loop run --prompt prompts/loop-prompt.md --agent-argv '["my-agent"]' # any command that reads the prompt on stdin
 ldgr loop run --prompt prompts/loop-prompt.md --dry-run            # render artifacts without spawning anything
 ```
+
+`ldgr install` writes `~/.agentctl/config.toml` entries named `ldgr-loop` and
+`ldgr-loop-<harness>` so the built-in `--agent agentctl` runner can call
+`agentctl run ldgr-loop` and stream the rendered prompt through stdin.
 
 Prompt records live in the ledger with slug, role, body, hash, status, and
 version history. Updating a prompt creates a new version while preserving prior

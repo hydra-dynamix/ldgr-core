@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Report an actionable `ldgr init` hint when the ledger parent directory is missing instead of surfacing only a low-level SQLite open error.
+- Append the latest matching agentctl raw log to failed `ldgr loop run --agent agentctl` output artifacts so child-agent auth/config errors are visible in LDGR evidence.
+- Make source-root adapter installs patch adapter command argv to a cargo source runner so `ldgr <adapter>` works immediately without requiring the adapter binary on `PATH`.
+- Use the current `agentctl run <agent>` CLI and merge `ldgr-loop` entries into `~/.agentctl/config.toml` so `ldgr loop run --agent agentctl` works after install without dropping existing agentctl agents.
 - Use Cargo's positional crate argument for git adapter installs so release fallback can install open adapters such as `ldgr-research`.
 - Suggest likely adapter names for `ldgr adapter install <adapter>` typos without silently executing fuzzy matches.
 - Install adapter skills only into Pi's configured global skill directory instead of also writing duplicate global `~/.agents/skills` copies.

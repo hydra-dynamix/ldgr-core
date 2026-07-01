@@ -15,6 +15,14 @@ pub fn init_store(db_path: &Path, artifact_root: &Path) -> anyhow::Result<()> {
 }
 
 pub fn open_store(db_path: &Path) -> anyhow::Result<Connection> {
+    if let Some(parent) = db_path.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            anyhow::bail!(
+                "No LDGR ledger found at {}. Run `ldgr init` to create one, or pass --db <path>.",
+                db_path.display()
+            );
+        }
+    }
     let connection = Connection::open(db_path)
         .with_context(|| format!("failed to open SQLite database {}", db_path.display()))?;
     connection
@@ -403,6 +411,17 @@ mod tests {
         )?;
         assert_eq!(outer_count, 1);
         assert_eq!(inner_count, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn open_store_missing_parent_suggests_init() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let db_path = temp.path().join("missing/ldgr.db");
+        let error = open_store(&db_path).expect_err("missing parent should be actionable");
+        let message = format!("{error:#}");
+        assert!(message.contains("No LDGR ledger found"), "{message}");
+        assert!(message.contains("Run `ldgr init`"), "{message}");
         Ok(())
     }
 

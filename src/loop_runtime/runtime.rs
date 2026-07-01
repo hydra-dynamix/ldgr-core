@@ -212,7 +212,7 @@ fn run_loop_after_start(
         "running_agent",
         &format!("Running autonomous agent command for {work_slug}."),
     )?;
-    let agent = match &options.agent {
+    let mut agent = match &options.agent {
         LoopAgent::DryRun => ProcessCapture::from_memory(
             None,
             0,
@@ -237,6 +237,10 @@ fn run_loop_after_start(
             )?
         }
     };
+
+    if matches!(options.agent, LoopAgent::Agentctl) {
+        agent = enrich_agentctl_failure_output(agent);
+    }
 
     if get_run(connection, run_id)?.status == RunStatus::Running {
         record_run_phase(

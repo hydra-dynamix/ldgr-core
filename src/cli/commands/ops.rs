@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use anyhow::bail;
+use anyhow::{bail, Context};
 use dialoguer::{theme::ColorfulTheme, Confirm, MultiSelect};
 
 use crate::adapter_registry::AdapterRegistry;
@@ -466,6 +466,7 @@ fn install_adapter_from_source_root_with_package(
     if !status.success() {
         bail!("adapter installer failed for package `{package}` with status {status}");
     }
+    patch_adapter_argv_to_source_runner(install_root, package, source_root)?;
     Ok(())
 }
 
@@ -622,6 +623,33 @@ fn install_release_binary(
     Ok(Some(dest))
 }
 
+fn patch_adapter_argv_to_source_runner(
+    install_root: &Path,
+    package: &str,
+    source_root: &Path,
+) -> anyhow::Result<()> {
+    let manifest = install_root.join("adapter.toml");
+    if !manifest.is_file() {
+        return Ok(());
+    }
+    let cargo_manifest = source_root.join("Cargo.toml");
+    let source_runner = [
+        "cargo".to_string(),
+        "run".to_string(),
+        "--quiet".to_string(),
+        "--manifest-path".to_string(),
+        cargo_manifest.display().to_string(),
+        "-p".to_string(),
+        package.to_string(),
+        "--".to_string(),
+    ]
+    .into_iter()
+    .map(|part| toml::Value::String(part).to_string())
+    .collect::<Vec<_>>()
+    .join(", ");
+    patch_adapter_argv_command(&manifest, package, &source_runner)
+}
+
 fn patch_adapter_argv_to_installed_binary(
     install_root: &Path,
     binary: &str,
@@ -635,14 +663,22 @@ fn patch_adapter_argv_to_installed_binary(
     if !bin_path.is_file() {
         return Ok(());
     }
-    let quoted_binary = format!("\"{}\"", binary);
     let quoted_path = toml::Value::String(bin_path.display().to_string()).to_string();
-    let text = fs::read_to_string(&manifest)?;
+    patch_adapter_argv_command(&manifest, binary, &quoted_path)
+}
+
+fn patch_adapter_argv_command(
+    manifest: &Path,
+    binary: &str,
+    replacement: &str,
+) -> anyhow::Result<()> {
+    let quoted_binary = format!("\"{}\"", binary);
+    let text = fs::read_to_string(manifest)?;
     let patched = text
         .lines()
         .map(|line| {
             if line.trim_start().starts_with("argv =") {
-                line.replace(&quoted_binary, &quoted_path)
+                line.replace(&quoted_binary, replacement)
             } else {
                 line.to_string()
             }
@@ -650,7 +686,7 @@ fn patch_adapter_argv_to_installed_binary(
         .collect::<Vec<_>>()
         .join("\n")
         + "\n";
-    fs::write(&manifest, patched)?;
+    fs::write(manifest, patched)?;
     Ok(())
 }
 
@@ -903,78 +939,164 @@ fn install_agentctl_config(
     home: &Path,
     harnesses: &[HarnessKind],
 ) -> anyhow::Result<serde_json::Value> {
-    let config_path = home.join(".ldgr/agentctl/harness.toml");
-    let config = render_agentctl_config(harnesses);
+    let config_path = home.join(".agentctl/config.toml");
+    let config = if config_path.is_file() {
+        let existing = fs::read_to_string(&config_path)?;
+        merge_agentctl_config(&existing, harnesses)?
+    } else {
+        render_agentctl_config(harnesses)
+    };
     write_file(&config_path, &config)?;
     println!("├─ agentctl config {}", config_path.display());
     Ok(serde_json::json!({
         "path": config_path,
         "agents": harnesses.iter().map(|harness| harness_name(*harness)).collect::<Vec<_>>(),
         "task": "ldgr-loop",
-        "note": "agentctl is the canonical LDGR agent control plane; ldgr loop run --agent agentctl uses this global harness config."
+        "note": "agentctl is the canonical LDGR agent control plane; ldgr loop run --agent agentctl runs `agentctl run ldgr-loop` with the rendered prompt on stdin."
     }))
 }
 
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct AgentctlCommandSpec {
+    argv: Vec<&'static str>,
+    prompt_stdin: bool,
+}
+
 fn render_agentctl_config(harnesses: &[HarnessKind]) -> String {
+    let mut config = default_agentctl_config_value();
+    add_ldgr_agentctl_agents(&mut config, harnesses)
+        .expect("default agentctl config should accept LDGR agents");
+    toml::to_string_pretty(&config).expect("default agentctl config should serialize")
+}
+
+fn merge_agentctl_config(existing: &str, harnesses: &[HarnessKind]) -> anyhow::Result<String> {
+    let mut config = if existing.trim().is_empty() {
+        default_agentctl_config_value()
+    } else {
+        toml::from_str(existing).context("failed to parse existing agentctl config")?
+    };
+    add_ldgr_agentctl_agents(&mut config, harnesses)?;
+    toml::to_string_pretty(&config).context("failed to serialize agentctl config")
+}
+
+fn default_agentctl_config_value() -> toml::Value {
+    toml::from_str(
+        r#"[summary]
+max_output_bytes = 16384
+tail_bytes = 4096
+max_preview_lines = 12
+
+[agents.codex]
+command = ["codex", "exec", "--sandbox", "workspace-write"]
+prompt_stdin = true
+
+[agents.claude-code]
+command = ["claude", "-p"]
+prompt_stdin = false
+
+[agents.claude]
+command = ["claude", "-p"]
+prompt_stdin = false
+
+[agents.ollama]
+command = ["ollama", "run", "llama3"]
+prompt_stdin = true
+
+[agents.openai-rest]
+command = ["openai-rest-agent"]
+prompt_stdin = true
+
+[agents.openai-websocket]
+command = ["openai-websocket-agent"]
+prompt_stdin = true
+"#,
+    )
+    .expect("embedded default agentctl config should parse")
+}
+
+fn add_ldgr_agentctl_agents(
+    config: &mut toml::Value,
+    harnesses: &[HarnessKind],
+) -> anyhow::Result<()> {
+    let root = config
+        .as_table_mut()
+        .context("agentctl config root must be a TOML table")?;
+    root.entry("summary".to_string())
+        .or_insert_with(|| default_agentctl_config_value()["summary"].clone());
+    let agents = root
+        .entry("agents".to_string())
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+        .as_table_mut()
+        .context("agentctl config [agents] must be a table")?;
+
     let primary = harnesses.first().copied().unwrap_or(HarnessKind::Pi);
-    let mut commands = Vec::<Vec<&'static str>>::new();
-    for harness in harnesses {
-        commands.extend(agentctl_commands_for_harness(*harness));
-    }
-    commands.sort();
-    commands.dedup();
-    let allowed = commands
-        .iter()
-        .filter_map(|command| command.first().copied())
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .map(|command| format!("\"{command}\""))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let mut rendered = format!(
-        "allowed_commands = [{allowed}]\nallowed_builtins = [\"read\"]\nenv_allowlist = [\"PATH\", \"HOME\", \"ANTHROPIC_API_KEY\", \"ANTHROPIC_OAUTH_TOKEN\", \"OPENAI_API_KEY\", \"CODEX_HOME\", \"PI_CODING_AGENT_DIR\"]\n\n"
+    agents.insert(
+        "ldgr-loop".to_string(),
+        agentctl_agent_value(&agentctl_primary_command(primary)),
     );
-    rendered.push_str("[tasks.ldgr-loop]\ncommands = [");
-    rendered.push_str(&render_agentctl_command(&agentctl_primary_command(primary)));
-    rendered.push_str("]\n\n");
     for harness in harnesses {
-        rendered.push_str(&format!(
-            "[tasks.ldgr-loop-{}]\ncommands = [",
-            harness_name(*harness)
-        ));
-        rendered.push_str(&render_agentctl_command(&agentctl_primary_command(
-            *harness,
-        )));
-        rendered.push_str("]\n\n");
+        agents.insert(
+            format!("ldgr-loop-{}", harness_name(*harness)),
+            agentctl_agent_value(&agentctl_primary_command(*harness)),
+        );
     }
-    rendered
+    Ok(())
 }
 
-fn agentctl_commands_for_harness(harness: HarnessKind) -> Vec<Vec<&'static str>> {
+fn agentctl_agent_value(command: &AgentctlCommandSpec) -> toml::Value {
+    let mut table = toml::map::Map::new();
+    table.insert(
+        "command".to_string(),
+        toml::Value::Array(
+            command
+                .argv
+                .iter()
+                .map(|part| toml::Value::String((*part).to_string()))
+                .collect(),
+        ),
+    );
+    table.insert(
+        "prompt_stdin".to_string(),
+        toml::Value::Boolean(command.prompt_stdin),
+    );
+    toml::Value::Table(table)
+}
+
+fn agentctl_commands_for_harness(harness: HarnessKind) -> Vec<AgentctlCommandSpec> {
     match harness {
-        HarnessKind::Pi => vec![vec!["pi", "-p"]],
-        HarnessKind::Codex => vec![vec!["codex", "exec", "--sandbox", "workspace-write"]],
-        HarnessKind::Claude => vec![vec!["claude", "-p"]],
-        HarnessKind::Openclaw => vec![vec!["openclaw", "run"], vec!["opencode", "run"]],
+        HarnessKind::Pi => vec![AgentctlCommandSpec {
+            argv: vec!["pi", "-p"],
+            prompt_stdin: false,
+        }],
+        HarnessKind::Codex => vec![AgentctlCommandSpec {
+            argv: vec!["codex", "exec", "--sandbox", "workspace-write"],
+            prompt_stdin: true,
+        }],
+        HarnessKind::Claude => vec![AgentctlCommandSpec {
+            argv: vec!["claude", "-p"],
+            prompt_stdin: false,
+        }],
+        HarnessKind::Openclaw => vec![
+            AgentctlCommandSpec {
+                argv: vec!["openclaw", "run"],
+                prompt_stdin: false,
+            },
+            AgentctlCommandSpec {
+                argv: vec!["opencode", "run"],
+                prompt_stdin: false,
+            },
+        ],
     }
 }
 
-fn agentctl_primary_command(harness: HarnessKind) -> Vec<&'static str> {
+fn agentctl_primary_command(harness: HarnessKind) -> AgentctlCommandSpec {
     agentctl_commands_for_harness(harness)
         .into_iter()
         .next()
-        .unwrap_or_else(|| vec!["pi", "-p"])
-}
-
-fn render_agentctl_command(command: &[&str]) -> String {
-    format!(
-        "[{}]",
-        command
-            .iter()
-            .map(|part| format!("\"{part}\""))
-            .collect::<Vec<_>>()
-            .join(", ")
-    )
+        .unwrap_or_else(|| AgentctlCommandSpec {
+            argv: vec!["pi", "-p"],
+            prompt_stdin: false,
+        })
 }
 
 fn command_on_path(command: &str) -> bool {
@@ -1482,5 +1604,98 @@ mod tests {
             ]
         );
         assert!(!args.iter().any(|arg| arg == "--package"));
+    }
+
+    #[test]
+    fn agentctl_config_defines_ldgr_loop_agents_for_current_cli() {
+        let config = render_agentctl_config(&[HarnessKind::Pi, HarnessKind::Codex]);
+        assert!(config.contains("[agents.ldgr-loop]"));
+        assert!(config.contains("[agents.ldgr-loop-pi]"));
+        assert!(config.contains("[agents.ldgr-loop-codex]"));
+        let parsed =
+            toml::from_str::<toml::Value>(&config).expect("agentctl config should parse as TOML");
+        let agents = parsed["agents"].as_table().expect("agents table");
+        assert_eq!(
+            agents["ldgr-loop"]["command"].as_array().expect("command"),
+            &vec![
+                toml::Value::String("pi".to_string()),
+                toml::Value::String("-p".to_string()),
+            ]
+        );
+        assert_eq!(agents["ldgr-loop"]["prompt_stdin"].as_bool(), Some(false));
+        assert_eq!(
+            agents["ldgr-loop-codex"]["command"]
+                .as_array()
+                .expect("command"),
+            &vec![
+                toml::Value::String("codex".to_string()),
+                toml::Value::String("exec".to_string()),
+                toml::Value::String("--sandbox".to_string()),
+                toml::Value::String("workspace-write".to_string()),
+            ]
+        );
+        assert_eq!(
+            agents["ldgr-loop-codex"]["prompt_stdin"].as_bool(),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn agentctl_config_merge_preserves_existing_agents() -> anyhow::Result<()> {
+        let merged = merge_agentctl_config(
+            r#"[summary]
+max_output_bytes = 99
+tail_bytes = 10
+max_preview_lines = 3
+
+[agents.custom]
+command = ["custom-agent"]
+prompt_stdin = true
+"#,
+            &[HarnessKind::Pi],
+        )?;
+        let parsed = toml::from_str::<toml::Value>(&merged)?;
+        let agents = parsed["agents"].as_table().expect("agents table");
+        assert!(agents.contains_key("custom"));
+        assert!(agents.contains_key("ldgr-loop"));
+        assert_eq!(parsed["summary"]["max_output_bytes"].as_integer(), Some(99));
+        Ok(())
+    }
+
+    #[test]
+    fn source_root_install_patches_adapter_argv_to_cargo_runner() -> anyhow::Result<()> {
+        let install_root = tempfile::tempdir()?;
+        let source_root = tempfile::tempdir()?;
+        std::fs::write(source_root.path().join("Cargo.toml"), "[workspace]\n")?;
+        std::fs::write(
+            install_root.path().join("adapter.toml"),
+            r#"[adapter]
+slug = "conduct"
+
+[[commands]]
+namespace = "conduct"
+argv = ["ldgr-conduct"]
+
+[[commands]]
+namespace = "conduct-status"
+argv = ["ldgr-conduct", "status"]
+"#,
+        )?;
+
+        patch_adapter_argv_to_source_runner(
+            install_root.path(),
+            "ldgr-conduct",
+            source_root.path(),
+        )?;
+        let manifest = std::fs::read_to_string(install_root.path().join("adapter.toml"))?;
+        assert!(manifest.contains("argv = [\"cargo\", \"run\", \"--quiet\", \"--manifest-path\""));
+        assert!(manifest.contains(&format!(
+            "\"{}\"",
+            source_root.path().join("Cargo.toml").display()
+        )));
+        assert!(manifest.contains("\"-p\", \"ldgr-conduct\", \"--\"]"));
+        assert!(manifest.contains("\"--\", \"status\"]"));
+        toml::from_str::<toml::Value>(&manifest).expect("patched manifest should parse as TOML");
+        Ok(())
     }
 }

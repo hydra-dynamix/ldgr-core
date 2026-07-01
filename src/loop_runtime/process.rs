@@ -54,23 +54,11 @@ impl ProcessCapture {
 }
 
 fn default_agentctl_argv() -> Vec<String> {
-    let config = std::env::var_os("LDGR_AGENTCTL_CONFIG")
-        .map(PathBuf::from)
-        .unwrap_or_else(global_agentctl_config_path);
     vec![
         "agentctl".to_owned(),
-        "--config".to_owned(),
-        config.display().to_string(),
         "run".to_owned(),
         std::env::var("LDGR_AGENTCTL_TASK").unwrap_or_else(|_| "ldgr-loop".to_owned()),
     ]
-}
-
-fn global_agentctl_config_path() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("~"))
-        .join(".ldgr/agentctl/harness.toml")
 }
 
 fn agent_output_argv(agent: &LoopAgent) -> Vec<String> {
@@ -79,6 +67,59 @@ fn agent_output_argv(agent: &LoopAgent) -> Vec<String> {
         LoopAgent::Agentctl => default_agentctl_argv(),
         LoopAgent::DryRun => Vec::new(),
     }
+}
+
+fn enrich_agentctl_failure_output(mut capture: ProcessCapture) -> ProcessCapture {
+    if capture.exit_code == Some(0) {
+        return capture;
+    }
+    let task = std::env::var("LDGR_AGENTCTL_TASK").unwrap_or_else(|_| "ldgr-loop".to_owned());
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return capture;
+    };
+    let Some(log_path) = latest_agentctl_log_path(&home, &task) else {
+        return capture;
+    };
+    let Ok(log) = fs::read_to_string(&log_path) else {
+        return capture;
+    };
+    let excerpt = tail_text(&log, 12_000);
+    capture.stderr.push_str(&format!(
+        "\n\n--- latest agentctl raw log ({}) ---\n{}\n--- end latest agentctl raw log ---\n",
+        log_path.display(),
+        excerpt.trim_end()
+    ));
+    capture.stderr_bytes = capture.stderr.len().try_into().unwrap_or(u64::MAX);
+    capture
+}
+
+fn latest_agentctl_log_path(home: &Path, task: &str) -> Option<PathBuf> {
+    let jobs = home.join(".agentctl/jobs");
+    let mut candidates = fs::read_dir(jobs)
+        .ok()?
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !name.contains(task) {
+                return None;
+            }
+            let path = entry.path().join("output.log");
+            path.is_file().then_some((name, path))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| left.0.cmp(&right.0));
+    candidates.pop().map(|(_, path)| path)
+}
+
+fn tail_text(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut start = value.len() - max_bytes;
+    while !value.is_char_boundary(start) {
+        start += 1;
+    }
+    &value[start..]
 }
 
 #[derive(Clone, Copy)]
@@ -589,6 +630,45 @@ impl Drop for WindowsJob {
         unsafe {
             windows_sys::Win32::Foundation::CloseHandle(self.handle);
         }
+    }
+}
+
+#[cfg(test)]
+mod process_tests {
+    use super::*;
+
+    #[test]
+    fn default_agentctl_argv_matches_current_agentctl_cli() {
+        assert_eq!(
+            default_agentctl_argv(),
+            vec![
+                "agentctl".to_string(),
+                "run".to_string(),
+                "ldgr-loop".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn latest_agentctl_log_path_prefers_matching_newest_job() -> anyhow::Result<()> {
+        let home = tempfile::tempdir()?;
+        let jobs = home.path().join(".agentctl/jobs");
+        fs::create_dir_all(jobs.join("100-other-iteration-1"))?;
+        fs::write(jobs.join("100-other-iteration-1/output.log"), "wrong")?;
+        fs::create_dir_all(jobs.join("101-ldgr-loop-iteration-1"))?;
+        fs::write(jobs.join("101-ldgr-loop-iteration-1/output.log"), "old")?;
+        fs::create_dir_all(jobs.join("102-ldgr-loop-iteration-1"))?;
+        fs::write(jobs.join("102-ldgr-loop-iteration-1/output.log"), "new")?;
+
+        let path = latest_agentctl_log_path(home.path(), "ldgr-loop").expect("matching log");
+        assert!(path.ends_with("102-ldgr-loop-iteration-1/output.log"));
+        Ok(())
+    }
+
+    #[test]
+    fn tail_text_preserves_utf8_boundary() {
+        assert_eq!(tail_text("abc😀def", 6), "def");
+        assert_eq!(tail_text("abc😀def", 7), "😀def");
     }
 }
 
