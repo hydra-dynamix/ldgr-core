@@ -5,7 +5,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use anyhow::bail;
-use dialoguer::{theme::ColorfulTheme, MultiSelect};
+use dialoguer::{theme::ColorfulTheme, Confirm, MultiSelect};
 
 use crate::adapter_registry::AdapterRegistry;
 use crate::loop_runtime::{
@@ -133,7 +133,7 @@ pub fn handle_install(args: InstallArgs) -> anyhow::Result<()> {
 }
 
 pub(crate) fn handle_install_adapter(args: &InstallAdapterArgs) -> anyhow::Result<()> {
-    let adapter = normalize_adapter_name(&args.name);
+    let adapter = resolve_adapter_install_name(&args.name, args.yes)?;
     let Some(entry) = available_adapter_catalog()
         .iter()
         .find(|entry| entry.slug == adapter)
@@ -167,11 +167,108 @@ pub(crate) fn handle_install_adapter(args: &InstallAdapterArgs) -> anyhow::Resul
     Ok(())
 }
 
+fn resolve_adapter_install_name(name: &str, assume_yes: bool) -> anyhow::Result<String> {
+    let normalized = normalize_adapter_name(name);
+    if available_adapter_catalog()
+        .iter()
+        .any(|entry| entry.slug == normalized)
+    {
+        return Ok(normalized);
+    }
+    let candidates = adapter_name_suggestions(&normalized);
+    match candidates.as_slice() {
+        [candidate] => {
+            if !assume_yes && stdin_is_terminal() {
+                let accepted = Confirm::with_theme(&ColorfulTheme::default())
+                    .with_prompt(format!(
+                        "Unknown adapter `{}`. Did you mean `{}`?",
+                        name, candidate
+                    ))
+                    .default(false)
+                    .interact()?;
+                if accepted {
+                    return Ok(candidate.clone());
+                }
+            }
+            bail!(
+                "unknown adapter `{}`\n\nDid you mean `{}`?\n\nRun:\n  ldgr adapter install {}\n\nAvailable adapters:\n{}",
+                name,
+                candidate,
+                candidate,
+                available_adapter_names().join(", ")
+            );
+        }
+        [] => bail!(
+            "unknown adapter `{}`; run `ldgr adapter install list`\n\nAvailable adapters: {}",
+            name,
+            available_adapter_names().join(", ")
+        ),
+        many => bail!(
+            "unknown adapter `{}`; input is ambiguous\n\nPossible adapters: {}\n\nRun `ldgr adapter install <adapter>` with one exact name.",
+            name,
+            many.join(", ")
+        ),
+    }
+}
+
 fn normalize_adapter_name(name: &str) -> String {
     name.trim()
         .strip_prefix("ldgr-")
         .unwrap_or_else(|| name.trim())
         .to_ascii_lowercase()
+}
+
+fn available_adapter_names() -> Vec<String> {
+    available_adapter_catalog()
+        .iter()
+        .map(|entry| entry.slug.to_string())
+        .collect()
+}
+
+fn adapter_name_suggestions(input: &str) -> Vec<String> {
+    let mut scored = available_adapter_catalog()
+        .iter()
+        .filter_map(|entry| {
+            let distance = edit_distance(input, entry.slug);
+            let threshold = typo_suggestion_threshold(input.len().max(entry.slug.len()));
+            (distance <= threshold).then_some((distance, entry.slug.to_string()))
+        })
+        .collect::<Vec<_>>();
+    scored.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    let Some(best_distance) = scored.first().map(|(distance, _)| *distance) else {
+        return Vec::new();
+    };
+    scored
+        .into_iter()
+        .filter(|(distance, _)| *distance == best_distance)
+        .map(|(_, slug)| slug)
+        .collect()
+}
+
+fn typo_suggestion_threshold(len: usize) -> usize {
+    match len {
+        0..=4 => 1,
+        5..=8 => 2,
+        _ => 3,
+    }
+}
+
+fn edit_distance(left: &str, right: &str) -> usize {
+    let left = left.chars().collect::<Vec<_>>();
+    let right = right.chars().collect::<Vec<_>>();
+    let mut previous = (0..=right.len()).collect::<Vec<_>>();
+    let mut current = vec![0; right.len() + 1];
+    for (i, left_ch) in left.iter().enumerate() {
+        current[0] = i + 1;
+        for (j, right_ch) in right.iter().enumerate() {
+            let substitution = previous[j] + usize::from(left_ch != right_ch);
+            let insertion = current[j] + 1;
+            let deletion = previous[j + 1] + 1;
+            current[j + 1] = substitution.min(insertion).min(deletion);
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[right.len()]
 }
 
 #[derive(Clone, Copy)]
@@ -1331,4 +1428,27 @@ fn loop_result_failed(result: &LoopRuntimeResult, options: &LoopRuntimeOptions) 
     }
     result.agent_exit_code != Some(0)
         || (options.project_complete_requested && result.audit_exit_code != Some(0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn adapter_typo_suggestion_handles_conduct_transposition() {
+        assert_eq!(
+            adapter_name_suggestions("coduct"),
+            vec!["conduct".to_string()]
+        );
+    }
+
+    #[test]
+    fn adapter_typo_suggestion_is_empty_for_unrelated_input() {
+        assert!(adapter_name_suggestions("xyzzy").is_empty());
+    }
+
+    #[test]
+    fn edit_distance_counts_single_deletion() {
+        assert_eq!(edit_distance("coduct", "conduct"), 1);
+    }
 }

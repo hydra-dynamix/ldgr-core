@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Suggest likely adapter names for `ldgr adapter install <adapter>` typos without silently executing fuzzy matches.
+
 ## [0.1.0] - 2026-06-11
 
 Initial open-source release.
