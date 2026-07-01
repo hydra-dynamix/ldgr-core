@@ -115,41 +115,52 @@ pub fn handle_install(args: InstallArgs) -> anyhow::Result<()> {
             "│  Point OpenClaw/OpenCode at ~/.openclaw/commands and ~/.openclaw/skills if needed."
         );
     }
+    let adapters = select_adapters(&args)?;
+    if !adapters.is_empty() {
+        println!("│");
+        println!("◇ Installing adapter bundles...");
+        for adapter in adapters {
+            handle_install_adapter(&InstallAdapterArgs {
+                name: adapter,
+                source_root: None,
+                install_root: None,
+                yes: args.yes,
+            })?;
+        }
+    }
     println!("└─ Adapter bundles install under ~/.ldgr/<adapter>.");
     Ok(())
 }
 
 pub(crate) fn handle_install_adapter(args: &InstallAdapterArgs) -> anyhow::Result<()> {
     let adapter = normalize_adapter_name(&args.name);
-    let Some(package) = open_source_adapter_package(&adapter) else {
-        bail!("adapter `{}` is listed but not installable from this source checkout yet; run `ldgr adapter install list` for source/release information", args.name);
+    let Some(entry) = available_adapter_catalog()
+        .iter()
+        .find(|entry| entry.slug == adapter)
+    else {
+        bail!(
+            "unknown adapter `{}`; run `ldgr adapter install list`",
+            args.name
+        );
     };
     let home = home_dir()?;
     let install_root = args
         .install_root
         .clone()
         .unwrap_or_else(|| home.join(".ldgr").join(&adapter));
-    let source_root = match &args.source_root {
-        Some(root) => root.clone(),
-        None => find_source_root(std::env::current_dir()?)?,
-    };
     println!("◇ Installing LDGR adapter `{adapter}`");
-    println!("├─ Source {}", source_root.display());
     println!("├─ Install root {}", install_root.display());
-    let status = Command::new("cargo")
-        .arg("run")
-        .arg("-p")
-        .arg(package)
-        .arg("--")
-        .arg("adapter")
-        .arg("install")
-        .arg("--install-root")
-        .arg(&install_root)
-        .arg("--print-path")
-        .current_dir(&source_root)
-        .status()?;
-    if !status.success() {
-        bail!("adapter installer failed for `{adapter}` with status {status}");
+    if let Some(source_root) = &args.source_root {
+        install_adapter_from_source_root(entry, source_root, &install_root)?;
+    } else if let Some(release) = entry.release {
+        install_adapter_from_release(entry, release, &install_root, &home)?;
+    } else if let Some(git) = entry.git {
+        install_adapter_from_git(entry, git, &install_root)?;
+    } else if let Some(package) = entry.workspace_package {
+        let source_root = find_source_root(std::env::current_dir()?)?;
+        install_adapter_from_source_root_with_package(package, &source_root, &install_root)?;
+    } else {
+        bail!("adapter `{adapter}` has no release or source installer configured yet");
     }
     install_adapter_harness_assets(&adapter, &install_root, &home)?;
     println!("└─ Installed adapter `{adapter}`. Try `ldgr {adapter} --help` or `ldgr adapter show {adapter}`.");
@@ -163,11 +174,20 @@ fn normalize_adapter_name(name: &str) -> String {
         .to_ascii_lowercase()
 }
 
-fn open_source_adapter_package(adapter: &str) -> Option<&'static str> {
-    available_adapter_catalog()
-        .iter()
-        .find(|entry| entry.slug == adapter)
-        .and_then(|entry| entry.workspace_package)
+#[derive(Clone, Copy)]
+struct GitAdapterSource {
+    repo: &'static str,
+    package: &'static str,
+    binary: &'static str,
+}
+
+#[derive(Clone, Copy)]
+struct ReleaseAdapterSource {
+    repo: &'static str,
+    tag_prefix: &'static str,
+    asset_prefix: &'static str,
+    root_prefix: &'static str,
+    binary: &'static str,
 }
 
 struct AvailableAdapter {
@@ -176,67 +196,127 @@ struct AvailableAdapter {
     source: &'static str,
     install: &'static str,
     workspace_package: Option<&'static str>,
+    git: Option<GitAdapterSource>,
+    release: Option<ReleaseAdapterSource>,
 }
 
+static AVAILABLE_ADAPTERS: &[AvailableAdapter] = &[
+    AvailableAdapter {
+        slug: "conduct",
+        title: "LDGR Conduct adapter",
+        source: "hydra-dynamix/ldgr-releases release bundle",
+        install: "ldgr adapter install conduct",
+        workspace_package: Some("ldgr-conduct"),
+        git: None,
+        release: Some(ReleaseAdapterSource {
+            repo: "hydra-dynamix/ldgr-releases",
+            tag_prefix: "conduct-v",
+            asset_prefix: "conduct",
+            root_prefix: "conduct",
+            binary: "ldgr-conduct",
+        }),
+    },
+    AvailableAdapter {
+        slug: "research",
+        title: "Research adapter",
+        source: "https://github.com/hydra-dynamix/ldgr-research release/git",
+        install: "ldgr adapter install research",
+        workspace_package: Some("ldgr-research"),
+        git: Some(GitAdapterSource {
+            repo: "https://github.com/hydra-dynamix/ldgr-research",
+            package: "ldgr-research",
+            binary: "ldgr-research",
+        }),
+        release: Some(ReleaseAdapterSource {
+            repo: "hydra-dynamix/ldgr-research",
+            tag_prefix: "v",
+            asset_prefix: "ldgr-research",
+            root_prefix: "ldgr-research",
+            binary: "ldgr-research",
+        }),
+    },
+    AvailableAdapter {
+        slug: "example",
+        title: "Public example adapter",
+        source: "https://github.com/hydra-dynamix/ldgr-example-adapter release/git",
+        install: "ldgr adapter install example",
+        workspace_package: Some("ldgr-example-adapter"),
+        git: Some(GitAdapterSource {
+            repo: "https://github.com/hydra-dynamix/ldgr-example-adapter",
+            package: "ldgr-example-adapter",
+            binary: "ldgr-example-adapter",
+        }),
+        release: Some(ReleaseAdapterSource {
+            repo: "hydra-dynamix/ldgr-example-adapter",
+            tag_prefix: "v",
+            asset_prefix: "ldgr-example-adapter",
+            root_prefix: "ldgr-example-adapter",
+            binary: "ldgr-example-adapter",
+        }),
+    },
+    AvailableAdapter {
+        slug: "programbench",
+        title: "Clean-room ProgramBench adapter",
+        source: "https://github.com/hydra-dynamix/ldgr-programbench git",
+        install: "ldgr adapter install programbench",
+        workspace_package: None,
+        git: Some(GitAdapterSource {
+            repo: "https://github.com/hydra-dynamix/ldgr-programbench",
+            package: "ldgr-programbench",
+            binary: "ldgr-programbench",
+        }),
+        release: None,
+    },
+    AvailableAdapter {
+        slug: "code",
+        title: "Coding adapter",
+        source: "commercial release catalog",
+        install: "ldgr adapter install code",
+        workspace_package: None,
+        git: None,
+        release: Some(commercial_release("code", "ldgr-code")),
+    },
+    AvailableAdapter {
+        slug: "security",
+        title: "Security adapter",
+        source: "commercial release catalog",
+        install: "ldgr adapter install security",
+        workspace_package: None,
+        git: None,
+        release: Some(commercial_release("security", "ldgr-security")),
+    },
+    AvailableAdapter {
+        slug: "explore",
+        title: "Explore adapter",
+        source: "commercial release catalog",
+        install: "ldgr adapter install explore",
+        workspace_package: None,
+        git: None,
+        release: Some(commercial_release("explore", "ldgr-explore")),
+    },
+    AvailableAdapter {
+        slug: "bench",
+        title: "Bench adapter",
+        source: "commercial release catalog",
+        install: "ldgr adapter install bench",
+        workspace_package: None,
+        git: None,
+        release: Some(commercial_release("bench", "ldgr-bench")),
+    },
+];
+
 fn available_adapter_catalog() -> &'static [AvailableAdapter] {
-    &[
-        AvailableAdapter {
-            slug: "conduct",
-            title: "LDGR Conduct adapter",
-            source: "commercial release / local workspace",
-            install: "ldgr adapter install conduct",
-            workspace_package: Some("ldgr-conduct"),
-        },
-        AvailableAdapter {
-            slug: "research",
-            title: "Research adapter",
-            source: "https://github.com/hydra-dynamix/ldgr-research",
-            install: "ldgr adapter install research",
-            workspace_package: Some("ldgr-research"),
-        },
-        AvailableAdapter {
-            slug: "example",
-            title: "Public example adapter",
-            source: "https://github.com/hydra-dynamix/ldgr-example-adapter",
-            install: "ldgr adapter install example",
-            workspace_package: Some("ldgr-example-adapter"),
-        },
-        AvailableAdapter {
-            slug: "programbench",
-            title: "Clean-room ProgramBench adapter",
-            source: "https://github.com/hydra-dynamix/ldgr-programbench",
-            install: "ldgr adapter install programbench",
-            workspace_package: None,
-        },
-        AvailableAdapter {
-            slug: "code",
-            title: "Coding adapter",
-            source: "commercial release catalog",
-            install: "ldgr adapter install code",
-            workspace_package: None,
-        },
-        AvailableAdapter {
-            slug: "security",
-            title: "Security adapter",
-            source: "commercial release catalog",
-            install: "ldgr adapter install security",
-            workspace_package: None,
-        },
-        AvailableAdapter {
-            slug: "explore",
-            title: "Explore adapter",
-            source: "commercial release catalog",
-            install: "ldgr adapter install explore",
-            workspace_package: None,
-        },
-        AvailableAdapter {
-            slug: "bench",
-            title: "Bench adapter",
-            source: "commercial release catalog",
-            install: "ldgr adapter install bench",
-            workspace_package: None,
-        },
-    ]
+    AVAILABLE_ADAPTERS
+}
+
+const fn commercial_release(adapter: &'static str, binary: &'static str) -> ReleaseAdapterSource {
+    ReleaseAdapterSource {
+        repo: "hydra-dynamix/ldgr-releases",
+        tag_prefix: "",
+        asset_prefix: adapter,
+        root_prefix: adapter,
+        binary,
+    }
 }
 
 pub(crate) fn print_available_adapter_catalog() {
@@ -248,6 +328,259 @@ pub(crate) fn print_available_adapter_catalog() {
     }
     println!("  installed adapters: ldgr adapter list");
     println!("  adapter details: ldgr adapter show <slug>");
+}
+
+fn install_adapter_from_source_root(
+    entry: &AvailableAdapter,
+    source_root: &Path,
+    install_root: &Path,
+) -> anyhow::Result<()> {
+    let Some(package) = entry.workspace_package else {
+        bail!(
+            "adapter `{}` does not have a workspace package; use release/git install instead",
+            entry.slug
+        );
+    };
+    install_adapter_from_source_root_with_package(package, source_root, install_root)
+}
+
+fn install_adapter_from_source_root_with_package(
+    package: &str,
+    source_root: &Path,
+    install_root: &Path,
+) -> anyhow::Result<()> {
+    println!("├─ Source checkout {}", source_root.display());
+    let status = Command::new("cargo")
+        .arg("run")
+        .arg("-p")
+        .arg(package)
+        .arg("--")
+        .arg("adapter")
+        .arg("install")
+        .arg("--install-root")
+        .arg(install_root)
+        .arg("--print-path")
+        .current_dir(source_root)
+        .status()?;
+    if !status.success() {
+        bail!("adapter installer failed for package `{package}` with status {status}");
+    }
+    Ok(())
+}
+
+fn install_adapter_from_git(
+    entry: &AvailableAdapter,
+    git: GitAdapterSource,
+    install_root: &Path,
+) -> anyhow::Result<()> {
+    println!("├─ Git source {}", git.repo);
+    run_checked(
+        Command::new("cargo")
+            .arg("install")
+            .arg("--git")
+            .arg(git.repo)
+            .arg("--locked")
+            .arg("--force")
+            .arg("--package")
+            .arg(git.package),
+        &format!("cargo install {}", git.package),
+    )?;
+    run_adapter_binary_installer(git.binary, entry.slug, install_root)
+}
+
+fn run_adapter_binary_installer(
+    binary: impl AsRef<std::ffi::OsStr>,
+    adapter: &str,
+    install_root: &Path,
+) -> anyhow::Result<()> {
+    let binary_ref = binary.as_ref();
+    let status = Command::new(binary_ref)
+        .arg("adapter")
+        .arg("install")
+        .arg("--install-root")
+        .arg(install_root)
+        .arg("--print-path")
+        .status()?;
+    if !status.success() {
+        bail!(
+            "adapter installer `{}` failed for `{adapter}` with status {status}",
+            Path::new(binary_ref).display()
+        );
+    }
+    Ok(())
+}
+
+fn install_adapter_from_release(
+    entry: &AvailableAdapter,
+    release: ReleaseAdapterSource,
+    install_root: &Path,
+    home: &Path,
+) -> anyhow::Result<()> {
+    let version = env!("CARGO_PKG_VERSION");
+    let platform = platform_tag()?;
+    let tag = if release.tag_prefix.is_empty() {
+        format!("{}-v{}", release.asset_prefix, version)
+    } else {
+        format!("{}{}", release.tag_prefix, version)
+    };
+    let archive_name = format!("{}-{}-{}.tar.gz", release.asset_prefix, version, platform);
+    let url = format!(
+        "https://github.com/{}/releases/download/{}/{}",
+        release.repo, tag, archive_name
+    );
+    println!("├─ Release {}", url);
+    let temp = std::env::temp_dir().join(format!(
+        "ldgr-adapter-install-{}-{}",
+        entry.slug,
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&temp);
+    fs::create_dir_all(&temp)?;
+    let archive = temp.join(&archive_name);
+    let download = Command::new("curl")
+        .arg("-fsSL")
+        .arg(&url)
+        .arg("-o")
+        .arg(&archive)
+        .status();
+    match download {
+        Ok(status) if status.success() => {}
+        _ => {
+            if let Some(git) = entry.git {
+                println!("├─ Release unavailable for {platform}; falling back to git install");
+                return install_adapter_from_git(entry, git, install_root);
+            }
+            if command_exists(release.binary) {
+                println!(
+                    "├─ Release unavailable for {platform}; falling back to installed `{}`",
+                    release.binary
+                );
+                return run_adapter_binary_installer(release.binary, entry.slug, install_root);
+            }
+            bail!(
+                "release asset unavailable for adapter `{}` on platform `{}`: {}; install `{}` or pass --source-root for a local source install",
+                entry.slug,
+                platform,
+                url,
+                release.binary
+            );
+        }
+    }
+    run_checked(
+        Command::new("tar")
+            .arg("-xzf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(&temp),
+        "extract adapter release archive",
+    )?;
+    let extracted = temp.join(format!("{}-{}", release.root_prefix, version));
+    if !extracted.is_dir() {
+        bail!(
+            "release archive did not contain expected root {}",
+            extracted.display()
+        );
+    }
+    let _ = fs::remove_dir_all(install_root);
+    copy_dir_recursive(&extracted, install_root)?;
+    let installed_binary = install_release_binary(install_root, home, release.binary, &platform)?;
+    if let Some(binary_path) = installed_binary {
+        println!("├─ Running adapter installer from release binary");
+        run_adapter_binary_installer(binary_path.as_os_str(), entry.slug, install_root)?;
+    }
+    patch_adapter_argv_to_installed_binary(install_root, release.binary, home)?;
+    let _ = fs::remove_dir_all(&temp);
+    Ok(())
+}
+
+fn install_release_binary(
+    install_root: &Path,
+    home: &Path,
+    binary: &str,
+    platform: &str,
+) -> anyhow::Result<Option<PathBuf>> {
+    let source = install_root.join(platform).join(binary);
+    if !source.is_file() {
+        return Ok(None);
+    }
+    let bin_dir = home.join(".local/bin");
+    fs::create_dir_all(&bin_dir)?;
+    let dest = bin_dir.join(binary);
+    fs::copy(&source, &dest)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&dest)?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&dest, perms)?;
+    }
+    println!("├─ Installed binary {}", dest.display());
+    Ok(Some(dest))
+}
+
+fn patch_adapter_argv_to_installed_binary(
+    install_root: &Path,
+    binary: &str,
+    home: &Path,
+) -> anyhow::Result<()> {
+    let manifest = install_root.join("adapter.toml");
+    if !manifest.is_file() {
+        return Ok(());
+    }
+    let bin_path = home.join(".local/bin").join(binary);
+    if !bin_path.is_file() {
+        return Ok(());
+    }
+    let quoted_binary = format!("\"{}\"", binary);
+    let quoted_path = toml::Value::String(bin_path.display().to_string()).to_string();
+    let text = fs::read_to_string(&manifest)?;
+    let patched = text
+        .lines()
+        .map(|line| {
+            if line.trim_start().starts_with("argv =") {
+                line.replace(&quoted_binary, &quoted_path)
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    fs::write(&manifest, patched)?;
+    Ok(())
+}
+
+fn platform_tag() -> anyhow::Result<String> {
+    let os = std::env::consts::OS;
+    let arch = match std::env::consts::ARCH {
+        "x86_64" => "x86_64",
+        "aarch64" => "aarch64",
+        other => bail!("unsupported adapter release architecture `{other}`"),
+    };
+    match os {
+        "linux" => Ok(format!("linux-{arch}")),
+        "macos" => Ok(format!("macos-{arch}")),
+        "windows" => Ok(format!("windows-{arch}")),
+        other => bail!("unsupported adapter release OS `{other}`"),
+    }
+}
+
+fn run_checked(command: &mut Command, label: &str) -> anyhow::Result<()> {
+    let status = command.status()?;
+    if !status.success() {
+        bail!("{label} failed with status {status}");
+    }
+    Ok(())
+}
+
+fn command_exists(binary: &str) -> bool {
+    Command::new(binary)
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 fn find_source_root(start: PathBuf) -> anyhow::Result<PathBuf> {
@@ -375,6 +708,40 @@ fn select_harnesses(args: &InstallArgs) -> anyhow::Result<Vec<HarnessKind>> {
         harnesses.push(HarnessKind::Pi);
     }
     Ok(harnesses)
+}
+
+fn select_adapters(args: &InstallArgs) -> anyhow::Result<Vec<String>> {
+    if !args.adapter.is_empty() {
+        let adapters = args
+            .adapter
+            .iter()
+            .map(|adapter| normalize_adapter_name(adapter))
+            .collect::<Vec<_>>();
+        println!("◇ Using adapters from flags: {}", adapters.join(", "));
+        return Ok(adapters);
+    }
+    if args.yes || !stdin_is_terminal() {
+        return Ok(Vec::new());
+    }
+    let entries = available_adapter_catalog();
+    let items = entries
+        .iter()
+        .map(|entry| format!("{} — {} [{}]", entry.slug, entry.title, entry.source))
+        .collect::<Vec<_>>();
+    let theme = ColorfulTheme::default();
+    let Some(selections) = MultiSelect::with_theme(&theme)
+        .with_prompt(
+            "Which adapter bundles would you like to install? (Space to select, Enter to submit, Esc to skip)",
+        )
+        .items(&items)
+        .defaults(&vec![false; items.len()])
+        .interact_opt()? else {
+        return Ok(Vec::new());
+    };
+    Ok(selections
+        .into_iter()
+        .filter_map(|index| entries.get(index).map(|entry| entry.slug.to_string()))
+        .collect())
 }
 
 fn install_harness(harness: HarnessKind, home: &Path) -> anyhow::Result<serde_json::Value> {

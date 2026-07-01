@@ -12,7 +12,7 @@ pub enum HarnessKind {
 
 #[derive(Debug, Args)]
 #[command(
-    after_help = "Examples:\n  ldgr install\n  ldgr install --harness pi --harness claude --yes\n  ldgr install --yes --no-agentctl\n  ldgr install adapter code --yes\n\nWithout --harness, the installer asks interactively and defaults to Pi. Multiple harnesses may be selected. The selected harness config is recorded under ~/.ldgr/. agentctl is installed when missing unless --no-agentctl is passed."
+    after_help = "Examples:\n  ldgr install\n  ldgr install --harness pi --harness claude --adapter conduct --yes\n  ldgr install --yes --no-agentctl\n  ldgr install adapter code --yes\n\nWithout --harness, the installer asks interactively and defaults to Pi. Multiple harnesses may be selected. In interactive mode the installer also offers adapter bundle selection. The selected harness config is recorded under ~/.ldgr/. agentctl is installed when missing unless --no-agentctl is passed."
 )]
 pub struct InstallArgs {
     #[command(subcommand)]
@@ -29,6 +29,10 @@ pub struct InstallArgs {
     /// Do not install agentctl even if it is missing from PATH.
     #[arg(long)]
     pub no_agentctl: bool,
+
+    /// Adapter bundle to install after harness setup. Repeatable.
+    #[arg(long)]
+    pub adapter: Vec<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -39,10 +43,10 @@ pub enum InstallCommand {
 
 #[derive(Debug, Args)]
 pub struct InstallAdapterArgs {
-    /// Adapter name, e.g. code, bench, explore, research, security, example.
+    /// Adapter name, e.g. conduct, research, example, code, bench, explore, security.
     pub name: String,
 
-    /// Source checkout root containing adapter crates. Defaults to the current directory or an ancestor.
+    /// Source checkout root containing adapter crates. Optional override for local source installs.
     #[arg(long)]
     pub source_root: Option<PathBuf>,
 

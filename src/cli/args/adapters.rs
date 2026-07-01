@@ -26,7 +26,7 @@ pub struct AdapterInstallArgs {
     /// Adapter slug to install, or `list` to show available adapters.
     pub name: String,
 
-    /// Source checkout root containing adapter crates. Defaults to the current directory or an ancestor for source installs.
+    /// Source checkout root containing adapter crates. Optional override for local source installs.
     #[arg(long)]
     pub source_root: Option<std::path::PathBuf>,
 
