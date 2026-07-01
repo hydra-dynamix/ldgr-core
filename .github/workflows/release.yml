@@ -30,6 +30,9 @@ jobs:
           - os: ubuntu-latest
             platform: linux-x86_64
             binary_ext: ""
+          - os: self-hosted
+            platform: linux-aarch64
+            binary_ext: ""
           - os: macos-13
             platform: macos-x86_64
             binary_ext: ""

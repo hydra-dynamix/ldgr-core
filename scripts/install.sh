@@ -69,9 +69,9 @@ install_from_source() {
   fi
   log "No prebuilt release asset for $PLATFORM; falling back to cargo install from $REPO."
   if [ -n "$VERSION" ]; then
-    cargo install --git "https://github.com/$REPO" --tag "v$VERSION" --locked --force --package "$PACKAGE"
+    cargo install --git "https://github.com/$REPO" --tag "v$VERSION" --locked --force "$PACKAGE"
   else
-    cargo install --git "https://github.com/$REPO" --locked --force --package "$PACKAGE"
+    cargo install --git "https://github.com/$REPO" --locked --force "$PACKAGE"
   fi
 }
 
