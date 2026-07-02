@@ -102,7 +102,7 @@ pub fn handle_install(args: InstallArgs) -> anyhow::Result<()> {
     println!("│");
     println!("◇ Next steps");
     if harnesses.contains(&HarnessKind::Pi) {
-        println!("│  Run /reload in Pi, then use /ldgr <args> or /ldgr-context.");
+        println!("│  Run /reload in Pi, then use /ldgr <args>, /ldgr-context, or /run-loop.");
     }
     if harnesses.contains(&HarnessKind::Claude) {
         println!("│  Restart/reload Claude Code, then use /ldgr <args>.");
@@ -1126,7 +1126,7 @@ fn install_pi_harness(home: &Path) -> anyhow::Result<serde_json::Value> {
         "harness": "pi",
         "extension_paths": [extension],
         "skill_paths": [home.join(".pi/agent/skills")],
-        "reload": "Run /reload in Pi, then use /ldgr <args> or /ldgr-context."
+        "reload": "Run /reload in Pi, then use /ldgr <args>, /ldgr-context, or /run-loop [adapter] [loop args]."
     }))
 }
 
@@ -1429,7 +1429,7 @@ fn install_core_harness_resources() -> anyhow::Result<()> {
         ".ldgr/harness-setup.md",
         "# LDGR harness setup\n\n\
 `ldgr init` installed the Pi project-local extension `.pi/extensions/ldgr-context.ts`.\n\n\
-If your agent harness is Pi, run `/reload` so `/ldgr <args>` and `/ldgr-context` become available. `/ldgr` runs the LDGR CLI in the project and pipes stdout/stderr back into the conversation; with no args it runs `ldgr context --brief`.\n\n\
+If your agent harness is Pi, run `/reload` so `/ldgr <args>`, `/ldgr-context`, and `/run-loop` become available. `/ldgr` runs the LDGR CLI in the project and pipes stdout/stderr back into the conversation; with no args it runs `ldgr context --brief`. `/run-loop [adapter] [loop args]` selects an installed adapter loop prompt and runs `ldgr loop run` with Pi as the loop agent.\n\n\
 If your agent harness is not Pi or does not load project-local Pi extensions, point the agent at this document and ask it to adapt the installed extension for its harness. The extension is optional; core `ldgr ...` commands continue to work from the shell.\n",
     )?;
     println!("installed Pi extension .pi/extensions/ldgr-context.ts");
