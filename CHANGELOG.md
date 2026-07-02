@@ -10,6 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Added
 
 - Add `scripts/install.sh`, an OS/architecture-aware release installer for clean `curl | sh` installation of `ldgr`.
+- Add `ldgr observe` as an observation shorthand, including `ldgr observe <run-id-or-work-slug> --body ...`.
+- Allow run references in run/evidence commands to use either numeric run IDs or work-item slugs.
 
 ### Fixed
 

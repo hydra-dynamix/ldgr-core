@@ -2,8 +2,8 @@ use std::path::Path;
 
 use crate::store::{
     add_artifact, add_observation, add_validation_record, close_run, finish_run, get_artifact,
-    get_run, list_artifacts, list_observations, list_runs, list_validation_records, start_run,
-    NextWorkSpec, RunStatus,
+    get_run, list_artifacts, list_observations, list_runs, list_validation_records,
+    resolve_run_reference, start_run, NextWorkSpec, RunStatus,
 };
 
 use super::super::args::{
@@ -24,7 +24,8 @@ pub fn handle_run(connection: &rusqlite::Connection, args: RunArgs) -> anyhow::R
             emit(args.json, &runs, |runs| print_runs(runs))?;
         }
         RunCommand::Show(args) => {
-            let run = get_run(connection, args.run_id)?;
+            let run_id = resolve_run_reference(connection, &args.run_id)?;
+            let run = get_run(connection, run_id)?;
             emit(args.json, &run, print_run)?;
         }
         RunCommand::Start(args) => {
@@ -32,9 +33,10 @@ pub fn handle_run(connection: &rusqlite::Connection, args: RunArgs) -> anyhow::R
             println!("started run {} for {}", run.id, args.work_slug);
         }
         RunCommand::Finish(args) => {
+            let run_id = resolve_run_reference(connection, &args.run_id)?;
             let run = finish_run(
                 connection,
-                args.run_id,
+                run_id,
                 args.status.into(),
                 args.notes.as_deref(),
             )?;
@@ -46,9 +48,10 @@ pub fn handle_run(connection: &rusqlite::Connection, args: RunArgs) -> anyhow::R
                 args.next_title.as_deref(),
                 args.next_description.as_deref(),
             )?;
+            let run_id = resolve_run_reference(connection, &args.run_id)?;
             let closed = close_run(
                 connection,
-                args.run_id,
+                run_id,
                 args.status.into(),
                 args.notes.as_deref(),
                 args.outcome.into(),
@@ -86,20 +89,30 @@ fn optional_next_work<'a>(
     }
 }
 
+fn resolve_optional_run_reference(
+    connection: &rusqlite::Connection,
+    reference: Option<&str>,
+) -> anyhow::Result<Option<i64>> {
+    reference
+        .map(|reference| resolve_run_reference(connection, reference))
+        .transpose()
+}
+
 pub fn handle_observation(
     connection: &rusqlite::Connection,
     args: ObservationArgs,
 ) -> anyhow::Result<()> {
     match args.command {
         ObservationCommand::List(args) => {
-            let observations =
-                list_observations(connection, args.run_id, checked_limit(args.limit)?)?;
+            let run_id = resolve_optional_run_reference(connection, args.run_id.as_deref())?;
+            let observations = list_observations(connection, run_id, checked_limit(args.limit)?)?;
             emit(args.json, &observations, |observations| {
                 print_observations(observations)
             })?;
         }
         ObservationCommand::Add(args) => {
-            let observation = add_observation(connection, args.run_id, &args.body)?;
+            let run_id = resolve_run_reference(connection, &args.run_id)?;
+            let observation = add_observation(connection, run_id, &args.body)?;
             println!("added observation {}", observation.id);
         }
     }
@@ -113,7 +126,8 @@ pub fn handle_artifact(
 ) -> anyhow::Result<()> {
     match args.command {
         ArtifactCommand::List(args) => {
-            let artifacts = list_artifacts(connection, args.run_id, checked_limit(args.limit)?)?;
+            let run_id = resolve_optional_run_reference(connection, args.run_id.as_deref())?;
+            let artifacts = list_artifacts(connection, run_id, checked_limit(args.limit)?)?;
             emit(args.json, &artifacts, |artifacts| {
                 print_artifacts(artifacts)
             })?;
@@ -123,10 +137,11 @@ pub fn handle_artifact(
             emit(args.json, &artifact, print_artifact)?;
         }
         ArtifactCommand::Add(args) => {
+            let run_id = resolve_run_reference(connection, &args.run_id)?;
             let artifact = add_artifact(
                 connection,
                 artifact_root,
-                args.run_id,
+                run_id,
                 args.kind.parse()?,
                 &args.path,
                 &args.description,
@@ -143,16 +158,18 @@ pub fn handle_validation(
 ) -> anyhow::Result<()> {
     match args.command {
         ValidationCommand::List(args) => {
+            let run_id = resolve_optional_run_reference(connection, args.run_id.as_deref())?;
             let validations =
-                list_validation_records(connection, args.run_id, checked_limit(args.limit)?)?;
+                list_validation_records(connection, run_id, checked_limit(args.limit)?)?;
             emit(args.json, &validations, |validations| {
                 print_validations(validations)
             })?;
         }
         ValidationCommand::Record(args) => {
+            let run_id = resolve_run_reference(connection, &args.run_id)?;
             let validation = add_validation_record(
                 connection,
-                args.run_id,
+                run_id,
                 args.outcome.into(),
                 args.command.as_deref(),
                 args.rationale.as_deref(),

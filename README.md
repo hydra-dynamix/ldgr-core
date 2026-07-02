@@ -57,10 +57,10 @@ ldgr work create my-first-task \
 ldgr work edit my-first-task --description "Figure out why X happens; record evidence."
 ldgr work status set my-first-task pending
 ldgr run start my-first-task --command "manual investigation"
-ldgr observation add 1 --body "X happens when Y."
-ldgr artifact add 1 --kind report --path notes/x-report.md --description "Investigation notes."
+ldgr observe my-first-task --body "X happens when Y."
+ldgr artifact add my-first-task --kind report --path notes/x-report.md --description "Investigation notes."
 ldgr artifact show 1
-ldgr run close 1 --status success --outcome continue \
+ldgr run close my-first-task --status success --outcome continue \
   --rationale "Y confirmed as the trigger." \
   --next-slug fix-y --next-title "Fix Y" --next-description "Patch Y handling."
 ldgr status                        # compact agent-first status summary
@@ -70,8 +70,11 @@ ldgr context                       # the operational cockpit, also: ldgr context
 ```
 
 That loop is the day-one model: work, run, observation, artifact, decision,
-notice, and context. `ldgr run close` is the recommended closure path for active
-runs because it records the terminal run status and work decision together.
+notice, and context. `ldgr observe` is a shorthand for recording run observations;
+`ldgr observation add` remains available. Commands that attach evidence to a run
+accept either numeric run IDs or work-item slugs. `ldgr run close` is the
+recommended closure path for active runs because it records the terminal run
+status and work decision together.
 
 Use `ldgr --help` or `ldgr <command> --help` to explore the command surface.
 

@@ -22,7 +22,7 @@ fn top_level_help_shows_core_loop_and_hides_mature_project_surface() -> anyhow::
                 "work create <slug> --title <title> --description <description>",
             ))
             .and(predicate::str::contains("run start <work-slug>"))
-            .and(predicate::str::contains("observation add <run-id>"))
+            .and(predicate::str::contains("observe <run-id-or-work-slug>"))
             .and(predicate::str::contains("decision record <work-slug>"))
             .and(predicate::str::contains(
                 "Default help shows the day-one workflow",
@@ -822,6 +822,143 @@ fn run_close_finishes_run_and_records_decision_from_run_id() -> anyhow::Result<(
 }
 
 #[test]
+fn observe_alias_and_slug_run_references_work_for_run_evidence() -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    let db_path = project.path().join(".ldgr/ldgr.db");
+    let artifact_root = project.path().join(".ldgr/artifacts");
+    let report_path = project.path().join("report.txt");
+    fs::write(&report_path, "slug artifact evidence\n")?;
+
+    run(project.path(), &db_path, &artifact_root, ["init"])?;
+    run(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        [
+            "work",
+            "create",
+            "slug-ref",
+            "--title",
+            "Slug ref",
+            "--description",
+            "Use work slugs where agents used to need numeric run IDs.",
+        ],
+    )?;
+    run(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        ["run", "start", "slug-ref"],
+    )?;
+
+    command(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        [
+            "observe",
+            "slug-ref",
+            "--body",
+            "direct observe alias resolved slug-ref",
+        ],
+    )?
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("added observation 1"));
+
+    command(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        [
+            "observe",
+            "add",
+            "slug-ref",
+            "--body",
+            "subcommand observe alias resolved slug-ref",
+        ],
+    )?
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("added observation 2"));
+
+    command(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        ["observation", "list", "--run-id", "slug-ref"],
+    )?
+    .assert()
+    .success()
+    .stdout(predicate::str::contains(
+        "subcommand observe alias resolved slug-ref",
+    ))
+    .stdout(predicate::str::contains(
+        "direct observe alias resolved slug-ref",
+    ));
+
+    command(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        [
+            "validation",
+            "record",
+            "slug-ref",
+            "--outcome",
+            "pass",
+            "--command",
+            "cargo test slug-ref",
+        ],
+    )?
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("command: cargo test slug-ref"));
+
+    command(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        [
+            "artifact",
+            "add",
+            "slug-ref",
+            "--path",
+            report_path.to_str().context("report path is UTF-8")?,
+            "--description",
+            "slug-ref artifact",
+        ],
+    )?
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("added artifact 1"));
+
+    command(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        [
+            "run",
+            "close",
+            "slug-ref",
+            "--status",
+            "success",
+            "--outcome",
+            "stop",
+            "--rationale",
+            "Slug-based run references are supported.",
+        ],
+    )?
+    .assert()
+    .success()
+    .stdout(predicate::str::contains(
+        "closed run 1 [success] and recorded decision 1 [stop] for slug-ref",
+    ));
+
+    Ok(())
+}
+
+#[test]
 fn validation_skip_requires_rationale_and_stays_distinct_from_pass() -> anyhow::Result<()> {
     let project = TempDir::new()?;
     let db_path = project.path().join(".ldgr/ldgr.db");
@@ -1301,13 +1438,13 @@ fn context_brief_prints_agent_on_ramp_without_full_cockpit_noise() -> anyhow::Re
     ))
     .stdout(predicate::str::contains("next_commands:"))
     .stdout(predicate::str::contains(
-        "ldgr observation add 1 --body <evidence>",
+        "ldgr observe brief-next --body <evidence>",
     ))
     .stdout(predicate::str::contains(
-        "ldgr run close 1 --status <success|partial|failed> --outcome stop --rationale <why>",
+        "ldgr run close brief-next --status <success|partial|failed> --outcome stop --rationale <why>",
     ))
     .stdout(predicate::str::contains(
-        "ldgr run close 1 --status <success|partial|failed> --outcome continue --rationale <why> --next-slug <slug> --next-title <title> --next-description <description>",
+        "ldgr run close brief-next --status <success|partial|failed> --outcome continue --rationale <why> --next-slug <slug> --next-title <title> --next-description <description>",
     ))
     .stdout(predicate::str::contains("--outcome <continue|stop>").not())
     .stdout(predicate::str::contains("brief_context: ldgr status"))
@@ -1329,7 +1466,7 @@ fn context_brief_prints_agent_on_ramp_without_full_cockpit_noise() -> anyhow::Re
     .stdout(predicate::str::contains(r#""work": "brief-next""#))
     .stdout(predicate::str::contains(r#""next_commands""#))
     .stdout(predicate::str::contains(
-        r#""ldgr run close 1 --status <success|partial|failed> --outcome continue --rationale <why> --next-slug <slug> --next-title <title> --next-description <description>""#,
+        r#""ldgr run close brief-next --status <success|partial|failed> --outcome continue --rationale <why> --next-slug <slug> --next-title <title> --next-description <description>""#,
     ))
     .stdout(predicate::str::contains(
         r#""brief_context_command": "ldgr status""#,
@@ -1409,13 +1546,13 @@ fn active_run_with_queued_next_work_prints_explicit_continue_next_slug() -> anyh
             "handoff: active_run=true next_work=true needs_decision=true",
         ))
         .stdout(predicate::str::contains(
-            "ldgr observation add 1 --body <evidence>",
+            "ldgr observe active-work --body <evidence>",
         ))
         .stdout(predicate::str::contains(
-            "ldgr run close 1 --status <success|partial|failed> --outcome continue --rationale <why> --next-slug queued-work",
+            "ldgr run close active-work --status <success|partial|failed> --outcome continue --rationale <why> --next-slug queued-work",
         ))
         .stdout(predicate::str::contains(
-            "ldgr run close 1 --status <success|partial|failed> --outcome stop --rationale <why>",
+            "ldgr run close active-work --status <success|partial|failed> --outcome stop --rationale <why>",
         ))
         .stdout(predicate::str::contains("--outcome <continue|stop>").not());
 

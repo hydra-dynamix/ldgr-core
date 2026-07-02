@@ -4,13 +4,13 @@ use clap::{Args, Subcommand, ValueEnum};
 
 use crate::store::{DecisionOutcome, RunStatus, ValidationOutcome};
 
-const RUN_HELP: &str = "Examples:\n  ldgr run start fix-login --command \"cargo test login\"\n  ldgr run finish 7 --status success --notes \"Tests pass.\"\n  ldgr run close 7 --status success --outcome stop --rationale \"Project complete.\"\n  ldgr run close 7 --status success --outcome continue --rationale \"Next slice identified.\" --next-slug docs --next-title \"Update docs\" --next-description \"Document token refresh.\"\n  ldgr run close 7 --status success --outcome continue --rationale \"Continue with queued work.\" --next-slug queued-docs\n\nRuns capture bounded execution. Decisions close the work narrative. Use --outcome stop only for terminal closure. Use --outcome continue only with --next-slug, either linking an existing nonterminal work item or creating one with --next-title and --next-description.";
+const RUN_HELP: &str = "Examples:\n  ldgr run start fix-login --command \"cargo test login\"\n  ldgr run finish 7 --status success --notes \"Tests pass.\"\n  ldgr run close fix-login --status success --outcome stop --rationale \"Project complete.\"\n  ldgr run close 7 --status success --outcome continue --rationale \"Next slice identified.\" --next-slug docs --next-title \"Update docs\" --next-description \"Document token refresh.\"\n  ldgr run close fix-login --status success --outcome continue --rationale \"Continue with queued work.\" --next-slug queued-docs\n\nRun references may be numeric run IDs or work-item slugs. Runs capture bounded execution. Decisions close the work narrative. Use --outcome stop only for terminal closure. Use --outcome continue only with --next-slug, either linking an existing nonterminal work item or creating one with --next-title and --next-description.";
 
-const OBSERVATION_HELP: &str = "Examples:\n  ldgr observation add 7 --body \"Token refresh fails when the cache is empty.\"\n  ldgr observation list --run-id 7\n\nObservations are append-only run notes. Add a correction observation instead of editing history.";
+const OBSERVATION_HELP: &str = "Examples:\n  ldgr observation add 7 --body \"Token refresh fails when the cache is empty.\"\n  ldgr observe add fix-login --body \"Token refresh fails when the cache is empty.\"\n  ldgr observe fix-login --body \"Token refresh fails when the cache is empty.\"\n  ldgr observation list --run-id fix-login\n\nRun references may be numeric run IDs or work-item slugs. Observations are append-only run notes. Add a correction observation instead of editing history.";
 
-const ARTIFACT_HELP: &str = "Examples:\n  ldgr artifact add 7 --kind report --path target/test-output.txt --description \"Test transcript.\"\n  ldgr artifact show 3\n  ldgr artifact list --run-id 7\n\nArtifacts preserve files or durable references produced during a run.";
+const ARTIFACT_HELP: &str = "Examples:\n  ldgr artifact add 7 --kind report --path target/test-output.txt --description \"Test transcript.\"\n  ldgr artifact add fix-login --kind report --path target/test-output.txt --description \"Test transcript.\"\n  ldgr artifact show 3\n  ldgr artifact list --run-id fix-login\n\nRun references may be numeric run IDs or work-item slugs. Artifacts preserve files or durable references produced during a run.";
 
-const VALIDATION_HELP: &str = "Examples:\n  ldgr validation record 7 --outcome pass --command \"cargo test\"\n  ldgr validation record 7 --outcome skipped --rationale \"No TypeScript files changed.\"\n  ldgr validation list --run-id 7\n\nValidation records capture generic PASS, FAIL, ERROR, and SKIPPED outcomes. Skipped validation requires a durable rationale.";
+const VALIDATION_HELP: &str = "Examples:\n  ldgr validation record 7 --outcome pass --command \"cargo test\"\n  ldgr validation record fix-login --outcome skipped --rationale \"No TypeScript files changed.\"\n  ldgr validation list --run-id fix-login\n\nRun references may be numeric run IDs or work-item slugs. Validation records capture generic PASS, FAIL, ERROR, and SKIPPED outcomes. Skipped validation requires a durable rationale.";
 
 #[derive(Debug, Args)]
 #[command(after_help = RUN_HELP)]
@@ -44,7 +44,7 @@ pub struct ListRunArgs {
 
 #[derive(Debug, Args)]
 pub struct ShowRunArgs {
-    pub run_id: i64,
+    pub run_id: String,
 
     #[arg(long)]
     pub json: bool,
@@ -60,7 +60,7 @@ pub struct StartRunArgs {
 
 #[derive(Debug, Args)]
 pub struct FinishRunArgs {
-    pub run_id: i64,
+    pub run_id: String,
 
     #[arg(long, value_enum)]
     pub status: CliRunStatus,
@@ -71,7 +71,7 @@ pub struct FinishRunArgs {
 
 #[derive(Debug, Args)]
 pub struct CloseRunArgs {
-    pub run_id: i64,
+    pub run_id: String,
 
     #[arg(long, value_enum)]
     pub status: CliRunStatus,
@@ -206,7 +206,7 @@ pub enum ObservationCommand {
 #[derive(Debug, Args)]
 pub struct ListObservationArgs {
     #[arg(long)]
-    pub run_id: Option<i64>,
+    pub run_id: Option<String>,
 
     #[arg(long, default_value_t = 20)]
     pub limit: i64,
@@ -217,7 +217,7 @@ pub struct ListObservationArgs {
 
 #[derive(Debug, Args)]
 pub struct AddObservationArgs {
-    pub run_id: i64,
+    pub run_id: String,
 
     #[arg(long)]
     pub body: String,
@@ -243,7 +243,7 @@ pub enum ArtifactCommand {
 #[derive(Debug, Args)]
 pub struct ListArtifactArgs {
     #[arg(long)]
-    pub run_id: Option<i64>,
+    pub run_id: Option<String>,
 
     #[arg(long, default_value_t = 20)]
     pub limit: i64,
@@ -262,7 +262,7 @@ pub struct ShowArtifactArgs {
 
 #[derive(Debug, Args)]
 pub struct AddArtifactArgs {
-    pub run_id: i64,
+    pub run_id: String,
 
     #[arg(long, default_value = "other")]
     pub kind: String,
@@ -292,7 +292,7 @@ pub enum ValidationCommand {
 #[derive(Debug, Args)]
 pub struct ListValidationArgs {
     #[arg(long)]
-    pub run_id: Option<i64>,
+    pub run_id: Option<String>,
 
     #[arg(long, default_value_t = 20)]
     pub limit: i64,
@@ -303,7 +303,7 @@ pub struct ListValidationArgs {
 
 #[derive(Debug, Args)]
 pub struct RecordValidationArgs {
-    pub run_id: i64,
+    pub run_id: String,
 
     #[arg(long, value_enum)]
     pub outcome: CliValidationOutcome,

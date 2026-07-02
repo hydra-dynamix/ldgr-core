@@ -256,6 +256,87 @@ pub(crate) fn ensure_run_exists(connection: &Connection, run_id: i64) -> anyhow:
     get_run_by_id(connection, run_id).map(|_| ())
 }
 
+pub fn resolve_run_reference(connection: &Connection, reference: &str) -> anyhow::Result<i64> {
+    let reference = reference.trim();
+    if reference.is_empty() {
+        bail!("run reference cannot be empty");
+    }
+    if let Some(run_id) = parse_run_id_reference(reference) {
+        get_run_by_id(connection, run_id)?;
+        return Ok(run_id);
+    }
+    if matches!(reference, "current" | "active") {
+        return resolve_current_run_reference(connection, reference);
+    }
+    let latest_for_work = connection
+        .query_row(
+            "SELECT run.id
+             FROM run
+             JOIN work_item ON work_item.id = run.work_item_id
+             WHERE work_item.slug = ?1
+             ORDER BY CASE run.status WHEN 'running' THEN 0 ELSE 1 END,
+                      run.started_at DESC,
+                      run.id DESC
+             LIMIT 1",
+            params![reference],
+            |row| row.get(0),
+        )
+        .optional()
+        .with_context(|| format!("failed to resolve run reference {reference}"))?;
+    if let Some(run_id) = latest_for_work {
+        return Ok(run_id);
+    }
+    let work_exists = connection
+        .query_row(
+            "SELECT id FROM work_item WHERE slug = ?1",
+            params![reference],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .with_context(|| format!("failed to inspect work item {reference}"))?;
+    if work_exists.is_some() {
+        bail!("work item {reference} has no runs; start one with `ldgr run start {reference}`");
+    }
+    bail!("run reference {reference} did not match a numeric run ID or work-item slug")
+}
+
+fn resolve_current_run_reference(connection: &Connection, reference: &str) -> anyhow::Result<i64> {
+    let running_runs = running_run_ids(connection)?;
+    match running_runs.as_slice() {
+        [run_id] => Ok(*run_id),
+        [] => bail!("run reference {reference} requested the active run, but no run is running"),
+        _ => bail!(
+            "run reference {reference} is ambiguous because multiple runs are active: {}",
+            running_runs
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+fn running_run_ids(connection: &Connection) -> anyhow::Result<Vec<i64>> {
+    let mut statement = connection
+        .prepare("SELECT id FROM run WHERE status = 'running' ORDER BY started_at, id")
+        .context("failed to prepare running run reference query")?;
+    let rows = statement
+        .query_map([], |row| row.get(0))
+        .context("failed to query running run references")?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to read running run references")
+}
+
+fn parse_run_id_reference(reference: &str) -> Option<i64> {
+    let id_text = reference
+        .strip_prefix("run-")
+        .or_else(|| reference.strip_prefix("run:"))
+        .or_else(|| reference.strip_prefix("run="))
+        .or_else(|| reference.strip_prefix('#'))
+        .unwrap_or(reference);
+    id_text.parse::<i64>().ok()
+}
+
 pub(crate) fn get_observation_by_id(
     connection: &Connection,
     observation_id: i64,

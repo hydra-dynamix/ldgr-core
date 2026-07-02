@@ -24,10 +24,11 @@ pub(crate) const CLI_DEFAULT_HELP_SECTIONS: &str = r#"Core loop:
   work status set <slug> held --reason <why>
   next
   run start <work-slug> --command <what-ran>
-  observation add <run-id> --body <what-changed-or-was-learned>
-  artifact add <run-id> --path <file> --description <why-it-matters>
+  observe <run-id-or-work-slug> --body <what-changed-or-was-learned>
+  observation add <run-id-or-work-slug> --body <what-changed-or-was-learned>
+  artifact add <run-id-or-work-slug> --path <file> --description <why-it-matters>
   artifact show <artifact-id>
-  validation record <run-id> --outcome <pass|fail|error|skipped> --rationale <why-if-skipped>
+  validation record <run-id-or-work-slug> --outcome <pass|fail|error|skipped> --rationale <why-if-skipped>
   decision record <work-slug> --outcome continue --rationale <why> --next-slug <slug> --next-title <title> --next-description <description>
   status
   context --brief
@@ -67,7 +68,7 @@ pub(crate) const CLI_FULL_HELP_SECTIONS: &str = r#"Core command tree:
     start
     finish
     close
-  observation
+  observation (alias: observe)
     list
     add
   artifact
@@ -147,6 +148,7 @@ enum Command {
     /// Start and finish investigation runs.
     Run(RunArgs),
     /// Attach observations to runs.
+    #[command(visible_alias = "observe")]
     Observation(ObservationArgs),
     /// Attach artifacts to runs.
     Artifact(ArtifactArgs),
@@ -182,6 +184,7 @@ where
     T: Into<OsString>,
 {
     let args = args.into_iter().map(Into::into).collect::<Vec<_>>();
+    let args = normalize_command_aliases(args);
     let cli = match Cli::try_parse_from(args.clone()) {
         Ok(cli) => cli,
         Err(error)
@@ -213,6 +216,50 @@ where
 
 pub fn command() -> clap::Command {
     Cli::command()
+}
+
+fn normalize_command_aliases(mut args: Vec<OsString>) -> Vec<OsString> {
+    let Some(command_index) = first_command_arg_index(&args) else {
+        return args;
+    };
+    let Some(command) = args[command_index].to_str() else {
+        return args;
+    };
+    if command != "observe" {
+        return args;
+    }
+    args[command_index] = OsString::from("observation");
+    let next_token = args.get(command_index + 1).and_then(|arg| arg.to_str());
+    if matches!(next_token, Some("add" | "list" | "--help" | "-h") | None) {
+        return args;
+    }
+    args.insert(command_index + 1, OsString::from("add"));
+    args
+}
+
+fn first_command_arg_index(args: &[OsString]) -> Option<usize> {
+    let mut index = 1;
+    while index < args.len() {
+        let token = args[index].to_str()?;
+        if token == "--db" || token == "--artifact-root" {
+            index += 2;
+            continue;
+        }
+        if token.starts_with("--db=") || token.starts_with("--artifact-root=") {
+            index += 1;
+            continue;
+        }
+        if token == "--full" {
+            index += 1;
+            continue;
+        }
+        if token.starts_with('-') {
+            index += 1;
+            continue;
+        }
+        return Some(index);
+    }
+    None
 }
 
 fn handle_cli(cli: Cli) -> anyhow::Result<()> {

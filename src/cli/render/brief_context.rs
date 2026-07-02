@@ -259,30 +259,25 @@ fn next_commands_with_registry(
     if handoff.needs_decision {
         if let Some(run) = context.active_runs.first() {
             let mut commands = adapter_commands;
-            commands.push(format!(
-                "ldgr observation add {} --body <evidence>",
-                run.run_id
-            ));
+            let run_ref = run.work_slug.as_str();
+            commands.push(format!("ldgr observe {run_ref} --body <evidence>"));
             if let Some(work_item) = &context.next_work_item {
                 commands.extend([
                     format!(
-                        "ldgr run close {} --status <success|partial|failed> --outcome continue --rationale <why> --next-slug {}",
-                        run.run_id, work_item.slug
+                        "ldgr run close {run_ref} --status <success|partial|failed> --outcome continue --rationale <why> --next-slug {}",
+                        work_item.slug
                     ),
                     format!(
-                        "ldgr run close {} --status <success|partial|failed> --outcome stop --rationale <why>",
-                        run.run_id
+                        "ldgr run close {run_ref} --status <success|partial|failed> --outcome stop --rationale <why>"
                     ),
                 ]);
             } else {
                 commands.extend([
                     format!(
-                        "ldgr run close {} --status <success|partial|failed> --outcome stop --rationale <why>",
-                        run.run_id
+                        "ldgr run close {run_ref} --status <success|partial|failed> --outcome stop --rationale <why>"
                     ),
                     format!(
-                        "ldgr run close {} --status <success|partial|failed> --outcome continue --rationale <why> --next-slug <slug> --next-title <title> --next-description <description>",
-                        run.run_id
+                        "ldgr run close {run_ref} --status <success|partial|failed> --outcome continue --rationale <why> --next-slug <slug> --next-title <title> --next-description <description>"
                     ),
                 ]);
             }
