@@ -740,6 +740,12 @@ fn install_adapter_harness_assets(
     install_root: &Path,
     home: &Path,
 ) -> anyhow::Result<()> {
+    let prompts = install_root.join("prompts");
+    if prompts.is_dir() {
+        let prompt_root = home.join(".ldgr/prompts");
+        copy_directory_children(&prompts, &prompt_root)?;
+        println!("├─ LDGR prompts {}", prompt_root.display());
+    }
     let skills = install_root.join("skills");
     if skills.is_dir() {
         let pi_skills = home.join(".pi/agent/skills");
@@ -1662,6 +1668,29 @@ prompt_stdin = true
         assert!(agents.contains_key("custom"));
         assert!(agents.contains_key("ldgr-loop"));
         assert_eq!(parsed["summary"]["max_output_bytes"].as_integer(), Some(99));
+        Ok(())
+    }
+
+    #[test]
+    fn adapter_harness_assets_install_central_prompts() -> anyhow::Result<()> {
+        let install_root = tempfile::tempdir()?;
+        let home = tempfile::tempdir()?;
+        std::fs::create_dir_all(install_root.path().join("prompts"))?;
+        std::fs::write(
+            install_root.path().join("prompts/research-loop.md"),
+            "prompt",
+        )?;
+
+        install_adapter_harness_assets("research", install_root.path(), home.path())?;
+
+        assert_eq!(
+            std::fs::read_to_string(home.path().join(".ldgr/prompts/research-loop.md"))?,
+            "prompt"
+        );
+        assert!(home
+            .path()
+            .join(".ldgr/installed-adapters/research")
+            .is_file());
         Ok(())
     }
 
