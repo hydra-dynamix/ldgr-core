@@ -633,12 +633,15 @@ fn patch_adapter_argv_to_source_runner(
         return Ok(());
     }
     let cargo_manifest = source_root.join("Cargo.toml");
+    let target_dir = install_root.join("source-target");
     let source_runner = [
         "cargo".to_string(),
         "run".to_string(),
         "--quiet".to_string(),
         "--manifest-path".to_string(),
         cargo_manifest.display().to_string(),
+        "--target-dir".to_string(),
+        target_dir.display().to_string(),
         "-p".to_string(),
         package.to_string(),
         "--".to_string(),
@@ -1692,6 +1695,11 @@ argv = ["ldgr-conduct", "status"]
         assert!(manifest.contains(&format!(
             "\"{}\"",
             source_root.path().join("Cargo.toml").display()
+        )));
+        assert!(manifest.contains("\"--target-dir\""));
+        assert!(manifest.contains(&format!(
+            "\"{}\"",
+            install_root.path().join("source-target").display()
         )));
         assert!(manifest.contains("\"-p\", \"ldgr-conduct\", \"--\"]"));
         assert!(manifest.contains("\"--\", \"status\"]"));
