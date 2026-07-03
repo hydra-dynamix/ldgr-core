@@ -122,7 +122,7 @@ pub struct WebArgs {
 
 #[derive(Debug, Args)]
 #[command(
-    after_help = "Examples:\n  ldgr loop run --prompt prompts/loop-prompt.md --agent agentctl\n  ldgr loop run --prompt prompts/loop-prompt.md --agent agentctl --until-empty\n  ldgr loop run --prompt prompts/loop-prompt.md --dry-run\n  ldgr loop run --prompt prompts/loop-prompt.md --agent-argv '[\"my-agent\"]'\n\nLoop run executes bounded cycles from pending work items. Each cycle is a fresh agent invocation that rehydrates from LDGR context. Use --until-empty to keep launching one fresh cycle at a time until no pending work remains or the loop blocks."
+    after_help = "Examples:\n  ldgr loop run --prompt prompts/loop-prompt.md --agent agentctl\n  ldgr loop run --prompt prompts/loop-prompt.md --agent agentctl --until-empty --summary-agent agentctl\n  ldgr loop run --prompt prompts/loop-prompt.md --dry-run\n  ldgr loop run --prompt prompts/loop-prompt.md --agent-argv '[\"my-agent\"]'\n\nLoop run executes bounded cycles from pending work items. Each cycle is a fresh agent invocation that rehydrates from LDGR context. Use --until-empty to keep launching one fresh cycle at a time until no pending work remains or the loop blocks."
 )]
 pub struct LoopArgs {
     #[command(subcommand)]
@@ -164,6 +164,18 @@ pub struct LoopRunArgs {
     /// Fresh audit command argv as JSON array for project-completion requests.
     #[arg(long)]
     pub audit_argv: Option<String>,
+
+    /// Built-in post-run summarizer preset. Values: agentctl. Runs once after each completed worker cycle.
+    #[arg(long, value_enum)]
+    pub summary_agent: Option<CliLoopAgent>,
+
+    /// Post-run summarizer command argv as JSON array. The summary prompt is written to stdin.
+    #[arg(long)]
+    pub summary_argv: Option<String>,
+
+    /// Append post-run summaries to this markdown log.
+    #[arg(long, default_value = ".ldgr/logs/loop-summary.md")]
+    pub summary_log: PathBuf,
 
     /// Request whole-project completion handling with a fresh external audit first.
     #[arg(long)]

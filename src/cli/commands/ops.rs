@@ -1072,9 +1072,14 @@ fn add_ldgr_agentctl_agents(
         .context("agentctl config [agents] must be a table")?;
 
     let primary = harnesses.first().copied().unwrap_or(HarnessKind::Pi);
+    let primary_command = agentctl_primary_command(primary);
     agents.insert(
         "ldgr-loop".to_string(),
-        agentctl_agent_value(&agentctl_primary_command(primary)),
+        agentctl_agent_value(&primary_command),
+    );
+    agents.insert(
+        "ldgr-summary".to_string(),
+        agentctl_agent_value(&primary_command),
     );
     for harness in harnesses {
         agents.insert(
@@ -1391,6 +1396,7 @@ pub fn handle_loop(
     match args.command {
         LoopCommand::Run(args) => {
             let agent = resolve_loop_agent(&args)?;
+            let summary_agent = resolve_summary_agent(&args)?;
             let prompt = resolve_loop_prompt(connection, &args)?;
             let options = LoopRuntimeOptions {
                 prompt,
@@ -1400,6 +1406,8 @@ pub fn handle_loop(
                     .as_deref()
                     .map(parse_argv_json)
                     .transpose()?,
+                summary_agent,
+                summary_log: args.summary_log.clone(),
                 project_complete_requested: args.project_complete_requested,
                 dry_run: args.dry_run,
                 stream_agent_output: args.stream_agent_output,
@@ -1470,7 +1478,7 @@ fn install_core_harness_resources() -> anyhow::Result<()> {
         ".ldgr/harness-setup.md",
         "# LDGR harness setup\n\n\
 `ldgr init` installed the Pi project-local extension `.pi/extensions/ldgr-context.ts`.\n\n\
-If your agent harness is Pi, run `/reload` so `/ldgr <args>`, `/ldgr-context`, and `/run-loop` become available. `/ldgr` runs the LDGR CLI in the project and pipes stdout/stderr back into the conversation; with no args it runs `ldgr context --brief`. `/run-loop [adapter] [loop args]` selects an installed adapter loop prompt and runs `ldgr loop run --agent agentctl --until-empty`, launching one fresh agent per LDGR work item until no pending work remains or the loop blocks.\n\n\
+If your agent harness is Pi, run `/reload` so `/ldgr <args>`, `/ldgr-context`, and `/run-loop` become available. `/ldgr` runs the LDGR CLI in the project and pipes stdout/stderr back into the conversation; with no args it runs `ldgr context --brief`. `/run-loop [adapter] [loop args]` selects an installed adapter loop prompt and runs `ldgr loop run --agent agentctl --until-empty --summary-agent agentctl`, launching one fresh worker agent per LDGR work item and one separate fresh summarizer call per completed cycle until no pending work remains or the loop blocks.\n\n\
 If your agent harness is not Pi or does not load project-local Pi extensions, point the agent at this document and ask it to adapt the installed extension for its harness. The extension is optional; core `ldgr ...` commands continue to work from the shell.\n",
     )?;
     println!("installed Pi extension .pi/extensions/ldgr-context.ts");
@@ -1599,6 +1607,26 @@ fn resolve_loop_agent(args: &LoopRunArgs) -> anyhow::Result<LoopAgent> {
     match args.agent.unwrap_or(CliLoopAgent::Agentctl) {
         CliLoopAgent::Agentctl => Ok(LoopAgent::Agentctl),
     }
+}
+
+fn resolve_summary_agent(args: &LoopRunArgs) -> anyhow::Result<Option<LoopAgent>> {
+    if args.dry_run {
+        return Ok(None);
+    }
+    if let Some(summary_argv) = args.summary_argv.as_deref() {
+        if args.summary_agent.is_some() {
+            bail!("--summary-agent and --summary-argv are mutually exclusive");
+        }
+        return Ok(Some(LoopAgent::Argv(parse_argv_json(summary_argv)?)));
+    }
+    Ok(args.summary_agent.map(|CliLoopAgent::Agentctl| {
+        LoopAgent::Argv(vec![
+            "agentctl".to_owned(),
+            "run".to_owned(),
+            std::env::var("LDGR_SUMMARY_AGENTCTL_TASK")
+                .unwrap_or_else(|_| "ldgr-summary".to_owned()),
+        ])
+    }))
 }
 
 fn loop_result_failed(result: &LoopRuntimeResult, options: &LoopRuntimeOptions) -> bool {

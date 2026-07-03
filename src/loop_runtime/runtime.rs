@@ -271,6 +271,16 @@ fn run_loop_after_start(
         "Autonomous loop agent stdout/stderr capture.",
     )?;
 
+    let (summary_artifact_path, summary_exit_code) = run_post_cycle_summary(
+        connection,
+        artifact_root,
+        options,
+        work_slug,
+        run_id,
+        &output_path,
+        agent.exit_code,
+    )?;
+
     let final_status = if options.dry_run {
         RunStatus::Partial
     } else if agent.exit_code == Some(0)
@@ -324,8 +334,123 @@ fn run_loop_after_start(
         work_slug: work_slug.to_owned(),
         prompt_artifact_path,
         audit_artifact_path,
+        summary_artifact_path,
+        summary_exit_code,
         agent_exit_code: agent.exit_code,
         audit_exit_code,
     })
+}
+
+fn run_post_cycle_summary(
+    connection: &Connection,
+    artifact_root: &Path,
+    options: &LoopRuntimeOptions,
+    work_slug: &str,
+    run_id: i64,
+    agent_output_path: &Path,
+    agent_exit_code: Option<i32>,
+) -> anyhow::Result<(Option<PathBuf>, Option<i32>)> {
+    let Some(summary_agent) = &options.summary_agent else {
+        return Ok((None, None));
+    };
+    record_run_phase(
+        connection,
+        run_id,
+        "running_summary_agent",
+        &format!("Running one-shot post-cycle summary agent for {work_slug}."),
+    )?;
+    let context = read_context(connection)?;
+    let prompt = format!(
+        "You are a one-shot LDGR summary agent. Do not continue the work. Summarize only the completed run for UI/log consumption.\n\nRun: {run_id}\nWork: {work_slug}\nAgent exit code: {}\nAgent output artifact: {}\n\nUse compact markdown with: outcome, evidence, notable files/artifacts, next work/blocker if visible. Do not invent results.\n\nLDGR context:\n```json\n{}\n```\n",
+        agent_exit_code
+            .map(|code| code.to_string())
+            .unwrap_or_else(|| "unknown".to_owned()),
+        agent_output_path.display(),
+        serde_json::to_string_pretty(&context)?
+    );
+    let argv = agent_output_argv(summary_agent);
+    let mut summary = match summary_agent {
+        LoopAgent::DryRun => ProcessCapture::from_memory(
+            None,
+            0,
+            "dry-run: summary agent would run here\n".to_owned(),
+            String::new(),
+        ),
+        LoopAgent::Argv(argv) => run_process_with_stdin(
+            argv,
+            &prompt,
+            options.stream_agent_output,
+            process_output_paths(artifact_root, run_id, "summary-agent")?,
+            options.agent_timeout,
+        )?,
+        LoopAgent::Agentctl => {
+            let argv = default_agentctl_argv();
+            run_process_with_stdin(
+                &argv,
+                &prompt,
+                options.stream_agent_output,
+                process_output_paths(artifact_root, run_id, "summary-agent")?,
+                options.agent_timeout,
+            )?
+        }
+    };
+    if matches!(summary_agent, LoopAgent::Agentctl) {
+        summary = enrich_agentctl_failure_output(summary);
+    }
+    let summary_path = artifact_root.join(format!("loop-run-{run_id}-summary.md"));
+    fs::write(
+        &summary_path,
+        summary.to_markdown("Post-cycle summary agent output", &argv),
+    )
+    .with_context(|| {
+        format!(
+            "failed to write post-cycle summary artifact {}",
+            summary_path.display()
+        )
+    })?;
+    add_artifact(
+        connection,
+        artifact_root,
+        run_id,
+        ArtifactKind::Report,
+        &summary_path,
+        "One-shot post-cycle summary agent output for UI/log consumption.",
+    )?;
+    append_summary_log(&options.summary_log, run_id, work_slug, &summary)?;
+    Ok((Some(summary_path), summary.exit_code))
+}
+
+fn append_summary_log(
+    path: &Path,
+    run_id: i64,
+    work_slug: &str,
+    summary: &ProcessCapture,
+) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create summary log dir {}", parent.display()))?;
+    }
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("failed to open summary log {}", path.display()))?;
+    writeln!(file, "\n## Run {run_id}: {work_slug}\n")?;
+    if summary.exit_code != Some(0) {
+        writeln!(file, "> summary agent exit: {:?}\n", summary.exit_code)?;
+    }
+    if summary.stdout.trim().is_empty() {
+        writeln!(file, "_No summary output._")?;
+    } else {
+        writeln!(file, "{}", summary.stdout.trim_end())?;
+    }
+    if !summary.stderr.trim().is_empty() {
+        writeln!(
+            file,
+            "\n<details><summary>summary stderr</summary>\n\n```text\n{}\n```\n</details>",
+            summary.stderr.trim_end()
+        )?;
+    }
+    Ok(())
 }
 

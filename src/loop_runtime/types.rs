@@ -30,6 +30,8 @@ pub struct LoopRuntimeOptions {
     pub prompt: LoopPromptSource,
     pub agent: LoopAgent,
     pub audit_argv: Option<Vec<String>>,
+    pub summary_agent: Option<LoopAgent>,
+    pub summary_log: PathBuf,
     pub project_complete_requested: bool,
     pub dry_run: bool,
     pub stream_agent_output: bool,
@@ -71,6 +73,8 @@ pub struct LoopRuntimeResult {
     pub work_slug: String,
     pub prompt_artifact_path: std::path::PathBuf,
     pub audit_artifact_path: Option<std::path::PathBuf>,
+    pub summary_artifact_path: Option<std::path::PathBuf>,
+    pub summary_exit_code: Option<i32>,
     pub agent_exit_code: Option<i32>,
     pub audit_exit_code: Option<i32>,
 }

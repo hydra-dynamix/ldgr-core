@@ -170,6 +170,8 @@ export default function ldgrContext(pi: ExtensionAPI) {
           "agentctl",
           "--stream-agent-output",
           "--until-empty",
+          "--summary-agent",
+          "agentctl",
           ...tokens,
         ];
         if (ctx.hasUI) ctx.ui.notify(`Running ${selected.slug} loop via ldgr ${loopArgs.join(" ")}`, "info");
