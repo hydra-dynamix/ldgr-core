@@ -1,5 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { execFile } from "node:child_process";
+import { existsSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
 
 const MAX_OUTPUT_CHARS = 40_000;
@@ -23,6 +25,13 @@ type Adapter = {
   profile?: {
     loop_prompt_path?: string;
   };
+};
+
+type LoopChoice = {
+  slug: string;
+  title?: string;
+  aliases?: string[];
+  promptPath: string;
 };
 
 function parseArgs(input: string): string[] {
@@ -86,28 +95,42 @@ function runLdgr(cwd: string, args: string[], timeout = 60_000): Promise<LdgrRes
   });
 }
 
-async function discoverAdapters(cwd: string): Promise<Adapter[]> {
+async function discoverLoopChoices(cwd: string): Promise<LoopChoice[]> {
+  const choices: LoopChoice[] = [];
+  const corePrompt = join(homedir(), ".ldgr", "prompts", "ldgr-core-loop.md");
+  if (existsSync(corePrompt)) {
+    choices.push({
+      slug: "core",
+      title: "LDGR core loop",
+      aliases: ["ldgr", "ldgr-core"],
+      promptPath: corePrompt,
+    });
+  }
+
   const result = await runLdgr(cwd, ["adapter", "list", "--json"]);
   if (result.code !== 0) {
     throw new Error(renderLdgrMessage(["adapter", "list", "--json"], result));
   }
   const registry = JSON.parse(result.stdout || "{}") as AdapterRegistry;
-  return (registry.adapters ?? []).filter((adapter) => Boolean(adapter.profile?.loop_prompt_path));
+  for (const adapter of registry.adapters ?? []) {
+    if (!adapter.profile?.loop_prompt_path) continue;
+    choices.push({
+      slug: adapter.slug,
+      title: adapter.title,
+      aliases: adapter.aliases,
+      promptPath: join(adapter.root_path, adapter.profile.loop_prompt_path),
+    });
+  }
+  return choices;
 }
 
-function adapterMatches(adapter: Adapter, token: string): boolean {
-  return adapter.slug === token || (adapter.aliases ?? []).includes(token);
+function loopChoiceMatches(choice: LoopChoice, token: string): boolean {
+  return choice.slug === token || (choice.aliases ?? []).includes(token);
 }
 
-function loopPromptPath(adapter: Adapter): string {
-  const prompt = adapter.profile?.loop_prompt_path;
-  if (!prompt) throw new Error(`adapter ${adapter.slug} does not declare profile.loop_prompt_path`);
-  return join(adapter.root_path, prompt);
-}
-
-function renderRunLoopMessage(adapter: Adapter, commandArgs: string[], result: LdgrResult): string {
+function renderRunLoopMessage(choice: LoopChoice, commandArgs: string[], result: LdgrResult): string {
   return renderLdgrMessage(commandArgs, result)
-    + `\n\nAdapter selected: ${adapter.slug}${adapter.title ? ` (${adapter.title})` : ""}`;
+    + `\n\nLoop selected: ${choice.slug}${choice.title ? ` (${choice.title})` : ""}`;
 }
 
 function renderLdgrMessage(args: string[], result: LdgrResult): string {
@@ -123,41 +146,41 @@ function renderLdgrMessage(args: string[], result: LdgrResult): string {
 
 export default function ldgrContext(pi: ExtensionAPI) {
   pi.registerCommand("run-loop", {
-    description: "Detect the active LDGR adapter and run its loop through agentctl.",
+    description: "Select the LDGR core or installed adapter loop and run it through agentctl.",
     handler: async (argsText, ctx) => {
       try {
         const tokens = parseArgs(argsText.trim());
-        const adapters = await discoverAdapters(ctx.cwd);
-        if (adapters.length === 0) {
-          if (ctx.hasUI) ctx.ui.notify("No installed LDGR adapters with loop prompts were discovered.", "warning");
+        const choices = await discoverLoopChoices(ctx.cwd);
+        if (choices.length === 0) {
+          if (ctx.hasUI) ctx.ui.notify("No LDGR core loop prompt or installed adapter loop prompts were discovered. Run `ldgr install` or install an adapter with a loop prompt.", "warning");
           return;
         }
 
-        let selected: Adapter | undefined;
+        let selected: LoopChoice | undefined;
         if (tokens.length > 0 && !tokens[0].startsWith("-")) {
-          const requested = adapters.find((adapter) => adapterMatches(adapter, tokens[0]));
+          const requested = choices.find((choice) => loopChoiceMatches(choice, tokens[0]));
           if (!requested) {
-            if (ctx.hasUI) ctx.ui.notify(`Unknown LDGR adapter ${tokens[0]}; known adapters: ${adapters.map((adapter) => adapter.slug).join(", ")}`, "warning");
+            if (ctx.hasUI) ctx.ui.notify(`Unknown LDGR loop ${tokens[0]}; known loops: ${choices.map((choice) => choice.slug).join(", ")}`, "warning");
             return;
           }
           selected = requested;
           tokens.shift();
         }
         if (!selected) {
-          const envAdapter = process.env.LDGR_ACTIVE_ADAPTER || process.env.LDGR_ADAPTER_SLUG;
-          if (envAdapter) selected = adapters.find((adapter) => adapterMatches(adapter, envAdapter));
+          const envLoop = process.env.LDGR_ACTIVE_LOOP || process.env.LDGR_ACTIVE_ADAPTER || process.env.LDGR_ADAPTER_SLUG;
+          if (envLoop) selected = choices.find((choice) => loopChoiceMatches(choice, envLoop));
         }
-        if (!selected && adapters.length === 1) selected = adapters[0];
+        if (!selected && choices.length === 1) selected = choices[0];
         if (!selected && ctx.hasUI) {
-          const choice = await ctx.ui.select(
-            "Select LDGR adapter loop to run:",
-            adapters.map((adapter) => `${adapter.slug}${adapter.title ? ` — ${adapter.title}` : ""}`),
+          const picked = await ctx.ui.select(
+            "Select LDGR loop to run:",
+            choices.map((choice) => `${choice.slug}${choice.title ? ` — ${choice.title}` : ""}`),
           );
-          if (!choice) return;
-          selected = adapters.find((adapter) => choice.startsWith(adapter.slug));
+          if (!picked) return;
+          selected = choices.find((choice) => picked.startsWith(choice.slug));
         }
         if (!selected) {
-          if (ctx.hasUI) ctx.ui.notify(`Multiple LDGR adapters found; pass one of: ${adapters.map((adapter) => adapter.slug).join(", ")}`, "warning");
+          if (ctx.hasUI) ctx.ui.notify(`Multiple LDGR loops found; pass one of: ${choices.map((choice) => choice.slug).join(", ")}`, "warning");
           return;
         }
 
@@ -165,7 +188,7 @@ export default function ldgrContext(pi: ExtensionAPI) {
           "loop",
           "run",
           "--prompt",
-          loopPromptPath(selected),
+          selected.promptPath,
           "--agent",
           "agentctl",
           "--stream-agent-output",

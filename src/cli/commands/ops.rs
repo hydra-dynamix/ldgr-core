@@ -29,6 +29,8 @@ use super::super::render::text::print_loop_result;
 use super::super::{CLI_DEFAULT_HELP_SECTIONS, INIT_PROJECT_SETUP_PROMPT};
 
 const LDGR_CONTEXT_EXTENSION: &str = include_str!("../../../extensions/ldgr-context.ts");
+const LDGR_CORE_LOOP_PROMPT: &str = include_str!("../../../prompts/loop-prompt.md");
+const LDGR_CORE_LOOP_PROMPT_FILE: &str = "ldgr-core-loop.md";
 const AGENTCTL_REPO: &str = "https://github.com/hydra-dynamix/agentctl";
 
 pub fn handle_init(db: &Path, artifact_root: &Path) -> anyhow::Result<()> {
@@ -71,6 +73,11 @@ pub fn handle_install(args: InstallArgs) -> anyhow::Result<()> {
     fs::create_dir_all(&ldgr_home)?;
 
     println!("◇ Installing LDGR harness files...");
+    let prompt_root = ldgr_home.join("prompts");
+    fs::create_dir_all(&prompt_root)?;
+    let core_loop_prompt = prompt_root.join(LDGR_CORE_LOOP_PROMPT_FILE);
+    fs::write(&core_loop_prompt, LDGR_CORE_LOOP_PROMPT)?;
+    println!("├─ Core loop prompt {}", core_loop_prompt.display());
     let mut installed = Vec::new();
     for harness in &harnesses {
         installed.push(install_harness(*harness, &home)?);
@@ -85,6 +92,7 @@ pub fn handle_install(args: InstallArgs) -> anyhow::Result<()> {
         "installed": installed,
         "agentctl": agentctl,
         "agentctl_config": agentctl_config,
+        "core_loop_prompt": core_loop_prompt,
         "adapter_files": {
             "default_global_path": "~/.ldgr/<adapter>",
             "note": "Adapter bundle files install globally under ~/.ldgr/<adapter>; adapter-owned skills/extensions install into the configured harness locations."

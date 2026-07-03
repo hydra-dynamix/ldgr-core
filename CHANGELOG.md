@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - Add `ldgr loop run --until-empty` to keep launching fresh single-agent loop cycles until no pending work remains or the loop blocks.
 - Add optional one-shot post-cycle summaries via `--summary-agent agentctl` / `--summary-argv`, appended to `.ldgr/logs/loop-summary.md` without making the worker agent write narrative reports.
+- Install the core loop prompt and include `core` alongside installed adapter loops such as conduct/research in the Pi `/run-loop` selector.
 - Add routine-cycle guidance to prefer compact machine-summarizable run summaries and reserve long narrative reports for promotion points.
 - Add `scripts/install.sh`, an OS/architecture-aware release installer for clean `curl | sh` installation of `ldgr`.
 - Add `ldgr observe` as an observation shorthand, including `ldgr observe <run-id-or-work-slug> --body ...`.
