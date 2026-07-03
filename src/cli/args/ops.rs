@@ -54,9 +54,35 @@ pub struct InstallAdapterArgs {
     #[arg(long)]
     pub install_root: Option<PathBuf>,
 
+    /// Pin release-backed installs to an exact adapter version instead of resolving the newest compatible version.
+    #[arg(long)]
+    pub adapter_version: Option<String>,
+
     /// Accept defaults and do not prompt.
     #[arg(long)]
     pub yes: bool,
+}
+
+#[derive(Debug, Args)]
+#[command(
+    after_help = "Examples:\n  ldgr update\n  ldgr update --dry-run\n  ldgr update --skip-core\n\nUpdate refreshes the ldgr binary and re-installs discovered adapter bundles. Commercial release adapters are only updated when the configured offline license has an update entitlement for the current license year."
+)]
+pub struct UpdateArgs {
+    /// Print planned updates without running cargo, downloads, or adapter installers.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Do not update the ldgr core binary.
+    #[arg(long)]
+    pub skip_core: bool,
+
+    /// Do not update installed adapters.
+    #[arg(long)]
+    pub skip_adapters: bool,
+
+    /// Source checkout root containing adapter crates. Optional override for local adapter source updates.
+    #[arg(long)]
+    pub source_root: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -122,7 +148,7 @@ pub struct WebArgs {
 
 #[derive(Debug, Args)]
 #[command(
-    after_help = "Examples:\n  ldgr loop run --prompt prompts/loop-prompt.md --agent agentctl\n  ldgr loop run --prompt prompts/loop-prompt.md --agent agentctl --until-empty --summary-agent agentctl\n  ldgr loop run --prompt prompts/loop-prompt.md --dry-run\n  ldgr loop run --prompt prompts/loop-prompt.md --agent-argv '[\"my-agent\"]'\n\nLoop run executes bounded cycles from pending work items. Each cycle is a fresh agent invocation that rehydrates from LDGR context. Use --until-empty to keep launching one fresh cycle at a time until no pending work remains or the loop blocks."
+    after_help = "Examples:\n  ldgr loop run --prompt prompts/loop-prompt.md --agent agentctl\n  ldgr loop run --prompt prompts/loop-prompt.md --agent agentctl --until-empty --summary-agent agentctl\n  ldgr loop run --prompt prompts/loop-prompt.md --dry-run\n  ldgr loop run --prompt prompts/loop-prompt.md --agent-argv '[\"my-agent\"]'\n\nLoop run executes bounded cycles from pending work items. Each cycle runs fresh role invocations that rehydrate from LDGR context. Use --until-empty to keep launching one fresh cycle at a time until no pending work remains or the loop blocks."
 )]
 pub struct LoopArgs {
     #[command(subcommand)]
@@ -197,7 +223,7 @@ pub struct LoopRunArgs {
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
     pub max_iterations: u32,
 
-    /// Keep launching fresh single-agent loop cycles until no pending work remains or the loop blocks.
+    /// Keep launching fresh bounded loop cycles until no pending work remains or the loop blocks.
     #[arg(long)]
     pub until_empty: bool,
 }

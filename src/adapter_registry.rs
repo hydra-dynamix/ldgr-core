@@ -6,9 +6,54 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context};
 use serde::{Deserialize, Serialize};
 
-use crate::manifest_integrity::verify_manifest_digest;
+use crate::manifest_integrity::{diagnose_manifest_digest, AdapterManifestDigestState};
 
 pub const ADAPTER_MANIFEST_FILE: &str = "adapter.toml";
+pub const LDGR_ADAPTER_PATH_ENV: &str = "LDGR_ADAPTER_PATH";
+pub const LDGR_HOME_ENV: &str = "LDGR_HOME";
+pub const HOME_ENV: &str = "HOME";
+pub const PROJECT_ADAPTER_ROOT: &str = ".ldgr";
+pub const INSTALLED_ADAPTERS_DIR: &str = "adapters";
+
+#[derive(Clone, Debug, Default)]
+pub struct AdapterDiscoveryEnvironment {
+    pub adapter_path: Option<std::ffi::OsString>,
+    pub ldgr_home: Option<std::ffi::OsString>,
+    pub home: Option<std::ffi::OsString>,
+    pub include_project_root: bool,
+}
+
+impl AdapterDiscoveryEnvironment {
+    pub fn from_process_env() -> Self {
+        Self {
+            adapter_path: env::var_os(LDGR_ADAPTER_PATH_ENV),
+            ldgr_home: env::var_os(LDGR_HOME_ENV),
+            home: env::var_os(HOME_ENV),
+            include_project_root: true,
+        }
+    }
+
+    pub fn adapter_search_roots(&self) -> Vec<PathBuf> {
+        let mut roots = Vec::new();
+        if let Some(paths) = &self.adapter_path {
+            roots.extend(env::split_paths(paths));
+        }
+        if self.include_project_root {
+            roots.push(PathBuf::from(PROJECT_ADAPTER_ROOT));
+        }
+        if let Some(home) = &self.ldgr_home {
+            let home = PathBuf::from(home);
+            roots.push(home.join(INSTALLED_ADAPTERS_DIR));
+            roots.push(home);
+        }
+        if let Some(home) = &self.home {
+            let home = PathBuf::from(home).join(PROJECT_ADAPTER_ROOT);
+            roots.push(home.join(INSTALLED_ADAPTERS_DIR));
+            roots.push(home);
+        }
+        dedup_roots(roots)
+    }
+}
 
 #[derive(Debug, Default, Serialize)]
 pub struct AdapterRegistry {
@@ -150,6 +195,22 @@ pub struct AdapterCommandNamespace {
     pub usage: Option<String>,
     pub summary: Option<String>,
     pub details: Option<String>,
+    pub help_groups: Vec<AdapterCommandHelpGroup>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdapterCommandHelpGroup {
+    pub title: String,
+    #[serde(default)]
+    pub commands: Vec<AdapterCommandHelpEntry>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdapterCommandHelpEntry {
+    pub usage: String,
+    pub summary: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -252,6 +313,8 @@ struct ManifestCommandHelp {
     usage: Option<String>,
     summary: Option<String>,
     details: Option<String>,
+    #[serde(default)]
+    groups: Vec<AdapterCommandHelpGroup>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -261,18 +324,23 @@ struct ManifestIntegrity {
 }
 
 pub fn adapter_search_roots() -> Vec<PathBuf> {
-    let mut roots = Vec::new();
-    if let Some(paths) = env::var_os("LDGR_ADAPTER_PATH") {
-        roots.extend(env::split_paths(&paths));
+    AdapterDiscoveryEnvironment::from_process_env().adapter_search_roots()
+}
+
+fn dedup_roots(roots: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut seen = BTreeSet::new();
+    let mut deduped = Vec::new();
+    for root in roots {
+        let key = root.to_string_lossy().to_string();
+        if seen.insert(key) {
+            deduped.push(root);
+        }
     }
-    roots.push(PathBuf::from(".ldgr"));
-    if let Some(home) = env::var_os("LDGR_HOME") {
-        roots.push(PathBuf::from(home));
-    }
-    if let Some(home) = env::var_os("HOME") {
-        roots.push(PathBuf::from(home).join(".ldgr"));
-    }
-    roots
+    deduped
+}
+
+pub fn adapter_manifest_paths(root: &Path, warnings: &mut Vec<AdapterWarning>) -> Vec<PathBuf> {
+    manifest_paths(root, warnings)
 }
 
 fn manifest_paths(root: &Path, warnings: &mut Vec<AdapterWarning>) -> Vec<PathBuf> {
@@ -332,12 +400,18 @@ fn load_adapter_manifest(manifest_path: &Path) -> anyhow::Result<DiscoveredAdapt
             manifest_path.display()
         )
     })?;
-    let verified_manifest_digest = verify_manifest_digest(&manifest_text).with_context(|| {
-        format!(
-            "failed to verify adapter manifest integrity {}",
-            manifest_path.display()
-        )
-    })?;
+    let integrity = diagnose_manifest_digest(&manifest_text);
+    if integrity.state == AdapterManifestDigestState::Failed {
+        bail!(
+            "failed to verify adapter manifest integrity {}: {}",
+            manifest_path.display(),
+            integrity
+                .message
+                .as_deref()
+                .unwrap_or("manifest digest verification failed")
+        );
+    }
+    let verified_manifest_digest = integrity.verified_manifest_digest;
 
     let manifest_dir = manifest_path
         .parent()
@@ -397,7 +471,8 @@ fn load_adapter_manifest(manifest_path: &Path) -> anyhow::Result<DiscoveredAdapt
             description: command.description,
             usage: help.as_ref().and_then(|help| help.usage.clone()),
             summary: help.as_ref().and_then(|help| help.summary.clone()),
-            details: help.and_then(|help| help.details),
+            details: help.as_ref().and_then(|help| help.details.clone()),
+            help_groups: help.map(|help| help.groups).unwrap_or_default(),
         });
     }
     if command_namespaces.is_empty() {
@@ -411,6 +486,7 @@ fn load_adapter_manifest(manifest_path: &Path) -> anyhow::Result<DiscoveredAdapt
             usage: Some(format!("ldgr {adapter_slug} <command> [options]")),
             summary: Some(format!("Run {adapter_slug} adapter commands.")),
             details: None,
+            help_groups: Vec::new(),
         });
     }
 
@@ -506,13 +582,40 @@ fn nonempty(field: &str, value: String) -> anyhow::Result<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
     use std::fs;
     use std::path::Path;
 
     use tempfile::TempDir;
 
-    use super::AdapterRegistry;
+    use super::{AdapterDiscoveryEnvironment, AdapterRegistry};
     use crate::manifest_integrity::canonical_manifest_digest;
+
+    #[test]
+    fn adapter_search_roots_cover_env_ldgr_home_and_default_locations() {
+        let path_separator = if cfg!(windows) { ";" } else { ":" };
+        let env_paths = ["/env/one", "/env/two"].join(path_separator);
+        let roots = AdapterDiscoveryEnvironment {
+            adapter_path: Some(OsString::from(env_paths)),
+            ldgr_home: Some(OsString::from("/ldgr-home")),
+            home: Some(OsString::from("/user-home")),
+            include_project_root: true,
+        }
+        .adapter_search_roots();
+
+        assert_eq!(
+            roots,
+            vec![
+                Path::new("/env/one").to_path_buf(),
+                Path::new("/env/two").to_path_buf(),
+                Path::new(".ldgr").to_path_buf(),
+                Path::new("/ldgr-home/adapters").to_path_buf(),
+                Path::new("/ldgr-home").to_path_buf(),
+                Path::new("/user-home/.ldgr/adapters").to_path_buf(),
+                Path::new("/user-home/.ldgr").to_path_buf(),
+            ]
+        );
+    }
 
     #[test]
     fn adapter_discovery_roots_include_valid_adapters_and_warnings() -> anyhow::Result<()> {

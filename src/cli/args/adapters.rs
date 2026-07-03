@@ -34,6 +34,10 @@ pub struct AdapterInstallArgs {
     #[arg(long)]
     pub install_root: Option<std::path::PathBuf>,
 
+    /// Pin release-backed installs to an exact adapter version instead of resolving the newest compatible version.
+    #[arg(long)]
+    pub adapter_version: Option<String>,
+
     /// Accept defaults and do not prompt.
     #[arg(long)]
     pub yes: bool,

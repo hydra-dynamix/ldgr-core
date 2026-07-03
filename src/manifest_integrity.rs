@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use anyhow::{bail, Context};
+use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Number as JsonNumber, Value as JsonValue};
 use sha2::{Digest, Sha256};
 use toml::Value as TomlValue;
@@ -27,6 +28,75 @@ pub fn verify_manifest_digest(manifest_text: &str) -> anyhow::Result<Option<Stri
         bail!("adapter manifest digest mismatch: expected {expected}, calculated {calculated}");
     }
     Ok(Some(calculated))
+}
+
+/// Public digest verification state for adapter manifest diagnostics.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdapterManifestDigestState {
+    /// The manifest has no public `integrity.manifest_digest` metadata.
+    Absent,
+    /// The declared digest matches the canonical public manifest content.
+    Passed,
+    /// The declared digest is invalid or does not match the manifest content.
+    Failed,
+}
+
+/// Public manifest integrity diagnostic suitable for discovery/apply warnings.
+///
+/// This intentionally reports only public manifest digest state. Licensing,
+/// entitlement, signature policy, and commercial trust decisions are outside
+/// this diagnostic surface.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct AdapterManifestIntegrityReport {
+    /// Stable digest verification state.
+    pub state: AdapterManifestDigestState,
+    /// Canonical digest when verification passed.
+    pub verified_manifest_digest: Option<String>,
+    /// Human-readable warning detail when verification failed.
+    pub message: Option<String>,
+}
+
+impl AdapterManifestIntegrityReport {
+    pub fn absent() -> Self {
+        Self {
+            state: AdapterManifestDigestState::Absent,
+            verified_manifest_digest: None,
+            message: None,
+        }
+    }
+
+    pub fn passed(verified_manifest_digest: String) -> Self {
+        Self {
+            state: AdapterManifestDigestState::Passed,
+            verified_manifest_digest: Some(verified_manifest_digest),
+            message: None,
+        }
+    }
+
+    pub fn failed(message: String) -> Self {
+        Self {
+            state: AdapterManifestDigestState::Failed,
+            verified_manifest_digest: None,
+            message: Some(message),
+        }
+    }
+
+    pub fn is_failed(&self) -> bool {
+        self.state == AdapterManifestDigestState::Failed
+    }
+}
+
+/// Verify manifest digest metadata without turning digest failures into errors.
+///
+/// Use this when callers need to preserve parse/load results while surfacing a
+/// public warning for absent, passed, or failed manifest digest states.
+pub fn diagnose_manifest_digest(manifest_text: &str) -> AdapterManifestIntegrityReport {
+    match verify_manifest_digest(manifest_text) {
+        Ok(Some(digest)) => AdapterManifestIntegrityReport::passed(digest),
+        Ok(None) => AdapterManifestIntegrityReport::absent(),
+        Err(error) => AdapterManifestIntegrityReport::failed(format!("{error:#}")),
+    }
 }
 
 fn canonical_manifest_value(manifest_text: &str) -> anyhow::Result<JsonValue> {

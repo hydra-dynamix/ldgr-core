@@ -1,6 +1,8 @@
 use std::fs;
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command as StdCommand, Stdio};
 use std::thread;
@@ -74,6 +76,149 @@ fn adapter_install_without_name_shows_selection_fallback_not_help() -> anyhow::R
                 "Run `ldgr adapter install <adapter>`",
             ))
             .and(predicate::str::contains("Usage: ldgr adapter install").not()),
+    );
+    Ok(())
+}
+
+#[test]
+fn adapter_install_list_names_commercial_release_catalog_source() -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    let mut command = isolated_command(project.path())?;
+    command.args(["adapter", "install", "list"]);
+    command.assert().success().stdout(
+        predicate::str::contains("Open-source/source adapters:")
+            .and(predicate::str::contains("Commercial binary adapters:"))
+            .and(predicate::str::contains(
+                "code — Coding adapter [commercial binary: https://github.com/hydra-dynamix/ldgr-releases]",
+            ))
+            .and(predicate::str::contains(
+                "bench — Bench adapter [commercial binary: https://github.com/hydra-dynamix/ldgr-releases]",
+            ))
+            .and(predicate::str::contains(
+                "commercial binary source: ldgr-releases (https://github.com/hydra-dynamix/ldgr-releases)",
+            ))
+            .and(predicate::str::contains(
+                "commercial lookup contract: repo hydra-dynamix/ldgr-releases, newest compatible release metadata for adapter_version_family 2026 and ldgr_core_api", 
+            ))
+            .and(predicate::str::contains(
+                "research — Research adapter [open-source git: https://github.com/hydra-dynamix/ldgr-research]",
+            ))
+            .and(predicate::str::contains(
+                "example — Public example adapter [open-source git: https://github.com/hydra-dynamix/ldgr-example-adapter]",
+            ))
+            .and(predicate::str::contains(
+                "programbench — Clean-room ProgramBench adapter [open-source git: https://github.com/hydra-dynamix/ldgr-programbench]",
+            )),
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn adapter_install_open_source_git_uses_cargo_install_and_patches_argv() -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    let fake_bin = project.path().join("fake-bin");
+    fs::create_dir_all(&fake_bin)?;
+    let cargo_log = project.path().join("cargo.log");
+    let fake_cargo = fake_bin.join("cargo");
+    fs::write(
+        &fake_cargo,
+        format!(
+            r#"#!/bin/sh
+printf '%s\n' "$*" > {cargo_log}
+root=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--root" ]; then shift; root="$1"; fi
+  shift || true
+done
+mkdir -p "$root/bin"
+cat > "$root/bin/ldgr-example-adapter" <<'BIN'
+#!/bin/sh
+install_root=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--install-root" ]; then shift; install_root="$1"; fi
+  shift || true
+done
+mkdir -p "$install_root"
+cat > "$install_root/adapter.toml" <<'TOML'
+[adapter]
+slug = "example"
+title = "Example adapter"
+core_version = "0.1"
+
+[[commands]]
+namespace = "example"
+argv = ["ldgr-example-adapter"]
+
+[commands.help]
+usage = "ldgr example <command>"
+summary = "Run example adapter commands."
+TOML
+BIN
+chmod +x "$root/bin/ldgr-example-adapter"
+"#,
+            cargo_log = cargo_log.display()
+        ),
+    )?;
+    let mut permissions = fs::metadata(&fake_cargo)?.permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake_cargo, permissions)?;
+
+    let path = format!(
+        "{}:{}",
+        fake_bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let mut command = isolated_command(project.path())?;
+    command
+        .env("PATH", path)
+        .args(["adapter", "install", "example", "--yes"]);
+    command.assert().success().stdout(predicate::str::contains(
+        "Git source https://github.com/hydra-dynamix/ldgr-example-adapter",
+    ));
+
+    let home = project.path().join(".ldgr/test-empty-home");
+    let cargo_args = fs::read_to_string(&cargo_log)?;
+    assert!(cargo_args.contains("install --git https://github.com/hydra-dynamix/ldgr-example-adapter --locked --force --root"));
+    assert!(cargo_args.contains("ldgr-example-adapter"));
+    let manifest = fs::read_to_string(home.join(".ldgr/example/adapter.toml"))?;
+    assert!(manifest.contains(".local/bin/ldgr-example-adapter"));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn adapter_install_programbench_git_failure_is_clear_not_yet_released_message() -> anyhow::Result<()>
+{
+    let project = TempDir::new()?;
+    let fake_bin = project.path().join("fake-bin");
+    fs::create_dir_all(&fake_bin)?;
+    let fake_cargo = fake_bin.join("cargo");
+    fs::write(
+        &fake_cargo,
+        "#!/bin/sh\nprintf 'no Cargo.toml in repository\n' >&2\nexit 101\n",
+    )?;
+    let mut permissions = fs::metadata(&fake_cargo)?.permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake_cargo, permissions)?;
+
+    let path = format!(
+        "{}:{}",
+        fake_bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let mut command = isolated_command(project.path())?;
+    command
+        .env("PATH", path)
+        .args(["adapter", "install", "programbench", "--yes"]);
+    command.assert().failure().stderr(
+        predicate::str::contains("adapter `programbench` is listed as an open-source git adapter")
+            .and(predicate::str::contains(
+                "not yet released as an installable Cargo package",
+            ))
+            .and(predicate::str::contains(
+                "https://github.com/hydra-dynamix/ldgr-programbench",
+            )),
     );
     Ok(())
 }
@@ -213,6 +358,63 @@ fn adapter_list_show_and_dispatch_use_core_registry_metadata() -> anyhow::Result
         "Inspect it with `ldgr adapter dispatch community-sample-check`.",
     ));
 
+    Ok(())
+}
+
+#[test]
+fn adapter_namespace_help_uses_manifest_metadata_without_executing_adapter() -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    let db_path = project.path().join(".ldgr/ldgr.db");
+    let artifact_root = project.path().join(".ldgr/artifacts");
+    let adapter_root = project.path().join("adapters");
+    let marker = project.path().join("adapter-ran.txt");
+    write_adapter_namespace_fixture(
+        &adapter_root.join("conduct"),
+        "conduct",
+        "conduct",
+        &format!(r#"["sh", "-c", "touch {}"]"#, marker.display()),
+    )?;
+
+    command(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        ["conduct", "--help"],
+    )?
+    .env("LDGR_ADAPTER_PATH", &adapter_root)
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("Usage: ldgr conduct <args...>"))
+    .stdout(predicate::str::contains("Batch supervision:"))
+    .stdout(predicate::str::contains(
+        "ldgr conduct batch refresh --batch-id <batch-id>",
+    ))
+    .stdout(predicate::str::contains(
+        "ldgr conduct batch status --batch-id <batch-id> --json",
+    ))
+    .stdout(predicate::str::contains(
+        "without executing adapter policy code",
+    ));
+
+    command(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        ["adapter", "show", "conduct"],
+    )?
+    .env("LDGR_ADAPTER_PATH", &adapter_root)
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("usage: ldgr conduct <args...>"))
+    .stdout(predicate::str::contains("Batch supervision:"))
+    .stdout(predicate::str::contains(
+        "ldgr conduct batch refresh --batch-id <batch-id>",
+    ));
+
+    assert!(
+        !marker.exists(),
+        "help surfaces must not execute adapter argv"
+    );
     Ok(())
 }
 
@@ -448,6 +650,8 @@ fn status_surfaces_referenced_conduct_batch_lifecycle() -> anyhow::Result<()> {
     let project = TempDir::new()?;
     let db_path = project.path().join(".ldgr/ldgr.db");
     let artifact_root = project.path().join(".ldgr/artifacts");
+    let adapter_root = project.path().join("adapters");
+    write_conduct_status_adapter_fixture(&adapter_root.join("conduct"))?;
 
     run(project.path(), &db_path, &artifact_root, ["init"])?;
     run(
@@ -461,7 +665,7 @@ fn status_surfaces_referenced_conduct_batch_lifecycle() -> anyhow::Result<()> {
             "--title",
             "Setup",
             "--description",
-            "Record conduct fixture artifacts.",
+            "Record setup evidence.",
         ],
     )?;
     run(
@@ -485,63 +689,8 @@ fn status_surfaces_referenced_conduct_batch_lifecycle() -> anyhow::Result<()> {
         ],
     )?;
 
-    let state_path = project.path().join("batch-state.md");
-    fs::write(
-        &state_path,
-        r#"---
-ldgr_doc: 1
-kind: batch_state
-id: batch-042
-schema: ldgr.batch_state.v1
-status: accepted
----
-
-# Batch State: batch-042
-
-```ldgr-batch-state yaml
-batch_id: batch-042
-graph_artifact_id: artifact:41
-ticket_index_artifact_id: artifact:42
-status: wave_complete
-current_wave: wave-001
-waves:
-  - wave_id: wave-001
-    node_ids:
-      - ticket.alpha
-    worker_ids:
-      - worker-001
-    status: wave_complete
-workers:
-  - worker_id: worker-001
-    ticket_id: ticket.alpha
-    work_item_id: work:alpha
-    worktree_path: path:.ldgr/.conduct/worktrees/batch-042/worker-001-alpha
-    worker_db_path: db:.ldgr/.conduct/workers/batch-042/worker-001/ldgr.db
-    status: complete
-blocked:
-  - ticket_id: ticket.beta
-    reason: waiting for dependencies ticket.alpha
-```
-"#,
-    )?;
-    run(
-        project.path(),
-        &db_path,
-        &artifact_root,
-        [
-            "artifact",
-            "add",
-            "1",
-            "--kind",
-            "report",
-            "--path",
-            state_path.to_str().expect("artifact path is UTF-8"),
-            "--description",
-            "LDGR batch_state artifact batch_id=batch-042.",
-        ],
-    )?;
-
     command(project.path(), &db_path, &artifact_root, ["status"])?
+        .env("LDGR_ADAPTER_PATH", &adapter_root)
         .assert()
         .success()
         .stdout(predicate::str::contains(
@@ -551,7 +700,7 @@ blocked:
             "workers=total:1 complete:1 active:0 blocked:0 terminal:1",
         ))
         .stdout(predicate::str::contains(
-            "conduct_artifacts: graph=41 ticket_index=42 batch_state=1",
+            "conduct_artifacts: graph=41 ticket_index=42 batch_state=9",
         ))
         .stdout(predicate::str::contains(
             "next_valid_action=ldgr conduct batch launch --batch-id batch-042 --graph <graph.md>",
@@ -575,6 +724,7 @@ blocked:
         &artifact_root,
         ["context", "--json"],
     )?
+    .env("LDGR_ADAPTER_PATH", &adapter_root)
     .assert()
     .success()
     .stdout(predicate::str::contains(r#""conduct_lifecycle""#))
@@ -618,6 +768,10 @@ fn init_prints_setup_prompt_and_command_workflow() -> anyhow::Result<()> {
         .stdout(predicate::str::contains(
             "one work item, one run, observations/artifacts from that run",
         ))
+        .stdout(predicate::str::contains(
+            ".ldgr/prompts/ldgr-loop-invariants.md",
+        ))
+        .stdout(predicate::str::contains("user-editable invariants prompt"))
         .stdout(predicate::str::contains("Keep setup core-only"))
         .stdout(predicate::str::contains(
             "Do not introduce adapter or research-layer records during core setup",
@@ -1793,6 +1947,113 @@ fn artifacts_can_be_recorded_outside_artifact_root() -> anyhow::Result<()> {
 }
 
 #[test]
+fn init_seeds_editable_generic_loop_role_prompts() -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    let db_path = project.path().join(".ldgr/ldgr.db");
+    let artifact_root = project.path().join(".ldgr/artifacts");
+
+    run(project.path(), &db_path, &artifact_root, ["init"])?;
+
+    let prompt_root = project.path().join(".ldgr/prompts");
+    assert!(prompt_root.join("ldgr-core-loop.md").is_file());
+    assert!(prompt_root.join("ldgr-loop-invariants.md").is_file());
+    assert!(prompt_root.join("ldgr-loop-planner.md").is_file());
+    assert!(prompt_root.join("ldgr-loop-worker.md").is_file());
+    assert!(prompt_root.join("ldgr-loop-scryb.md").is_file());
+    assert!(prompt_root.join("ldgr-loop-validator.md").is_file());
+    let invariants_prompt = fs::read_to_string(prompt_root.join("ldgr-loop-invariants.md"))?;
+    assert!(invariants_prompt.contains("durable guidance for ephemeral agents"));
+    assert!(invariants_prompt.contains("proportionate validator rigor"));
+    let validator_prompt = fs::read_to_string(prompt_root.join("ldgr-loop-validator.md"))?;
+    assert!(validator_prompt.contains("fresh, ephemeral agent"));
+    assert!(validator_prompt.contains("ldgr-validator-revision json"));
+    assert!(validator_prompt.contains("proportionate, risk-based acceptance"));
+
+    fs::write(prompt_root.join("ldgr-loop-worker.md"), "custom worker")?;
+    fs::write(
+        prompt_root.join("ldgr-loop-invariants.md"),
+        "custom invariants",
+    )?;
+    run(project.path(), &db_path, &artifact_root, ["init"])?;
+    assert_eq!(
+        fs::read_to_string(prompt_root.join("ldgr-loop-worker.md"))?,
+        "custom worker"
+    );
+    assert_eq!(
+        fs::read_to_string(prompt_root.join("ldgr-loop-invariants.md"))?,
+        "custom invariants"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn status_and_context_expose_active_loop_invariants() -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    let db_path = project.path().join(".ldgr/ldgr.db");
+    let artifact_root = project.path().join(".ldgr/artifacts");
+
+    run(project.path(), &db_path, &artifact_root, ["init"])?;
+    fs::write(
+        project.path().join(".ldgr/prompts/ldgr-loop-invariants.md"),
+        "custom status context invariants",
+    )?;
+
+    command(project.path(), &db_path, &artifact_root, ["status"])?
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("loop_invariants: status=active"))
+        .stdout(predicate::str::contains("ldgr-loop-invariants.md"))
+        .stdout(predicate::str::contains("custom status context invariants").not());
+
+    command(project.path(), &db_path, &artifact_root, ["context"])?
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("loop_invariants: status=active"))
+        .stdout(predicate::str::contains("loop_invariants_body:"))
+        .stdout(predicate::str::contains("custom status context invariants"));
+
+    command(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        ["status", "--json"],
+    )?
+    .assert()
+    .success()
+    .stdout(predicate::str::contains(r#""loop_invariants""#))
+    .stdout(predicate::str::contains(r#""status": "active""#))
+    .stdout(predicate::str::contains("custom status context invariants"));
+
+    Ok(())
+}
+
+#[test]
+fn context_reports_clear_loop_invariants_fallback_when_prompt_missing() -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    let db_path = project.path().join(".ldgr/ldgr.db");
+    let artifact_root = project.path().join(".ldgr/artifacts");
+
+    run(project.path(), &db_path, &artifact_root, ["init"])?;
+    fs::remove_file(project.path().join(".ldgr/prompts/ldgr-loop-invariants.md"))?;
+
+    command(project.path(), &db_path, &artifact_root, ["context"])?
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "loop_invariants: status=missing path=none",
+        ))
+        .stdout(predicate::str::contains(
+            "No active loop invariants prompt found",
+        ))
+        .stdout(predicate::str::contains(
+            "reseed prompts with `ldgr init` or `ldgr install`",
+        ));
+
+    Ok(())
+}
+
+#[test]
 fn prompt_and_bundle_commands_match_documented_loop_surface() -> anyhow::Result<()> {
     let project = TempDir::new()?;
     let db_path = project.path().join(".ldgr/ldgr.db");
@@ -2269,6 +2530,88 @@ fn autonomous_loop_runtime_allows_agent_to_finish_run_before_parent_capture() ->
         ))
         .stdout(predicate::str::contains("loop-run-1-agent-output.md"))
         .stdout(predicate::str::contains("phase=failed").not());
+
+    Ok(())
+}
+
+#[test]
+fn autonomous_loop_runtime_rejects_non_planner_stop_decision() -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    let db_path = project.path().join(".ldgr/ldgr.db");
+    let artifact_root = project.path().join(".ldgr/artifacts");
+    let prompt_root = project.path().join("prompts");
+    fs::create_dir_all(&prompt_root)?;
+    let prompt_path = prompt_root.join("ldgr-core-loop.md");
+    fs::write(&prompt_path, "BASE {{ldgr_context}}")?;
+    for role in ["planner", "worker", "scryb", "validator"] {
+        fs::write(
+            prompt_root.join(format!("ldgr-loop-{role}.md")),
+            format!("ROLE: {role}\n{{{{ldgr_context}}}}"),
+        )?;
+    }
+    let agent_path = project.path().join("agent-nonplanner-stop.sh");
+    fs::write(
+        &agent_path,
+        "#!/bin/sh\ncat >/dev/null\nif [ \"$LDGR_LOOP_ROLE\" = worker ]; then\n  LDGR_BIN=\"$1\"\n  DB=\"$2\"\n  ARTIFACTS=\"$3\"\n  \"$LDGR_BIN\" --db \"$DB\" --artifact-root \"$ARTIFACTS\" run close 1 --status success --outcome stop --rationale 'worker recommends stopping'\n  exit $?\nfi\nprintf 'role=%s\\n' \"$LDGR_LOOP_ROLE\"\n",
+    )?;
+    let ldgr_bin = assert_cmd::cargo::cargo_bin("ldgr");
+    let agent_argv = serde_json::to_string(&vec![
+        "sh".to_string(),
+        agent_path.to_str().unwrap().to_string(),
+        ldgr_bin.to_str().unwrap().to_string(),
+        db_path.to_str().unwrap().to_string(),
+        artifact_root.to_str().unwrap().to_string(),
+    ])?;
+
+    run(project.path(), &db_path, &artifact_root, ["init"])?;
+    run(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        [
+            "work",
+            "create",
+            "nonplanner-stop-loop",
+            "--title",
+            "Nonplanner stop loop",
+            "--description",
+            "Worker must not be able to stop the broader loop.",
+        ],
+    )?;
+
+    command(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        [
+            "loop",
+            "run",
+            "--prompt",
+            prompt_path.to_str().expect("prompt path is UTF-8"),
+            "--agent-argv",
+            &agent_argv,
+        ],
+    )?
+    .assert()
+    .success()
+    .stdout(predicate::str::contains(
+        "loop run=1 work=nonplanner-stop-loop",
+    ))
+    .stdout(predicate::str::contains("agent_exit_code: 1"));
+
+    let worker_output =
+        fs::read_to_string(artifact_root.join("loop-run-1-worker-agent-output.md"))?;
+    assert!(
+        worker_output.contains("loop stop decisions require planner authority"),
+        "{worker_output}"
+    );
+    command(project.path(), &db_path, &artifact_root, ["context"])?
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("latest_decision: none"))
+        .stdout(predicate::str::contains(
+            "loop_state: phase=needs_decision run=1 work=nonplanner-stop-loop status=failed",
+        ));
 
     Ok(())
 }
@@ -3805,6 +4148,44 @@ description = "Run a check."
     Ok(())
 }
 
+fn write_conduct_status_adapter_fixture(dir: &Path) -> anyhow::Result<()> {
+    fs::create_dir_all(dir)?;
+    let script = dir.join("conduct-status-fixture.sh");
+    fs::write(
+        &script,
+        r#"#!/bin/sh
+if [ "$1" != "batch" ] || [ "$2" != "status" ]; then
+  echo "unexpected conduct fixture command: $*" >&2
+  exit 64
+fi
+cat <<'JSON'
+{
+  "artifact_id": 9,
+  "state": {
+    "batch_id": "batch-042",
+    "graph_artifact_id": 41,
+    "ticket_index_artifact_id": 42,
+    "status": "wave_complete",
+    "current_wave": "wave-001",
+    "waves": [{"wave_id":"wave-001","node_ids":["ticket.alpha"],"worker_ids":["worker-001"],"status":"wave_complete"}],
+    "workers": [{"worker_id":"worker-001","ticket_id":"ticket.alpha","work_item_id":"work:alpha","worktree_path":"adapter-owned-worktree","worker_db_path":"adapter-owned-worker-db","worker_artifact_root":"adapter-owned-artifacts","status":"complete","summary":null}],
+    "blocked": [{"ticket_id":"ticket.beta","reason":"waiting for dependencies ticket.alpha"}]
+  },
+  "worker_status": {"total":1,"terminal":1,"active":0,"complete":1,"blocked":0,"all_terminal":true,"all_complete":true,"status":"complete","counts":{"complete":1}}
+}
+JSON
+"#,
+    )?;
+    #[cfg(unix)]
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755))?;
+    write_adapter_namespace_fixture(
+        dir,
+        "conduct",
+        "conduct",
+        &format!("[\"{}\"]", script.display()),
+    )
+}
+
 fn write_adapter_namespace_fixture(
     dir: &Path,
     slug: &str,
@@ -3838,6 +4219,13 @@ argv = {argv}
 [commands.help]
 usage = "ldgr {namespace} <args...>"
 summary = "Run {namespace} adapter commands."
+
+[[commands.help.groups]]
+title = "Batch supervision"
+commands = [
+  {{ usage = "ldgr {namespace} batch refresh --batch-id <batch-id>", summary = "Refresh terminal worker state." }},
+  {{ usage = "ldgr {namespace} batch status --batch-id <batch-id> --json", summary = "Inspect batch state as JSON." }},
+]
 "#
         ),
     )?;

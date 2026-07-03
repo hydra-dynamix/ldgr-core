@@ -18,6 +18,7 @@ pub(crate) struct BriefContextOptions {
 pub(crate) struct BriefContext {
     pub work_items: BriefWorkCounts,
     pub next: Option<BriefNextWork>,
+    pub loop_invariants: BriefLoopInvariants,
     pub loop_state: BriefLoopState,
     pub active_runs: Vec<BriefActiveRun>,
     pub latest_decision: Option<BriefDecision>,
@@ -45,6 +46,14 @@ pub(crate) struct BriefNextWork {
     pub slug: String,
     pub title: String,
     pub description: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct BriefLoopInvariants {
+    pub status: String,
+    pub path: Option<String>,
+    pub body: String,
+    pub note: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -123,6 +132,16 @@ pub(crate) fn brief_context(context: &StoreContext, options: BriefContextOptions
                 title: compact_text(&work_item.title, TITLE_WIDTH),
                 description: compact_text(&work_item.description, options.width),
             }),
+        loop_invariants: BriefLoopInvariants {
+            status: context.loop_invariants.status.clone(),
+            path: context
+                .loop_invariants
+                .path
+                .as_ref()
+                .map(|path| path.display().to_string()),
+            body: context.loop_invariants.body.clone(),
+            note: compact_text(&context.loop_invariants.note, options.width),
+        },
         loop_state: BriefLoopState {
             phase: context.loop_state.current_phase.clone(),
             run: display_optional_id(context.loop_state.run_id),
@@ -215,6 +234,12 @@ pub(crate) fn print_brief_context(context: &BriefContext) {
         }
         None => println!("next: none"),
     }
+    println!(
+        "loop_invariants: status={} path={} note={}",
+        context.loop_invariants.status,
+        context.loop_invariants.path.as_deref().unwrap_or("none"),
+        context.loop_invariants.note
+    );
     println!(
         "loop: phase={} run={} work={} status={}",
         context.loop_state.phase,

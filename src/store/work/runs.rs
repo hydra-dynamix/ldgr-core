@@ -154,6 +154,7 @@ pub fn close_run(
     if status == RunStatus::Running {
         bail!("run close requires a terminal status");
     }
+    enforce_loop_stop_authority(outcome)?;
     in_write_transaction(connection, |connection| {
         let run = get_run_by_id(connection, run_id)?;
         if run.status != RunStatus::Running {
@@ -182,6 +183,22 @@ pub fn close_run(
             work_item,
         })
     })
+}
+
+fn enforce_loop_stop_authority(outcome: DecisionOutcome) -> anyhow::Result<()> {
+    if outcome != DecisionOutcome::Stop {
+        return Ok(());
+    }
+    if std::env::var("LDGR_LOOP_STOP_AUTHORITY").ok().as_deref() != Some("planner") {
+        return Ok(());
+    }
+    let role = std::env::var("LDGR_LOOP_ROLE").unwrap_or_else(|_| "unknown".to_owned());
+    if role == "planner" {
+        return Ok(());
+    }
+    bail!(
+        "loop stop decisions require planner authority; role {role} may record recommendations but cannot close with outcome stop"
+    )
 }
 
 pub fn restore_work_item_pending_after_dry_run(

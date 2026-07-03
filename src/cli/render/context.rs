@@ -22,6 +22,22 @@ pub(crate) fn print_context(context: &StoreContext) {
     }
 
     println!(
+        "loop_invariants: status={} path={} note={}",
+        context.loop_invariants.status,
+        context
+            .loop_invariants
+            .path
+            .as_deref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "none".to_owned()),
+        context.loop_invariants.note
+    );
+    if !context.loop_invariants.body.is_empty() {
+        println!("loop_invariants_body:");
+        println!("{}", context.loop_invariants.body.trim_end());
+    }
+
+    println!(
         "loop_state: phase={} run={} work={} status={}",
         context.loop_state.current_phase,
         display_optional_id(context.loop_state.run_id),

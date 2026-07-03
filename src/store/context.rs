@@ -30,6 +30,7 @@ fn base_context(connection: &Connection) -> anyhow::Result<StoreContext> {
         held_work_items: count_work_items_by_status(connection, WorkItemStatus::Held)?,
         done_work_items: count_work_items_by_status(connection, WorkItemStatus::Done)?,
         canceled_work_items: count_work_items_by_status(connection, WorkItemStatus::Canceled)?,
+        loop_invariants: crate::loop_invariants::resolve_loop_invariants(),
         loop_state: read_loop_state(connection)?,
         active_runs: list_active_runs(connection, CONTEXT_ACTIVE_RUN_LIMIT)?,
         next_work_item: next_pending_work_item(connection)?,
@@ -61,18 +62,12 @@ fn conduct_lifecycle_summary(
     if batch_id.is_none() && !context_mentions_conduct(context) {
         return Ok(None);
     }
-    for artifact in list_artifacts(connection, None, 10_000)? {
-        let path = artifact_root.join(&artifact.path);
-        let Ok(text) = fs::read_to_string(&path) else {
-            continue;
-        };
-        let Some(summary) = parse_conduct_batch_state(&text, artifact.artifact_id) else {
-            continue;
-        };
-        if batch_id
-            .as_deref()
-            .is_none_or(|expected| expected == summary.batch_id)
-        {
+    if let Ok(Some(status_json)) = crate::conduct_status::read_conduct_batch_status_json(
+        Path::new(connection.path().unwrap_or(".ldgr/ldgr.db")),
+        artifact_root,
+        batch_id.as_deref(),
+    ) {
+        if let Some(summary) = parse_conduct_status_json(&status_json) {
             return Ok(Some(summary));
         }
     }
@@ -96,66 +91,38 @@ fn conduct_lifecycle_summary(
     }))
 }
 
-fn parse_conduct_batch_state(
-    text: &str,
-    batch_state_artifact_id: i64,
-) -> Option<ConductLifecycleSummary> {
-    if !text.contains("kind: batch_state") || !text.contains("status: accepted") {
-        return None;
-    }
-    let mut batch_id = None;
-    let mut status = None;
-    let mut graph_artifact_id = None;
-    let mut ticket_index_artifact_id = None;
-    let mut current_wave = None;
-    let mut worker_statuses = Vec::new();
-    let mut blocked_count = 0usize;
-    let mut section = "";
-    let mut in_state_block = false;
-    for line in text.lines() {
-        if line.trim_start().starts_with("```ldgr-batch-state") {
-            in_state_block = true;
-            continue;
-        }
-        if in_state_block && line.trim_start().starts_with("```") {
-            break;
-        }
-        if !in_state_block {
-            continue;
-        }
-        let trimmed = line.trim();
-        match trimmed {
-            "workers:" => section = "workers",
-            "blocked:" => section = "blocked",
-            "waves:" => section = "waves",
-            _ => {}
-        }
-        if let Some(value) = trimmed.strip_prefix("batch_id: ") {
-            batch_id = Some(unquote_yaml_scalar(value));
-        } else if let Some(value) = trimmed.strip_prefix("graph_artifact_id: artifact:") {
-            graph_artifact_id = value.parse::<i64>().ok();
-        } else if let Some(value) = trimmed.strip_prefix("ticket_index_artifact_id: artifact:") {
-            ticket_index_artifact_id = value.parse::<i64>().ok();
-        } else if let Some(value) = trimmed.strip_prefix("current_wave: ") {
-            let value = unquote_yaml_scalar(value);
-            if value != "null" {
-                current_wave = Some(value);
-            }
-        } else if section != "workers" {
-            if let Some(value) = trimmed.strip_prefix("status: ") {
-                status.get_or_insert_with(|| unquote_yaml_scalar(value));
-            }
-        }
-        if section == "workers" && line.starts_with("    status: ") {
-            worker_statuses.push(unquote_yaml_scalar(line.trim_start_matches("    status: ")));
-        }
-        if section == "blocked" && trimmed.starts_with("- ticket_id: ") {
-            blocked_count += 1;
-        }
-    }
-    let batch_id = batch_id?;
-    let status = status.unwrap_or_else(|| "unknown".to_owned());
-    let worker_counts = conduct_worker_counts(&worker_statuses);
+fn parse_conduct_status_json(value: &serde_json::Value) -> Option<ConductLifecycleSummary> {
+    let state = value.get("state")?;
+    let batch_id = json_string(state.get("batch_id"))?;
+    let status = json_string(state.get("status")).unwrap_or_else(|| "unknown".to_owned());
+    let graph_artifact_id = json_i64(state.get("graph_artifact_id"));
+    let ticket_index_artifact_id = json_i64(state.get("ticket_index_artifact_id"));
+    let batch_state_artifact_id = json_i64(value.get("artifact_id"));
+    let current_wave = json_string(state.get("current_wave"));
+    let blocked_count = state
+        .get("blocked")
+        .and_then(|blocked| blocked.as_array())
+        .map(Vec::len)
+        .unwrap_or_default();
+    let worker_counts = value
+        .get("worker_status")
+        .and_then(parse_worker_status_overview)
+        .or_else(|| {
+            let statuses = state
+                .get("workers")?
+                .as_array()?
+                .iter()
+                .filter_map(|worker| json_string(worker.get("status")))
+                .collect::<Vec<_>>();
+            Some(conduct_worker_counts(&statuses))
+        })
+        .unwrap_or(ConductWorkerCounts {
+            total: 0,
+            complete: 0,
+            active: 0,
+            blocked: 0,
+            terminal: 0,
+        });
     let next_valid_action =
         conduct_next_valid_action(&batch_id, &status, &worker_counts, blocked_count);
     Some(ConductLifecycleSummary {
@@ -164,12 +131,36 @@ fn parse_conduct_batch_state(
         worker_counts,
         graph_artifact_id,
         ticket_index_artifact_id,
-        batch_state_artifact_id: Some(batch_state_artifact_id),
+        batch_state_artifact_id,
         current_wave,
         blocked_count,
         next_valid_action,
         stale_next_work: None,
     })
+}
+
+fn parse_worker_status_overview(value: &serde_json::Value) -> Option<ConductWorkerCounts> {
+    Some(ConductWorkerCounts {
+        total: json_usize(value.get("total"))?,
+        complete: json_usize(value.get("complete"))?,
+        active: json_usize(value.get("active"))?,
+        blocked: json_usize(value.get("blocked"))?,
+        terminal: json_usize(value.get("terminal"))?,
+    })
+}
+
+fn json_string(value: Option<&serde_json::Value>) -> Option<String> {
+    value?.as_str().map(str::to_owned)
+}
+
+fn json_i64(value: Option<&serde_json::Value>) -> Option<i64> {
+    value?.as_i64()
+}
+
+fn json_usize(value: Option<&serde_json::Value>) -> Option<usize> {
+    value?
+        .as_u64()
+        .and_then(|value| usize::try_from(value).ok())
 }
 
 fn attach_stale_conduct_next_work_warning(context: &mut StoreContext) {
@@ -221,7 +212,7 @@ fn attach_stale_conduct_next_work_warning(context: &mut StoreContext) {
     summary.stale_next_work = Some(ConductStaleNextWorkWarning {
         work_slug: work_item.slug.clone(),
         message: format!(
-            "next work {} references conduct batch {} but latest batch_state artifact {} reports status {}",
+            "next work {} references conduct batch {} but adapter status artifact {} reports status {}",
             work_item.slug,
             summary.batch_id,
             summary.batch_state_artifact_id.unwrap_or_default(),
@@ -354,10 +345,6 @@ fn extract_conduct_batch_id(text: &str) -> Option<String> {
         }
     }
     None
-}
-
-fn unquote_yaml_scalar(value: &str) -> String {
-    value.trim().trim_matches('"').trim_matches('\'').to_owned()
 }
 
 pub fn request_loop_intervention(

@@ -2,12 +2,15 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context};
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use dialoguer::{theme::ColorfulTheme, Confirm, MultiSelect};
+use sha2::{Digest, Sha256};
 
 use crate::adapter_registry::AdapterRegistry;
+use crate::loop_invariants::{LOOP_INVARIANTS_PROMPT, LOOP_INVARIANTS_PROMPT_FILE};
 use crate::loop_runtime::{
     run_loop_once, LoopAgent, LoopPromptSource, LoopRuntimeOptions, LoopRuntimeOutcome,
     LoopRuntimeResult,
@@ -15,10 +18,11 @@ use crate::loop_runtime::{
 use crate::store::{init_store, read_context_with_conduct_lifecycle};
 use crate::tool_runner::parse_argv_json;
 use crate::web::{generate_control_token, serve, WebOptions};
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 
 use super::super::args::{
     CliLoopAgent, ContextArgs, HarnessKind, InstallAdapterArgs, InstallArgs, InstallCommand,
-    LoopArgs, LoopCommand, LoopRunArgs, StatusArgs, WebArgs,
+    LoopArgs, LoopCommand, LoopRunArgs, StatusArgs, UpdateArgs, WebArgs,
 };
 use super::super::render::brief_context::{
     brief_context, print_brief_context, BriefContextOptions,
@@ -30,8 +34,16 @@ use super::super::{CLI_DEFAULT_HELP_SECTIONS, INIT_PROJECT_SETUP_PROMPT};
 
 const LDGR_CONTEXT_EXTENSION: &str = include_str!("../../../extensions/ldgr-context.ts");
 const LDGR_CORE_LOOP_PROMPT: &str = include_str!("../../../prompts/loop-prompt.md");
+const LDGR_LOOP_PLANNER_PROMPT: &str = include_str!("../../../prompts/ldgr-loop-planner.md");
+const LDGR_LOOP_WORKER_PROMPT: &str = include_str!("../../../prompts/ldgr-loop-worker.md");
+const LDGR_LOOP_SCRYB_PROMPT: &str = include_str!("../../../prompts/ldgr-loop-scryb.md");
+const LDGR_LOOP_VALIDATOR_PROMPT: &str = include_str!("../../../prompts/ldgr-loop-validator.md");
 const LDGR_CORE_LOOP_PROMPT_FILE: &str = "ldgr-core-loop.md";
 const AGENTCTL_REPO: &str = "https://github.com/hydra-dynamix/agentctl";
+const LDGR_CORE_REPO: &str = "https://github.com/hydra-dynamix/ldgr-core";
+const CURRENT_LICENSE_YEAR: &str = "2026";
+const FULL_LICENSE_FEATURE: &str = "full";
+const LDGR_CORE_API_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub fn handle_init(db: &Path, artifact_root: &Path) -> anyhow::Result<()> {
     let existing_database = db.exists();
@@ -74,10 +86,8 @@ pub fn handle_install(args: InstallArgs) -> anyhow::Result<()> {
 
     println!("◇ Installing LDGR harness files...");
     let prompt_root = ldgr_home.join("prompts");
-    fs::create_dir_all(&prompt_root)?;
+    seed_core_prompt_files(&prompt_root)?;
     let core_loop_prompt = prompt_root.join(LDGR_CORE_LOOP_PROMPT_FILE);
-    fs::write(&core_loop_prompt, LDGR_CORE_LOOP_PROMPT)?;
-    println!("├─ Core loop prompt {}", core_loop_prompt.display());
     let mut installed = Vec::new();
     for harness in &harnesses {
         installed.push(install_harness(*harness, &home)?);
@@ -97,7 +107,8 @@ pub fn handle_install(args: InstallArgs) -> anyhow::Result<()> {
             "default_global_path": "~/.ldgr/<adapter>",
             "note": "Adapter bundle files install globally under ~/.ldgr/<adapter>; adapter-owned skills/extensions install into the configured harness locations."
         },
-        "notes": "Adapters should read this file, validate their own license when applicable, install adapter bundle files under ~/.ldgr/<adapter> by default, then install adapter-owned skills/extensions into the configured harness locations."
+        "licenses": {},
+        "notes": "Adapters should read this file, validate their own license when applicable, use licenses.<product>.license_file and licenses.<product>.keyring_file for offline commercial license paths, install adapter bundle files under ~/.ldgr/<adapter> by default, then install adapter-owned skills/extensions into the configured harness locations."
     });
     let config_path = ldgr_home.join("config.json");
     fs::write(
@@ -132,6 +143,7 @@ pub fn handle_install(args: InstallArgs) -> anyhow::Result<()> {
                 name: adapter,
                 source_root: None,
                 install_root: None,
+                adapter_version: None,
                 yes: args.yes,
             })?;
         }
@@ -143,6 +155,7 @@ pub fn handle_install(args: InstallArgs) -> anyhow::Result<()> {
 pub(crate) fn handle_interactive_adapter_install(
     source_root: Option<PathBuf>,
     install_root: Option<PathBuf>,
+    adapter_version: Option<String>,
     yes: bool,
 ) -> anyhow::Result<()> {
     if yes || !stdin_is_terminal() {
@@ -150,8 +163,8 @@ pub(crate) fn handle_interactive_adapter_install(
         println!("\nRun `ldgr adapter install <adapter>` to install one adapter, or run `ldgr adapter install` in an interactive terminal for the selection menu.");
         return Ok(());
     }
-    if install_root.is_some() {
-        bail!("--install-root requires an adapter name; run `ldgr adapter install <adapter> --install-root <path>`");
+    if install_root.is_some() || adapter_version.is_some() {
+        bail!("--install-root and --adapter-version require an adapter name; run `ldgr adapter install <adapter> --install-root <path> --adapter-version <version>`");
     }
     let adapters = select_adapter_bundles()?;
     if adapters.is_empty() {
@@ -163,6 +176,7 @@ pub(crate) fn handle_interactive_adapter_install(
             name: adapter,
             source_root: source_root.clone(),
             install_root: None,
+            adapter_version: None,
             yes,
         })?;
     }
@@ -189,10 +203,16 @@ pub(crate) fn handle_install_adapter(args: &InstallAdapterArgs) -> anyhow::Resul
     println!("├─ Install root {}", install_root.display());
     if let Some(source_root) = &args.source_root {
         install_adapter_from_source_root(entry, source_root, &install_root)?;
-    } else if let Some(release) = entry.release {
-        install_adapter_from_release(entry, release, &install_root, &home)?;
     } else if let Some(git) = entry.git {
-        install_adapter_from_git(entry, git, &install_root)?;
+        install_adapter_from_git(entry, git, &install_root, &home)?;
+    } else if let Some(release) = entry.release {
+        install_adapter_from_release(
+            entry,
+            release,
+            &install_root,
+            &home,
+            args.adapter_version.as_deref(),
+        )?;
     } else if let Some(package) = entry.workspace_package {
         let source_root = find_source_root(std::env::current_dir()?)?;
         install_adapter_from_source_root_with_package(package, &source_root, &install_root)?;
@@ -202,6 +222,404 @@ pub(crate) fn handle_install_adapter(args: &InstallAdapterArgs) -> anyhow::Resul
     install_adapter_harness_assets(&adapter, &install_root, &home)?;
     println!("└─ Installed adapter `{adapter}`. Try `ldgr {adapter} --help` or `ldgr adapter show {adapter}`.");
     Ok(())
+}
+
+pub fn handle_update(args: UpdateArgs) -> anyhow::Result<()> {
+    println!("◇ Updating LDGR");
+    if args.dry_run {
+        println!("├─ dry-run: no commands will be executed");
+    }
+    if args.skip_core {
+        println!("├─ Skipped core update (--skip-core)");
+    } else {
+        update_core(args.dry_run)?;
+    }
+    if args.skip_adapters {
+        println!("├─ Skipped adapter updates (--skip-adapters)");
+    } else {
+        update_installed_adapters(args.source_root.as_deref(), args.dry_run)?;
+    }
+    println!("└─ Update complete");
+    Ok(())
+}
+
+fn update_core(dry_run: bool) -> anyhow::Result<()> {
+    let mut command = Command::new("cargo");
+    command
+        .arg("install")
+        .arg("--git")
+        .arg(LDGR_CORE_REPO)
+        .arg("--locked")
+        .arg("--force")
+        .arg("ldgr-core");
+    if dry_run {
+        println!(
+            "├─ would update core: cargo install --git {LDGR_CORE_REPO} --locked --force ldgr-core"
+        );
+        return Ok(());
+    }
+    println!("├─ Updating core from {LDGR_CORE_REPO}");
+    run_checked(&mut command, "update ldgr core")
+}
+
+fn update_installed_adapters(source_root: Option<&Path>, dry_run: bool) -> anyhow::Result<()> {
+    let registry = AdapterRegistry::discover();
+    for warning in &registry.warnings {
+        eprintln!(
+            "warning: skipped adapter manifest {}: {}",
+            warning.manifest_path.display(),
+            warning.message
+        );
+    }
+    if registry.adapters.is_empty() {
+        println!("├─ No installed adapters discovered");
+        return Ok(());
+    }
+    let home = home_dir()?;
+    let today = today_iso_date();
+    for adapter in &registry.adapters {
+        let Some(entry) = available_adapter_catalog()
+            .iter()
+            .find(|entry| entry.slug == adapter.slug)
+        else {
+            println!(
+                "├─ Skipped adapter `{}`: not in update catalog",
+                adapter.slug
+            );
+            continue;
+        };
+        if let Some(reason) = adapter_update_skip_reason(entry, &home, &today)? {
+            println!("├─ Skipped adapter `{}`: {reason}", adapter.slug);
+            continue;
+        }
+        println!(
+            "├─ Updating adapter `{}` at {}",
+            adapter.slug,
+            adapter.root_path.display()
+        );
+        if dry_run {
+            println!("│  would reinstall adapter `{}`", adapter.slug);
+            continue;
+        }
+        handle_install_adapter(&InstallAdapterArgs {
+            name: adapter.slug.clone(),
+            source_root: source_root.map(Path::to_path_buf),
+            install_root: Some(adapter.root_path.clone()),
+            adapter_version: None,
+            yes: true,
+        })?;
+    }
+    Ok(())
+}
+
+fn adapter_update_skip_reason(
+    entry: &AvailableAdapter,
+    home: &Path,
+    today: &str,
+) -> anyhow::Result<Option<String>> {
+    let Some(release) = entry.release else {
+        return Ok(None);
+    };
+    if release.repo != "hydra-dynamix/ldgr-releases" {
+        return Ok(None);
+    }
+    let product = release.binary;
+    match check_update_license(home, entry.slug, product, today) {
+        LicenseUpdateDecision::Allow(diagnostic) => {
+            println!("│  license: {diagnostic}");
+            Ok(None)
+        }
+        LicenseUpdateDecision::Deny(diagnostic) => Ok(Some(diagnostic)),
+    }
+}
+
+enum LicenseUpdateDecision {
+    Allow(String),
+    Deny(String),
+}
+
+#[derive(serde::Deserialize)]
+struct LicenseEnvelope {
+    payload: String,
+    signature: String,
+}
+
+#[derive(serde::Deserialize)]
+struct LicenseClaims {
+    entitlements: Vec<ProductEntitlement>,
+}
+
+#[derive(serde::Deserialize)]
+struct ProductEntitlement {
+    product: String,
+    version_families: Vec<VersionFamilyEntitlement>,
+}
+
+#[derive(serde::Deserialize)]
+struct VersionFamilyEntitlement {
+    family: String,
+    features: Vec<String>,
+    updates_until: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct CommercialPublicKeyringFile {
+    alg: String,
+    keys: Vec<CommercialPublicKeyringEntry>,
+}
+
+#[derive(serde::Deserialize)]
+struct CommercialPublicKeyringEntry {
+    version_family: String,
+    public_key: String,
+}
+
+fn check_update_license(
+    home: &Path,
+    slug: &str,
+    product: &str,
+    today: &str,
+) -> LicenseUpdateDecision {
+    let Some(license_path) = configured_license_path(home, slug, product) else {
+        return LicenseUpdateDecision::Deny(format!(
+            "commercial update requires a configured `{product}` license for {CURRENT_LICENSE_YEAR}"
+        ));
+    };
+    let Some(keyring_path) = configured_keyring_path(home, slug, product) else {
+        return LicenseUpdateDecision::Deny(
+            "commercial update requires ~/.ldgr/licenses/keyrings/commercial-public-keyring.json or configured licenses.<product>.keyring_file".to_string(),
+        );
+    };
+    match verify_update_license(&license_path, &keyring_path, product, today) {
+        Ok(diagnostic) => LicenseUpdateDecision::Allow(diagnostic),
+        Err(diagnostic) => LicenseUpdateDecision::Deny(diagnostic),
+    }
+}
+
+fn verify_update_license(
+    license_path: &Path,
+    keyring_path: &Path,
+    product: &str,
+    today: &str,
+) -> Result<String, String> {
+    let license_text = fs::read_to_string(license_path)
+        .map_err(|_| "license file is missing or unreadable".to_string())?;
+    let envelope: LicenseEnvelope =
+        toml::from_str(&license_text).map_err(|_| "license file is malformed".to_string())?;
+    let claims: LicenseClaims = serde_json::from_str(&envelope.payload)
+        .map_err(|_| "license file is malformed".to_string())?;
+    let family = payload_version_family(&claims)
+        .ok_or_else(|| "license file is malformed".to_string())?
+        .to_string();
+    if family != CURRENT_LICENSE_YEAR {
+        return Err(format!(
+            "license version family `{family}` does not match current update year `{CURRENT_LICENSE_YEAR}`"
+        ));
+    }
+    let keyring_text = fs::read_to_string(keyring_path)
+        .map_err(|_| "public keyring file is missing or unreadable".to_string())?;
+    let keyring: CommercialPublicKeyringFile = serde_json::from_str(&keyring_text)
+        .map_err(|_| "public keyring file is malformed".to_string())?;
+    let public_key = keyring_public_key_bytes(&keyring, &family)?;
+    verify_license_signature(
+        &public_key,
+        envelope.payload.as_bytes(),
+        &envelope.signature,
+    )?;
+    evaluate_update_claims(&claims, product, today)
+}
+
+fn payload_version_family(claims: &LicenseClaims) -> Option<&str> {
+    claims
+        .entitlements
+        .iter()
+        .flat_map(|product| product.version_families.iter())
+        .map(|family| family.family.as_str())
+        .next()
+}
+
+fn keyring_public_key_bytes(
+    keyring: &CommercialPublicKeyringFile,
+    version_family: &str,
+) -> Result<Vec<u8>, String> {
+    if keyring.alg != "Ed25519" {
+        return Err("public keyring file is malformed".to_string());
+    }
+    let entry = keyring
+        .keys
+        .iter()
+        .find(|entry| entry.version_family == version_family)
+        .ok_or_else(|| {
+            format!("public keyring does not include version family `{version_family}`")
+        })?;
+    STANDARD
+        .decode(entry.public_key.as_bytes())
+        .map_err(|_| "public keyring file is malformed".to_string())
+}
+
+fn verify_license_signature(
+    public_key: &[u8],
+    payload: &[u8],
+    signature: &str,
+) -> Result<(), String> {
+    let public_key: [u8; 32] = public_key
+        .try_into()
+        .map_err(|_| "public keyring file is malformed".to_string())?;
+    let signature = STANDARD
+        .decode(signature.as_bytes())
+        .map_err(|_| "license file is malformed".to_string())?;
+    let signature: [u8; 64] = signature
+        .try_into()
+        .map_err(|_| "license file is malformed".to_string())?;
+    let verifying_key = VerifyingKey::from_bytes(&public_key)
+        .map_err(|_| "public keyring file is malformed".to_string())?;
+    verifying_key
+        .verify(payload, &Signature::from_bytes(&signature))
+        .map_err(|_| "license signature could not be verified".to_string())
+}
+
+fn evaluate_update_claims(
+    claims: &LicenseClaims,
+    product: &str,
+    today: &str,
+) -> Result<String, String> {
+    let product_claim = claims
+        .entitlements
+        .iter()
+        .find(|claim| claim.product == product)
+        .ok_or_else(|| format!("license does not include product `{product}`"))?;
+    let family = product_claim
+        .version_families
+        .iter()
+        .find(|family| family.family == CURRENT_LICENSE_YEAR)
+        .ok_or_else(|| {
+            format!(
+                "license for `{product}` does not include version family `{CURRENT_LICENSE_YEAR}`"
+            )
+        })?;
+    if !family
+        .features
+        .iter()
+        .any(|feature| feature == FULL_LICENSE_FEATURE)
+    {
+        return Err(format!(
+            "license for `{product}` `{CURRENT_LICENSE_YEAR}` does not include feature `{FULL_LICENSE_FEATURE}`"
+        ));
+    }
+    if let Some(updates_until) = family.updates_until.as_deref() {
+        if updates_until < today {
+            return Err(format!(
+                "update entitlement expired on {updates_until} for `{product}` `{CURRENT_LICENSE_YEAR}`"
+            ));
+        }
+    }
+    Ok(format!(
+        "license allows `{product}` `{CURRENT_LICENSE_YEAR}` updates through {}",
+        family
+            .updates_until
+            .as_deref()
+            .unwrap_or(CURRENT_LICENSE_YEAR)
+    ))
+}
+
+fn configured_license_path(home: &Path, slug: &str, product: &str) -> Option<PathBuf> {
+    configured_license_field(home, slug, product, &["license_file", "license_path"]).or_else(|| {
+        first_existing([
+            home.join(".ldgr/licenses")
+                .join(slug)
+                .join(format!("{CURRENT_LICENSE_YEAR}.ldgr")),
+            home.join(".ldgr/licenses")
+                .join(product)
+                .join(format!("{CURRENT_LICENSE_YEAR}.ldgr")),
+            home.join(".ldgr/.ldgr/licenses")
+                .join(slug)
+                .join(format!("{CURRENT_LICENSE_YEAR}.ldgr")),
+            home.join(".ldgr/.ldgr/licenses")
+                .join(product)
+                .join(format!("{CURRENT_LICENSE_YEAR}.ldgr")),
+        ])
+    })
+}
+
+fn configured_keyring_path(home: &Path, slug: &str, product: &str) -> Option<PathBuf> {
+    configured_license_field(
+        home,
+        slug,
+        product,
+        &[
+            "keyring_file",
+            "public_keyring_file",
+            "keyring_path",
+            "public_keyring_path",
+        ],
+    )
+    .or_else(|| {
+        first_existing([
+            home.join(".ldgr/licenses/keyrings/commercial-public-keyring.json"),
+            home.join(".ldgr/.ldgr/licenses/keyrings/commercial-public-keyring.json"),
+        ])
+    })
+}
+
+fn configured_license_field(
+    home: &Path,
+    slug: &str,
+    product: &str,
+    field_names: &[&str],
+) -> Option<PathBuf> {
+    let config_path = home.join(".ldgr/config.json");
+    let text = fs::read_to_string(config_path).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&text).ok()?;
+    for section in ["licenses", "adapter_licenses", "commercial_licenses"] {
+        for key in [product, slug] {
+            let Some(entry) = json.get(section).and_then(|section| section.get(key)) else {
+                continue;
+            };
+            for field in field_names {
+                if let Some(value) = entry.get(field).and_then(|value| value.as_str()) {
+                    return Some(expand_home_path(home, value));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn expand_home_path(home: &Path, value: &str) -> PathBuf {
+    if value == "~" {
+        home.to_path_buf()
+    } else if let Some(rest) = value.strip_prefix("~/") {
+        home.join(rest)
+    } else {
+        PathBuf::from(value)
+    }
+}
+
+fn first_existing(paths: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
+    paths.into_iter().find(|path| path.is_file())
+}
+
+fn today_iso_date() -> String {
+    let days = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() / 86_400)
+        .unwrap_or(0) as i64;
+    let (year, month, day) = civil_from_days(days);
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+fn civil_from_days(days_since_epoch: i64) -> (i32, u32, u32) {
+    let z = days_since_epoch + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    let year = y + i64::from(month <= 2);
+    (year as i32, month as u32, day as u32)
 }
 
 fn resolve_adapter_install_name(name: &str, assume_yes: bool) -> anyhow::Result<String> {
@@ -322,6 +740,44 @@ struct ReleaseAdapterSource {
     asset_prefix: &'static str,
     root_prefix: &'static str,
     binary: &'static str,
+    version_family: &'static str,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ReleaseMetadata {
+    adapter: String,
+    #[serde(default)]
+    version: Option<String>,
+    adapter_version: String,
+    adapter_version_family: String,
+    platform: String,
+    artifact: String,
+    sha256: String,
+    ldgr_core_api_min: String,
+    #[serde(default)]
+    ldgr_core_api_max_exclusive: Option<String>,
+    #[serde(default)]
+    entitlement_family: Option<String>,
+}
+
+struct ResolvedReleaseAsset {
+    tag: String,
+    version: String,
+    archive_name: String,
+    archive_url: String,
+    checksum_name: String,
+    checksum_url: String,
+    metadata_name: String,
+    metadata_url: String,
+    adapter_version_family: String,
+    core_api_min: String,
+    core_api_max_exclusive: Option<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AdapterCatalogSection {
+    OpenSource,
+    CommercialBinary,
 }
 
 struct AvailableAdapter {
@@ -329,6 +785,7 @@ struct AvailableAdapter {
     title: &'static str,
     source: &'static str,
     install: &'static str,
+    section: AdapterCatalogSection,
     workspace_package: Option<&'static str>,
     git: Option<GitAdapterSource>,
     release: Option<ReleaseAdapterSource>,
@@ -338,8 +795,9 @@ static AVAILABLE_ADAPTERS: &[AvailableAdapter] = &[
     AvailableAdapter {
         slug: "conduct",
         title: "LDGR Conduct adapter",
-        source: "hydra-dynamix/ldgr-releases release bundle",
+        source: "binary release: https://github.com/hydra-dynamix/ldgr-releases",
         install: "ldgr adapter install conduct",
+        section: AdapterCatalogSection::OpenSource,
         workspace_package: Some("ldgr-conduct"),
         git: None,
         release: Some(ReleaseAdapterSource {
@@ -348,13 +806,15 @@ static AVAILABLE_ADAPTERS: &[AvailableAdapter] = &[
             asset_prefix: "conduct",
             root_prefix: "conduct",
             binary: "ldgr-conduct",
+            version_family: "2026",
         }),
     },
     AvailableAdapter {
         slug: "research",
         title: "Research adapter",
-        source: "https://github.com/hydra-dynamix/ldgr-research release/git",
+        source: "open-source git: https://github.com/hydra-dynamix/ldgr-research",
         install: "ldgr adapter install research",
+        section: AdapterCatalogSection::OpenSource,
         workspace_package: Some("ldgr-research"),
         git: Some(GitAdapterSource {
             repo: "https://github.com/hydra-dynamix/ldgr-research",
@@ -367,13 +827,15 @@ static AVAILABLE_ADAPTERS: &[AvailableAdapter] = &[
             asset_prefix: "ldgr-research",
             root_prefix: "ldgr-research",
             binary: "ldgr-research",
+            version_family: "2026",
         }),
     },
     AvailableAdapter {
         slug: "example",
         title: "Public example adapter",
-        source: "https://github.com/hydra-dynamix/ldgr-example-adapter release/git",
+        source: "open-source git: https://github.com/hydra-dynamix/ldgr-example-adapter",
         install: "ldgr adapter install example",
+        section: AdapterCatalogSection::OpenSource,
         workspace_package: Some("ldgr-example-adapter"),
         git: Some(GitAdapterSource {
             repo: "https://github.com/hydra-dynamix/ldgr-example-adapter",
@@ -386,13 +848,15 @@ static AVAILABLE_ADAPTERS: &[AvailableAdapter] = &[
             asset_prefix: "ldgr-example-adapter",
             root_prefix: "ldgr-example-adapter",
             binary: "ldgr-example-adapter",
+            version_family: "2026",
         }),
     },
     AvailableAdapter {
         slug: "programbench",
         title: "Clean-room ProgramBench adapter",
-        source: "https://github.com/hydra-dynamix/ldgr-programbench git",
+        source: "open-source git: https://github.com/hydra-dynamix/ldgr-programbench",
         install: "ldgr adapter install programbench",
+        section: AdapterCatalogSection::OpenSource,
         workspace_package: None,
         git: Some(GitAdapterSource {
             repo: "https://github.com/hydra-dynamix/ldgr-programbench",
@@ -404,8 +868,9 @@ static AVAILABLE_ADAPTERS: &[AvailableAdapter] = &[
     AvailableAdapter {
         slug: "code",
         title: "Coding adapter",
-        source: "",
+        source: "commercial binary: https://github.com/hydra-dynamix/ldgr-releases",
         install: "ldgr adapter install code",
+        section: AdapterCatalogSection::CommercialBinary,
         workspace_package: None,
         git: None,
         release: Some(commercial_release("code", "ldgr-code")),
@@ -413,8 +878,9 @@ static AVAILABLE_ADAPTERS: &[AvailableAdapter] = &[
     AvailableAdapter {
         slug: "security",
         title: "Security adapter",
-        source: "",
+        source: "commercial binary: https://github.com/hydra-dynamix/ldgr-releases",
         install: "ldgr adapter install security",
+        section: AdapterCatalogSection::CommercialBinary,
         workspace_package: None,
         git: None,
         release: Some(commercial_release("security", "ldgr-security")),
@@ -422,8 +888,9 @@ static AVAILABLE_ADAPTERS: &[AvailableAdapter] = &[
     AvailableAdapter {
         slug: "explore",
         title: "Explore adapter",
-        source: "",
+        source: "commercial binary: https://github.com/hydra-dynamix/ldgr-releases",
         install: "ldgr adapter install explore",
+        section: AdapterCatalogSection::CommercialBinary,
         workspace_package: None,
         git: None,
         release: Some(commercial_release("explore", "ldgr-explore")),
@@ -431,8 +898,9 @@ static AVAILABLE_ADAPTERS: &[AvailableAdapter] = &[
     AvailableAdapter {
         slug: "bench",
         title: "Bench adapter",
-        source: "",
+        source: "commercial binary: https://github.com/hydra-dynamix/ldgr-releases",
         install: "ldgr adapter install bench",
+        section: AdapterCatalogSection::CommercialBinary,
         workspace_package: None,
         git: None,
         release: Some(commercial_release("bench", "ldgr-bench")),
@@ -450,22 +918,36 @@ const fn commercial_release(adapter: &'static str, binary: &'static str) -> Rele
         asset_prefix: adapter,
         root_prefix: adapter,
         binary,
+        version_family: "2026",
     }
 }
 
 pub(crate) fn print_available_adapter_catalog() {
     println!("Available adapters:");
-    for entry in available_adapter_catalog() {
-        if entry.source.is_empty() {
-            println!("  {} — {}", entry.slug, entry.title);
-        } else {
-            println!("  {} — {} [{}]", entry.slug, entry.title, entry.source);
-        }
-        println!("    install: {}", entry.install);
-        println!("    after install: ldgr {} --help", entry.slug);
-    }
+    print_available_adapter_catalog_section(
+        "Open-source/source adapters",
+        AdapterCatalogSection::OpenSource,
+    );
+    print_available_adapter_catalog_section(
+        "Commercial binary adapters",
+        AdapterCatalogSection::CommercialBinary,
+    );
     println!("  installed adapters: ldgr adapter list");
     println!("  adapter details: ldgr adapter show <slug>");
+    println!("  commercial binary source: ldgr-releases (https://github.com/hydra-dynamix/ldgr-releases)");
+    println!("  commercial lookup contract: repo hydra-dynamix/ldgr-releases, newest compatible release metadata for adapter_version_family 2026 and ldgr_core_api {LDGR_CORE_API_VERSION}; pin with --adapter-version <version>; asset <adapter>-<adapter_version>-<platform>.tar.gz plus .sha256/.release.json, root <adapter>-<adapter_version>/, binary <platform>/ldgr-<adapter>");
+}
+
+fn print_available_adapter_catalog_section(title: &str, section: AdapterCatalogSection) {
+    println!("  {title}:");
+    for entry in available_adapter_catalog()
+        .iter()
+        .filter(|entry| entry.section == section)
+    {
+        println!("    {} — {} [{}]", entry.slug, entry.title, entry.source);
+        println!("      install: {}", entry.install);
+        println!("      after install: ldgr {} --help", entry.slug);
+    }
 }
 
 fn install_adapter_from_source_root(
@@ -511,14 +993,26 @@ fn install_adapter_from_git(
     entry: &AvailableAdapter,
     git: GitAdapterSource,
     install_root: &Path,
+    home: &Path,
 ) -> anyhow::Result<()> {
     println!("├─ Git source {}", git.repo);
-    let mut command = cargo_install_git_command(git);
-    run_checked(&mut command, &format!("cargo install {}", git.package))?;
-    run_adapter_binary_installer(git.binary, entry.slug, install_root)
+    let cargo_root = home.join(".local");
+    let mut command = cargo_install_git_command(git, &cargo_root);
+    if let Err(error) = run_checked(&mut command, &format!("cargo install {}", git.package)) {
+        if entry.slug == "programbench" {
+            bail!(
+                "adapter `programbench` is listed as an open-source git adapter at {}, but it is not yet released as an installable Cargo package: {error}",
+                git.repo
+            );
+        }
+        return Err(error);
+    }
+    let binary_path = cargo_root.join("bin").join(git.binary);
+    run_adapter_binary_installer(binary_path.as_os_str(), entry.slug, install_root)?;
+    patch_adapter_argv_to_installed_binary(install_root, git.binary, home)
 }
 
-fn cargo_install_git_command(git: GitAdapterSource) -> Command {
+fn cargo_install_git_command(git: GitAdapterSource, cargo_root: &Path) -> Command {
     let mut command = Command::new("cargo");
     command
         .arg("install")
@@ -526,6 +1020,8 @@ fn cargo_install_git_command(git: GitAdapterSource) -> Command {
         .arg(git.repo)
         .arg("--locked")
         .arg("--force")
+        .arg("--root")
+        .arg(cargo_root)
         .arg(git.package);
     command
 }
@@ -557,20 +1053,51 @@ fn install_adapter_from_release(
     release: ReleaseAdapterSource,
     install_root: &Path,
     home: &Path,
+    pinned_version: Option<&str>,
 ) -> anyhow::Result<()> {
-    let version = env!("CARGO_PKG_VERSION");
     let platform = platform_tag()?;
-    let tag = if release.tag_prefix.is_empty() {
-        format!("{}-v{}", release.asset_prefix, version)
-    } else {
-        format!("{}{}", release.tag_prefix, version)
+    let resolved = match resolve_release_asset(entry.slug, release, &platform, pinned_version) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            if let Some(git) = entry.git {
+                println!(
+                    "├─ Release unavailable for {platform}; falling back to git install ({error})"
+                );
+                return install_adapter_from_git(entry, git, install_root, home);
+            }
+            if command_exists(release.binary) {
+                println!(
+                    "├─ Release unavailable for {platform}; falling back to installed `{}` ({error})",
+                    release.binary
+                );
+                run_adapter_binary_installer(release.binary, entry.slug, install_root)?;
+                patch_adapter_argv_to_installed_binary(install_root, release.binary, home)?;
+                return Ok(());
+            }
+            bail!(
+                "release asset unavailable for adapter `{}` on platform `{}` from `{}`: {error}; install `{}` or pass --source-root for a local source install",
+                entry.slug,
+                platform,
+                release.repo,
+                release.binary
+            );
+        }
     };
-    let archive_name = format!("{}-{}-{}.tar.gz", release.asset_prefix, version, platform);
-    let url = format!(
-        "https://github.com/{}/releases/download/{}/{}",
-        release.repo, tag, archive_name
+    println!(
+        "├─ Release https://github.com/{}/releases/download/{}/{}",
+        release.repo, resolved.tag, resolved.archive_name
     );
-    println!("├─ Release {}", url);
+    println!(
+        "├─ Resolved adapter version {} (family {}, core API {}..{}) for ldgr-core {}",
+        resolved.version,
+        resolved.adapter_version_family,
+        resolved.core_api_min,
+        resolved
+            .core_api_max_exclusive
+            .as_deref()
+            .unwrap_or("unbounded"),
+        LDGR_CORE_API_VERSION
+    );
     let temp = std::env::temp_dir().join(format!(
         "ldgr-adapter-install-{}-{}",
         entry.slug,
@@ -578,36 +1105,34 @@ fn install_adapter_from_release(
     ));
     let _ = fs::remove_dir_all(&temp);
     fs::create_dir_all(&temp)?;
-    let archive = temp.join(&archive_name);
-    let download = Command::new("curl")
-        .arg("-fsSL")
-        .arg(&url)
-        .arg("-o")
-        .arg(&archive)
-        .status();
-    match download {
-        Ok(status) if status.success() => {}
-        _ => {
-            if let Some(git) = entry.git {
-                println!("├─ Release unavailable for {platform}; falling back to git install");
-                return install_adapter_from_git(entry, git, install_root);
-            }
-            if command_exists(release.binary) {
-                println!(
-                    "├─ Release unavailable for {platform}; falling back to installed `{}`",
-                    release.binary
-                );
-                return run_adapter_binary_installer(release.binary, entry.slug, install_root);
-            }
-            bail!(
-                "release asset unavailable for adapter `{}` on platform `{}`: {}; install `{}` or pass --source-root for a local source install",
-                entry.slug,
-                platform,
-                url,
-                release.binary
-            );
-        }
-    }
+
+    let archive = temp.join(&resolved.archive_name);
+    download_file(
+        &resolved.archive_url,
+        &archive,
+        "download adapter release archive",
+    )?;
+    let checksum_path = temp.join(&resolved.checksum_name);
+    download_file(
+        &resolved.checksum_url,
+        &checksum_path,
+        "download adapter release checksum",
+    )?;
+    verify_sha256_file(&archive, &checksum_path)?;
+    let metadata_path = temp.join(&resolved.metadata_name);
+    download_file(
+        &resolved.metadata_url,
+        &metadata_path,
+        "download adapter release metadata",
+    )?;
+    verify_release_metadata(
+        &metadata_path,
+        entry.slug,
+        &platform,
+        &resolved.archive_name,
+        &archive,
+    )?;
+
     run_checked(
         Command::new("tar")
             .arg("-xzf")
@@ -616,7 +1141,7 @@ fn install_adapter_from_release(
             .arg(&temp),
         "extract adapter release archive",
     )?;
-    let extracted = temp.join(format!("{}-{}", release.root_prefix, version));
+    let extracted = temp.join(format!("{}-{}", release.root_prefix, resolved.version));
     if !extracted.is_dir() {
         bail!(
             "release archive did not contain expected root {}",
@@ -626,13 +1151,341 @@ fn install_adapter_from_release(
     let _ = fs::remove_dir_all(install_root);
     copy_dir_recursive(&extracted, install_root)?;
     let installed_binary = install_release_binary(install_root, home, release.binary, &platform)?;
-    if let Some(binary_path) = installed_binary {
-        println!("├─ Running adapter installer from release binary");
-        run_adapter_binary_installer(binary_path.as_os_str(), entry.slug, install_root)?;
-    }
+    let Some(binary_path) = installed_binary else {
+        bail!(
+            "release archive `{}` did not contain expected binary `{}` for platform `{}`",
+            resolved.archive_name,
+            release.binary,
+            platform
+        );
+    };
+    println!("├─ Running adapter installer from release binary");
+    run_adapter_binary_installer(binary_path.as_os_str(), entry.slug, install_root)?;
     patch_adapter_argv_to_installed_binary(install_root, release.binary, home)?;
     let _ = fs::remove_dir_all(&temp);
     Ok(())
+}
+
+fn resolve_release_asset(
+    adapter: &str,
+    release: ReleaseAdapterSource,
+    platform: &str,
+    pinned_version: Option<&str>,
+) -> anyhow::Result<ResolvedReleaseAsset> {
+    let catalog_url = format!(
+        "https://api.github.com/repos/{}/releases?per_page=100",
+        release.repo
+    );
+    let temp = std::env::temp_dir().join(format!(
+        "ldgr-release-catalog-{}-{}-{}.json",
+        release.asset_prefix,
+        platform,
+        std::process::id()
+    ));
+    download_file(&catalog_url, &temp, "download adapter release catalog")?;
+    let catalog: serde_json::Value = serde_json::from_str(&fs::read_to_string(&temp)?)
+        .with_context(|| format!("parse release catalog {}", catalog_url))?;
+    let releases = catalog
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("release catalog response was not an array"))?;
+    let tag_prefix = if release.tag_prefix.is_empty() {
+        format!("{}-v", release.asset_prefix)
+    } else {
+        release.tag_prefix.to_string()
+    };
+    let archive_suffix = format!("-{platform}.tar.gz");
+    let archive_prefix = format!("{}-", release.asset_prefix);
+    let mut rejection_reasons = Vec::new();
+    for item in releases {
+        let Some(tag) = item.get("tag_name").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        if !tag.starts_with(&tag_prefix) {
+            continue;
+        }
+        let Some(assets) = item.get("assets").and_then(|value| value.as_array()) else {
+            continue;
+        };
+        let Some((archive_name, archive_url)) = find_release_asset(assets, |name| {
+            name.starts_with(&archive_prefix) && name.ends_with(&archive_suffix)
+        }) else {
+            continue;
+        };
+        let version = archive_name
+            .strip_prefix(&archive_prefix)
+            .and_then(|tail| tail.strip_suffix(&archive_suffix))
+            .ok_or_else(|| anyhow::anyhow!("could not parse version from asset `{archive_name}`"))?
+            .to_string();
+        if pinned_version.is_some_and(|pinned| pinned != version) {
+            continue;
+        }
+        let checksum_name = format!("{archive_name}.sha256");
+        let Some((_, checksum_url)) = find_release_asset(assets, |name| name == checksum_name)
+        else {
+            rejection_reasons.push(format!("{version}: missing checksum asset"));
+            continue;
+        };
+        let metadata_name = format!("{}.release.json", archive_name.trim_end_matches(".tar.gz"));
+        let Some((_, metadata_url)) = find_release_asset(assets, |name| name == metadata_name)
+        else {
+            rejection_reasons.push(format!("{version}: missing explicit release metadata"));
+            continue;
+        };
+        let metadata_path = temp.with_file_name(format!(
+            "ldgr-release-metadata-{}-{}-{}-{}.json",
+            release.asset_prefix,
+            version,
+            platform,
+            std::process::id()
+        ));
+        if let Err(error) = download_file(
+            &metadata_url,
+            &metadata_path,
+            "download adapter release metadata for compatibility selection",
+        ) {
+            rejection_reasons.push(format!("{version}: could not download metadata: {error}"));
+            let _ = fs::remove_file(&metadata_path);
+            continue;
+        }
+        let metadata = match parse_release_metadata(&metadata_path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                rejection_reasons.push(format!("{version}: malformed metadata: {error}"));
+                let _ = fs::remove_file(&metadata_path);
+                continue;
+            }
+        };
+        let _ = fs::remove_file(&metadata_path);
+        if let Err(error) = validate_release_metadata_identity(
+            &metadata,
+            adapter,
+            platform,
+            &archive_name,
+            Some(&version),
+        ) {
+            rejection_reasons.push(format!("{version}: {error}"));
+            continue;
+        }
+        if metadata.adapter_version_family != release.version_family {
+            rejection_reasons.push(format!(
+                "{version}: adapter_version_family `{}` does not match required `{}`",
+                metadata.adapter_version_family, release.version_family
+            ));
+            continue;
+        }
+        if let Err(error) = validate_core_api_compatibility(&metadata) {
+            rejection_reasons.push(format!("{version}: {error}"));
+            continue;
+        }
+        let _ = fs::remove_file(&temp);
+        return Ok(ResolvedReleaseAsset {
+            tag: tag.to_string(),
+            version,
+            archive_name,
+            archive_url,
+            checksum_name,
+            checksum_url,
+            metadata_name,
+            metadata_url,
+            adapter_version_family: metadata.adapter_version_family,
+            core_api_min: metadata.ldgr_core_api_min,
+            core_api_max_exclusive: metadata.ldgr_core_api_max_exclusive,
+        });
+    }
+    let _ = fs::remove_file(&temp);
+    let pin = pinned_version
+        .map(|version| format!(" pinned version `{version}`"))
+        .unwrap_or_default();
+    bail!(
+        "no compatible release asset matched tag prefix `{}`{} platform `{}` adapter_version_family `{}` ldgr_core_api `{}`{}",
+        tag_prefix,
+        pin,
+        platform,
+        release.version_family,
+        LDGR_CORE_API_VERSION,
+        if rejection_reasons.is_empty() {
+            String::new()
+        } else {
+            format!("; rejected candidates: {}", rejection_reasons.join("; "))
+        }
+    )
+}
+
+fn parse_release_metadata(metadata_path: &Path) -> anyhow::Result<ReleaseMetadata> {
+    serde_json::from_str(&fs::read_to_string(metadata_path)?)
+        .with_context(|| format!("parse release metadata {}", metadata_path.display()))
+}
+
+fn validate_release_metadata_identity(
+    metadata: &ReleaseMetadata,
+    adapter: &str,
+    platform: &str,
+    archive_name: &str,
+    expected_adapter_version: Option<&str>,
+) -> anyhow::Result<()> {
+    if metadata.adapter != adapter {
+        bail!("release metadata adapter field did not match `{adapter}`");
+    }
+    if metadata.platform != platform {
+        bail!("release metadata platform field did not match `{platform}`");
+    }
+    if metadata.artifact != archive_name {
+        bail!("release metadata artifact field did not match `{archive_name}`");
+    }
+    if let Some(expected_adapter_version) = expected_adapter_version {
+        if metadata.adapter_version != expected_adapter_version {
+            bail!(
+                "release metadata adapter_version `{}` did not match asset version `{}`",
+                metadata.adapter_version,
+                expected_adapter_version
+            );
+        }
+        if let Some(legacy_version) = metadata.version.as_deref() {
+            if legacy_version != expected_adapter_version {
+                bail!(
+                    "release metadata version `{legacy_version}` did not match asset version `{expected_adapter_version}`"
+                );
+            }
+        }
+    }
+    if metadata.adapter_version_family.trim().is_empty() {
+        bail!("release metadata missing adapter_version_family");
+    }
+    if metadata.ldgr_core_api_min.trim().is_empty() {
+        bail!("release metadata missing ldgr_core_api_min");
+    }
+    if metadata
+        .entitlement_family
+        .as_deref()
+        .is_some_and(|family| family.trim().is_empty())
+    {
+        bail!("release metadata entitlement_family was present but empty");
+    }
+    Ok(())
+}
+
+fn validate_core_api_compatibility(metadata: &ReleaseMetadata) -> anyhow::Result<()> {
+    if compare_semverish(LDGR_CORE_API_VERSION, &metadata.ldgr_core_api_min)? < 0 {
+        bail!(
+            "requires ldgr_core_api >= {}, current {}",
+            metadata.ldgr_core_api_min,
+            LDGR_CORE_API_VERSION
+        );
+    }
+    if let Some(max_exclusive) = metadata.ldgr_core_api_max_exclusive.as_deref() {
+        if compare_semverish(LDGR_CORE_API_VERSION, max_exclusive)? >= 0 {
+            bail!(
+                "requires ldgr_core_api < {}, current {}",
+                max_exclusive,
+                LDGR_CORE_API_VERSION
+            );
+        }
+    }
+    Ok(())
+}
+
+fn compare_semverish(left: &str, right: &str) -> anyhow::Result<i8> {
+    let left = parse_semverish_triplet(left)?;
+    let right = parse_semverish_triplet(right)?;
+    Ok(match left.cmp(&right) {
+        std::cmp::Ordering::Less => -1,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
+    })
+}
+
+fn parse_semverish_triplet(version: &str) -> anyhow::Result<(u64, u64, u64)> {
+    let core = version
+        .find(['-', '+'])
+        .map(|index| &version[..index])
+        .unwrap_or(version);
+    let mut parts = core.split('.');
+    let major = parts
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("invalid semantic version `{version}`"))?
+        .parse::<u64>()?;
+    let minor = parts
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("invalid semantic version `{version}`"))?
+        .parse::<u64>()?;
+    let patch = parts
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("invalid semantic version `{version}`"))?
+        .parse::<u64>()?;
+    Ok((major, minor, patch))
+}
+
+fn find_release_asset(
+    assets: &[serde_json::Value],
+    predicate: impl Fn(&str) -> bool,
+) -> Option<(String, String)> {
+    assets.iter().find_map(|asset| {
+        let name = asset.get("name")?.as_str()?;
+        if !predicate(name) {
+            return None;
+        }
+        let url = asset.get("browser_download_url")?.as_str()?;
+        Some((name.to_string(), url.to_string()))
+    })
+}
+
+fn download_file(url: &str, dest: &Path, label: &str) -> anyhow::Result<()> {
+    let mut command = Command::new("curl");
+    command.arg("-fsSL").arg(url).arg("-o").arg(dest);
+    run_checked(&mut command, label)
+}
+
+fn verify_sha256_file(archive: &Path, checksum_path: &Path) -> anyhow::Result<String> {
+    let checksum_text = fs::read_to_string(checksum_path)?;
+    let expected = checksum_text
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("checksum file {} was empty", checksum_path.display()))?
+        .to_ascii_lowercase();
+    let actual = sha256_hex(archive)?;
+    if actual != expected {
+        bail!(
+            "checksum mismatch for {}: expected {}, got {}",
+            archive.display(),
+            expected,
+            actual
+        );
+    }
+    println!("├─ Verified checksum {}", checksum_path.display());
+    Ok(actual)
+}
+
+fn verify_release_metadata(
+    metadata_path: &Path,
+    adapter: &str,
+    platform: &str,
+    archive_name: &str,
+    archive: &Path,
+) -> anyhow::Result<()> {
+    let metadata = parse_release_metadata(metadata_path)?;
+    validate_release_metadata_identity(&metadata, adapter, platform, archive_name, None)?;
+    validate_core_api_compatibility(&metadata)?;
+    if metadata.sha256.trim().is_empty() {
+        bail!("release metadata missing sha256 field");
+    }
+    let expected_sha = metadata.sha256.as_str();
+    let actual_sha = sha256_hex(archive)?;
+    if actual_sha != expected_sha.to_ascii_lowercase() {
+        bail!(
+            "release metadata sha256 mismatch for {}: expected {}, got {}",
+            archive.display(),
+            expected_sha,
+            actual_sha
+        );
+    }
+    println!("├─ Verified release metadata {}", metadata_path.display());
+    Ok(())
+}
+
+fn sha256_hex(path: &Path) -> anyhow::Result<String> {
+    let bytes = fs::read(path)?;
+    let digest = Sha256::digest(bytes);
+    Ok(format!("{digest:x}"))
 }
 
 fn install_release_binary(
@@ -1479,6 +2332,7 @@ pub fn handle_loop(
 }
 
 fn install_core_harness_resources() -> anyhow::Result<()> {
+    seed_core_prompt_files(Path::new(".ldgr/prompts"))?;
     fs::create_dir_all(".pi/extensions")?;
     fs::write(".pi/extensions/ldgr-context.ts", LDGR_CONTEXT_EXTENSION)?;
     fs::create_dir_all(".ldgr")?;
@@ -1492,6 +2346,34 @@ If your agent harness is not Pi or does not load project-local Pi extensions, po
     println!("installed Pi extension .pi/extensions/ldgr-context.ts");
     println!("wrote fallback harness notes .ldgr/harness-setup.md");
     Ok(())
+}
+
+fn seed_core_prompt_files(prompt_root: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    fs::create_dir_all(prompt_root)?;
+    let mut seeded = Vec::new();
+    for (file_name, body) in core_prompt_files() {
+        let path = prompt_root.join(file_name);
+        if path.exists() {
+            println!("├─ Preserved user prompt {}", path.display());
+        } else {
+            fs::write(&path, body)
+                .with_context(|| format!("failed to seed prompt {}", path.display()))?;
+            println!("├─ Seeded prompt {}", path.display());
+            seeded.push(path);
+        }
+    }
+    Ok(seeded)
+}
+
+fn core_prompt_files() -> [(&'static str, &'static str); 6] {
+    [
+        (LDGR_CORE_LOOP_PROMPT_FILE, LDGR_CORE_LOOP_PROMPT),
+        (LOOP_INVARIANTS_PROMPT_FILE, LOOP_INVARIANTS_PROMPT),
+        ("ldgr-loop-planner.md", LDGR_LOOP_PLANNER_PROMPT),
+        ("ldgr-loop-worker.md", LDGR_LOOP_WORKER_PROMPT),
+        ("ldgr-loop-scryb.md", LDGR_LOOP_SCRYB_PROMPT),
+        ("ldgr-loop-validator.md", LDGR_LOOP_VALIDATOR_PROMPT),
+    ]
 }
 
 fn print_init_project_setup_prompt() {
@@ -1668,12 +2550,69 @@ mod tests {
     }
 
     #[test]
+    fn release_metadata_validates_explicit_core_api_compatibility() -> anyhow::Result<()> {
+        let metadata = ReleaseMetadata {
+            adapter: "code".to_string(),
+            version: Some("2026.1.0".to_string()),
+            adapter_version: "2026.1.0".to_string(),
+            adapter_version_family: "2026".to_string(),
+            platform: "linux-x86_64".to_string(),
+            artifact: "code-2026.1.0-linux-x86_64.tar.gz".to_string(),
+            sha256: "abc".to_string(),
+            ldgr_core_api_min: "0.1.0".to_string(),
+            ldgr_core_api_max_exclusive: Some("0.2.0".to_string()),
+            entitlement_family: Some("2026-commercial".to_string()),
+        };
+
+        validate_release_metadata_identity(
+            &metadata,
+            "code",
+            "linux-x86_64",
+            "code-2026.1.0-linux-x86_64.tar.gz",
+            Some("2026.1.0"),
+        )?;
+        validate_core_api_compatibility(&metadata)?;
+        Ok(())
+    }
+
+    #[test]
+    fn release_metadata_rejects_implicit_or_incompatible_adapter_version() {
+        let metadata = ReleaseMetadata {
+            adapter: "code".to_string(),
+            version: Some("0.1.1".to_string()),
+            adapter_version: "2026.1.0".to_string(),
+            adapter_version_family: "2026".to_string(),
+            platform: "linux-x86_64".to_string(),
+            artifact: "code-2026.1.0-linux-x86_64.tar.gz".to_string(),
+            sha256: "abc".to_string(),
+            ldgr_core_api_min: "0.1.0".to_string(),
+            ldgr_core_api_max_exclusive: Some("0.2.0".to_string()),
+            entitlement_family: Some("2026-commercial".to_string()),
+        };
+
+        let error = validate_release_metadata_identity(
+            &metadata,
+            "code",
+            "linux-x86_64",
+            "code-2026.1.0-linux-x86_64.tar.gz",
+            Some("2026.1.0"),
+        )
+        .expect_err("legacy version alias must not silently override adapter_version");
+        assert!(error
+            .to_string()
+            .contains("release metadata version `0.1.1` did not match asset version `2026.1.0`"));
+    }
+
+    #[test]
     fn cargo_git_install_uses_positional_crate_name() {
-        let command = cargo_install_git_command(GitAdapterSource {
-            repo: "https://github.com/hydra-dynamix/ldgr-research",
-            package: "ldgr-research",
-            binary: "ldgr-research",
-        });
+        let command = cargo_install_git_command(
+            GitAdapterSource {
+                repo: "https://github.com/hydra-dynamix/ldgr-research",
+                package: "ldgr-research",
+                binary: "ldgr-research",
+            },
+            Path::new("/tmp/ldgr-cargo-root"),
+        );
         let args = command
             .get_args()
             .map(|arg| arg.to_string_lossy().to_string())
@@ -1686,6 +2625,8 @@ mod tests {
                 "https://github.com/hydra-dynamix/ldgr-research".to_string(),
                 "--locked".to_string(),
                 "--force".to_string(),
+                "--root".to_string(),
+                "/tmp/ldgr-cargo-root".to_string(),
                 "ldgr-research".to_string(),
             ]
         );
@@ -1768,6 +2709,73 @@ prompt_stdin = true
             .path()
             .join(".ldgr/installed-adapters/research")
             .is_file());
+        Ok(())
+    }
+
+    #[test]
+    fn core_prompt_seed_installs_role_prompts_and_preserves_user_edits() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let prompt_root = root.path().join("prompts");
+
+        let seeded = seed_core_prompt_files(&prompt_root)?;
+        assert_eq!(seeded.len(), 6);
+        assert!(prompt_root.join("ldgr-core-loop.md").is_file());
+        assert!(prompt_root.join("ldgr-loop-invariants.md").is_file());
+        assert!(prompt_root.join("ldgr-loop-planner.md").is_file());
+        assert!(prompt_root.join("ldgr-loop-worker.md").is_file());
+        assert!(prompt_root.join("ldgr-loop-scryb.md").is_file());
+        assert!(prompt_root.join("ldgr-loop-validator.md").is_file());
+        assert!(
+            std::fs::read_to_string(prompt_root.join("ldgr-loop-worker.md"))?
+                .contains("fresh, ephemeral agent")
+        );
+        assert!(
+            std::fs::read_to_string(prompt_root.join("ldgr-loop-invariants.md"))?
+                .contains("durable guidance for ephemeral agents")
+        );
+
+        std::fs::write(prompt_root.join("ldgr-loop-planner.md"), "custom planner")?;
+        let reseeded = seed_core_prompt_files(&prompt_root)?;
+        assert!(reseeded.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(prompt_root.join("ldgr-loop-planner.md"))?,
+            "custom planner"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn installed_binary_patch_replaces_adapter_argv_with_absolute_binary() -> anyhow::Result<()> {
+        let install_root = tempfile::tempdir()?;
+        let home = tempfile::tempdir()?;
+        let bin_dir = home.path().join(".local/bin");
+        std::fs::create_dir_all(&bin_dir)?;
+        std::fs::write(bin_dir.join("ldgr-conduct"), "#!/bin/sh\n")?;
+        std::fs::write(
+            install_root.path().join("adapter.toml"),
+            r#"[adapter]
+slug = "conduct"
+
+[[commands]]
+namespace = "conduct"
+argv = ["ldgr-conduct"]
+
+[[tools]]
+name = "conduct-status"
+argv = ["ldgr-conduct", "status"]
+"#,
+        )?;
+
+        patch_adapter_argv_to_installed_binary(install_root.path(), "ldgr-conduct", home.path())?;
+
+        let manifest = std::fs::read_to_string(install_root.path().join("adapter.toml"))?;
+        let installed_binary = home.path().join(".local/bin/ldgr-conduct");
+        assert!(manifest.contains(&format!("argv = [\"{}\"]", installed_binary.display())));
+        assert!(manifest.contains(&format!(
+            "argv = [\"{}\", \"status\"]",
+            installed_binary.display()
+        )));
+        toml::from_str::<toml::Value>(&manifest).expect("patched manifest should parse as TOML");
         Ok(())
     }
 

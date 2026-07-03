@@ -34,7 +34,7 @@ fn handle_get(
             write_json(stream, &mission_log)
         }
         "/api/logs" => serve_logs(stream, db_path),
-        "/api/conduct/waves" => serve_conduct_waves(stream, db_path),
+        "/api/conduct/waves" => serve_conduct_waves(stream, db_path, artifact_root),
         api_path if api_path.starts_with("/api/runs/") => {
             serve_run_detail(stream, db_path, api_path)
         }

@@ -296,6 +296,7 @@ pub struct StoreContext {
     pub held_work_items: i64,
     pub done_work_items: i64,
     pub canceled_work_items: i64,
+    pub loop_invariants: crate::loop_invariants::LoopInvariantsSummary,
     pub loop_state: LoopStateSummary,
     pub active_runs: Vec<RunSummary>,
     pub next_work_item: Option<WorkItem>,

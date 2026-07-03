@@ -24,6 +24,8 @@ Repository outline from `dev walk . --stdout --no-content`:
 
 Read additional files only when this outline is insufficient to choose the first bounded work item. Run `ldgr status` for the agent on-ramp; expand to `ldgr context` only when full cockpit detail is needed.
 
+`ldgr init` seeds `.ldgr/prompts/ldgr-loop-invariants.md`, a user-editable invariants prompt for durable, project-agnostic loop rules. `ldgr status` references the active invariants file and `ldgr context` includes its body so future ephemeral agents inherit local operating rules without recompiling LDGR.
+
 `ldgr init` also installs `.pi/extensions/ldgr-context.ts` for Pi-compatible harnesses. Identify the current harness. If it is Pi, run `/reload` when appropriate and use `/ldgr <args>` to run LDGR CLI commands and pipe stdout/stderr into the conversation; `/ldgr` with no args and `/ldgr-context` both capture `ldgr context --brief`. If the harness cannot load Pi extensions, read `.ldgr/harness-setup.md`; extension commands will not work, but `ldgr ...` remains available from the shell.
 
 ### 2. Identify the first loop

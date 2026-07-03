@@ -12,13 +12,13 @@ use rusqlite::Connection;
 use crate::cli::render::brief_context::{brief_context, BriefContextOptions};
 use crate::store::{
     active_prompt, add_artifact, add_observation, apply_loop_intervention, bundled_prompt_version,
-    claim_next_pending_run, finish_run, get_run, oldest_running_work_item,
-    pending_loop_interventions, read_context, record_run_phase,
-    restore_work_item_pending_after_dry_run, sealed_bundle, ArtifactKind, LoopIntervention,
-    LoopInterventionAction, RunStatus,
+    claim_next_pending_run, clear_loop_intervention, close_run, finish_run, get_run,
+    oldest_running_work_item, pending_loop_interventions, read_context, record_run_phase,
+    restore_work_item_pending_after_dry_run, sealed_bundle, ArtifactKind, DecisionOutcome,
+    LoopIntervention, LoopInterventionAction, NextWorkSpec, RunStatus,
 };
 use crate::tool_runner::render_command;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 const LOOP_PROCESS_OUTPUT_PREVIEW_BYTES: usize = 64 * 1024;
 pub const DEFAULT_LOOP_PROCESS_TIMEOUT: Duration = Duration::from_secs(12 * 60 * 60);
@@ -68,6 +68,14 @@ impl LoopAgent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoopRoleResult {
+    pub role: String,
+    pub prompt_artifact_path: std::path::PathBuf,
+    pub output_artifact_path: std::path::PathBuf,
+    pub agent_exit_code: Option<i32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoopRuntimeResult {
     pub run_id: i64,
     pub work_slug: String,
@@ -77,6 +85,7 @@ pub struct LoopRuntimeResult {
     pub summary_exit_code: Option<i32>,
     pub agent_exit_code: Option<i32>,
     pub audit_exit_code: Option<i32>,
+    pub role_results: Vec<LoopRoleResult>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -314,6 +314,26 @@ fn run_process_with_stdin_timeout(
     )
 }
 
+fn run_process_with_stdin_env(
+    argv: &[String],
+    stdin_text: &str,
+    stream_output: bool,
+    output_paths: ProcessOutputPaths,
+    timeout: Duration,
+    envs: &[(&str, &str)],
+) -> anyhow::Result<ProcessCapture> {
+    run_process_with_stdin_timeouts_env(
+        argv,
+        stdin_text,
+        stream_output,
+        output_paths,
+        timeout,
+        LOOP_PROCESS_PIPE_DRAIN_TIMEOUT,
+        LOOP_PROCESS_PIPE_DRAIN_TIMEOUT,
+        envs,
+    )
+}
+
 fn run_process_with_stdin_timeouts(
     argv: &[String],
     stdin_text: &str,
@@ -322,6 +342,28 @@ fn run_process_with_stdin_timeouts(
     process_timeout: Duration,
     pipe_drain_timeout: Duration,
     kill_drain_timeout: Duration,
+) -> anyhow::Result<ProcessCapture> {
+    run_process_with_stdin_timeouts_env(
+        argv,
+        stdin_text,
+        stream_output,
+        output_paths,
+        process_timeout,
+        pipe_drain_timeout,
+        kill_drain_timeout,
+        &[],
+    )
+}
+
+fn run_process_with_stdin_timeouts_env(
+    argv: &[String],
+    stdin_text: &str,
+    stream_output: bool,
+    output_paths: ProcessOutputPaths,
+    process_timeout: Duration,
+    pipe_drain_timeout: Duration,
+    kill_drain_timeout: Duration,
+    envs: &[(&str, &str)],
 ) -> anyhow::Result<ProcessCapture> {
     if argv.is_empty() {
         bail!("process argv must not be empty");
@@ -345,6 +387,7 @@ fn run_process_with_stdin_timeouts(
     let mut command = Command::new(&argv[0]);
     command
         .args(&argv[1..])
+        .envs(envs.iter().copied())
         .stdin(Stdio::from(stdin_file))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

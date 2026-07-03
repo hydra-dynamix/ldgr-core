@@ -15,6 +15,8 @@ struct PromptProvenance {
     prompt_hash: Option<String>,
     bundle_slug: Option<String>,
     bundle_hash: Option<String>,
+    thinking_level_intent: Option<String>,
+    advisory_intent: Option<String>,
 }
 
 fn resolve_prompt_source(
@@ -35,6 +37,8 @@ fn resolve_prompt_source(
                 prompt_hash: None,
                 bundle_slug: None,
                 bundle_hash: None,
+                thinking_level_intent: None,
+                advisory_intent: None,
             },
         }),
         LoopPromptSource::StoredPrompt { slug } => {
@@ -54,6 +58,8 @@ fn resolve_prompt_source(
                     prompt_hash: Some(prompt.content_hash),
                     bundle_slug: None,
                     bundle_hash: None,
+                    thinking_level_intent: None,
+                    advisory_intent: None,
                 },
             })
         }
@@ -76,6 +82,8 @@ fn resolve_prompt_source(
                     prompt_hash: Some(version.content_hash),
                     bundle_slug: Some(bundle.slug),
                     bundle_hash: Some(bundle.bundle_hash),
+                    thinking_level_intent: None,
+                    advisory_intent: None,
                 },
             })
         }

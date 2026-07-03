@@ -1,7 +1,12 @@
+pub mod adapter_bundle;
+pub mod adapter_command;
 pub mod adapter_manifest;
+pub mod adapter_profile;
 pub mod adapter_registry;
 pub mod claims;
 pub mod cli;
+pub mod conduct_status;
+pub mod loop_invariants;
 pub mod loop_runtime;
 pub mod manifest_integrity;
 pub mod store;

@@ -75,6 +75,7 @@ pub fn record_decision(
     rationale: &str,
     next_work: Option<NextWorkSpec<'_>>,
 ) -> anyhow::Result<Decision> {
+    enforce_loop_stop_authority(outcome)?;
     in_write_transaction(connection, |connection| {
         let work_item = require_work_item_by_slug(connection, work_slug)?;
         ensure_no_running_runs_for_work_item(connection, &work_item)?;

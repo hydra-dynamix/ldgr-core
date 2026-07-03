@@ -81,12 +81,16 @@ Use `ldgr --help` or `ldgr <command> --help` to explore the command surface.
 ## The autonomous loop
 
 `ldgr loop run` drives an agent through one or more bounded cycles: each cycle
-picks the next pending work item, renders a prompt with the current ledger
-context, pipes it to the configured agent, and records the output as a run
-artifact. Prompts can come from an editable file path, a durable active prompt
-record, or a sealed prompt bundle. Use `--max-iterations N` to run multiple
-cycles; the loop stops early when work is blocked, no pending work remains, or a
-subprocess fails.
+picks the next pending work item, renders prompts with the current ledger
+context, runs the generic planner/worker/scryb/validator role sequence, and
+records prompt/output/report artifacts. Prompts can come from an editable file
+path, a durable active prompt record, or a sealed prompt bundle. Use
+`--max-iterations N` to run multiple cycles; the loop stops early when work is
+blocked, no pending work remains, or a subprocess fails.
+
+See `docs/generic-multi-role-loop.md` for the role model, migration notes from
+the single-agent loop, default artifact/report locations, validator authority
+boundaries, CLI flags, and generic/research examples.
 
 ```sh
 ldgr loop run --prompt prompts/loop-prompt.md --agent agentctl    # use the ldgr-loop agentctl entry from ldgr install
@@ -116,6 +120,23 @@ ldgr bundle seal cleanroom
 
 Loop runs that use stored prompts or bundles write prompt provenance artifacts
 with the exact prompt slug, version, content hash, and bundle hash used.
+
+`ldgr init` seeds editable project prompt files under `.ldgr/prompts/`, and
+`ldgr install` seeds the same defaults under `~/.ldgr/prompts/`. Existing files
+are preserved so local prompt customization does not require recompiling LDGR.
+The compatibility prompt remains `ldgr-core-loop.md`; generic multi-role loop
+contracts are seeded as `ldgr-loop-planner.md`, `ldgr-loop-worker.md`,
+`ldgr-loop-scryb.md`, and `ldgr-loop-validator.md`. Each role prompt reminds
+fresh ephemeral agents to rehydrate only from LDGR context and durable artifacts.
+Use the existing prompt store to version customizations when you want durable
+prompt provenance:
+
+```sh
+ldgr prompt import generic-planner --role planner --path .ldgr/prompts/ldgr-loop-planner.md
+ldgr prompt activate generic-planner
+# after editing the file:
+ldgr prompt update generic-planner --path .ldgr/prompts/ldgr-loop-planner.md
+```
 
 Operator steering outside a run is represented as notices:
 

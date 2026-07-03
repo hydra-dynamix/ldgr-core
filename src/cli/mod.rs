@@ -43,6 +43,7 @@ Adapters:
   adapter install <slug>
   adapter list
   adapter show <slug-or-alias>
+  update                       # update ldgr + entitled adapters
   <adapter-namespace> <args...>    # dynamically dispatched from installed adapter.toml
 
 Default help shows the day-one workflow. Run `ldgr --full` for the core command map.
@@ -96,6 +97,7 @@ pub(crate) const CLI_FULL_HELP_SECTIONS: &str = r#"Core command tree:
     list
     show
     dispatch
+  update
   notice
     list
     add
@@ -142,6 +144,8 @@ enum Command {
     Init,
     /// Install LDGR harness integrations and record ~/.ldgr config.
     Install(InstallArgs),
+    /// Update ldgr and installed adapters within license-year entitlements.
+    Update(UpdateArgs),
     /// Manage durable work items.
     Work(WorkArgs),
     /// Manage global observations and notifications for out-of-run steering.
@@ -278,6 +282,7 @@ fn handle_cli(cli: Cli) -> anyhow::Result<()> {
     match command {
         Command::Init => commands::ops::handle_init(&cli.db, &cli.artifact_root),
         Command::Install(args) => commands::ops::handle_install(args),
+        Command::Update(args) => commands::ops::handle_update(args),
         Command::Work(args) => commands::work::handle_work(&open_store(&cli.db)?, args),
         Command::Notice(args) => commands::work::handle_notice(&open_store(&cli.db)?, args),
         Command::Run(args) => commands::runs::handle_run(&open_store(&cli.db)?, args),
@@ -401,6 +406,14 @@ fn dispatch_adapter_namespace(
     command: &AdapterCommandNamespace,
     request: AdapterNamespaceRequest,
 ) -> anyhow::Result<()> {
+    if request
+        .remaining
+        .iter()
+        .any(|arg| matches!(arg.to_str(), Some("--help" | "-h")))
+    {
+        print_adapter_namespace_help(command);
+        return Ok(());
+    }
     if command.argv.is_empty() {
         bail!("adapter namespace `{}` has empty argv", command.namespace);
     }
@@ -443,9 +456,55 @@ fn print_dynamic_adapter_help() {
                 .map(|text| format!(" — {text}"))
                 .unwrap_or_default();
             println!("    ldgr {} <args...>{}", namespace.namespace, description);
+            if let Some(usage) = &namespace.usage {
+                println!("      usage: {usage}");
+            }
+            print_adapter_namespace_help_groups(namespace, "      ");
         }
         for profile in &adapter.target_profiles {
             println!("    profile {} — {}", profile.slug, profile.title);
+        }
+    }
+}
+
+pub(crate) fn print_adapter_namespace_help(command: &AdapterCommandNamespace) {
+    let title = command.title.as_deref().unwrap_or(&command.namespace);
+    println!("{title}");
+    if let Some(summary) = &command.summary {
+        println!();
+        println!("{summary}");
+    }
+    if let Some(usage) = &command.usage {
+        println!();
+        println!("Usage: {usage}");
+    } else {
+        println!();
+        println!("Usage: ldgr {} <args...>", command.namespace);
+    }
+    if let Some(description) = &command.description {
+        println!();
+        println!("{description}");
+    }
+    if let Some(details) = &command.details {
+        println!();
+        println!("{details}");
+    }
+    print_adapter_namespace_help_groups(command, "");
+    println!();
+    println!(
+        "Core renders this help from installed adapter.toml metadata without executing adapter policy code."
+    );
+}
+
+pub(crate) fn print_adapter_namespace_help_groups(command: &AdapterCommandNamespace, indent: &str) {
+    for group in &command.help_groups {
+        println!();
+        println!("{indent}{}:", group.title);
+        for entry in &group.commands {
+            match &entry.summary {
+                Some(summary) => println!("{indent}  {} — {}", entry.usage, summary),
+                None => println!("{indent}  {}", entry.usage),
+            }
         }
     }
 }

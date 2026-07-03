@@ -11,7 +11,7 @@ function renderWaveManagement(conduct) {
 }
 
 function renderWaveBatches(batches) {
-  if (!batches.length) return '<article class="panel"><p class="muted">No .ldgr/.conduct worker batches found.</p></article>';
+  if (!batches.length) return '<article class="panel"><p class="muted">No conduct adapter status batches found.</p></article>';
   return batches.map(batch => {
     const workers = batch.workers || [];
     const counts = workerCounts(workers);

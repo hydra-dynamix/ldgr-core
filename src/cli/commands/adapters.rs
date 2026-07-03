@@ -19,11 +19,13 @@ pub fn handle_adapter(args: AdapterArgs) -> anyhow::Result<()> {
                 name,
                 source_root: args.source_root,
                 install_root: args.install_root,
+                adapter_version: args.adapter_version,
                 yes: args.yes,
             }),
             None => super::ops::handle_interactive_adapter_install(
                 args.source_root,
                 args.install_root,
+                args.adapter_version,
                 args.yes,
             ),
         },
@@ -109,6 +111,16 @@ pub fn handle_adapter(args: AdapterArgs) -> anyhow::Result<()> {
                     if let Some(description) = &namespace.description {
                         println!("  description: {description}");
                     }
+                    if let Some(summary) = &namespace.summary {
+                        println!("  summary: {summary}");
+                    }
+                    if let Some(usage) = &namespace.usage {
+                        println!("  usage: {usage}");
+                    }
+                    if let Some(details) = &namespace.details {
+                        println!("  details: {details}");
+                    }
+                    super::super::print_adapter_namespace_help_groups(namespace, "  ");
                 }
                 for command in &adapter.commands {
                     print_command(command);
