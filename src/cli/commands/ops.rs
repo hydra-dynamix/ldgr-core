@@ -1462,7 +1462,7 @@ fn install_core_harness_resources() -> anyhow::Result<()> {
         ".ldgr/harness-setup.md",
         "# LDGR harness setup\n\n\
 `ldgr init` installed the Pi project-local extension `.pi/extensions/ldgr-context.ts`.\n\n\
-If your agent harness is Pi, run `/reload` so `/ldgr <args>`, `/ldgr-context`, and `/run-loop` become available. `/ldgr` runs the LDGR CLI in the project and pipes stdout/stderr back into the conversation; with no args it runs `ldgr context --brief`. `/run-loop [adapter] [loop args]` selects an installed adapter loop prompt and runs `ldgr loop run` with Pi as the loop agent.\n\n\
+If your agent harness is Pi, run `/reload` so `/ldgr <args>`, `/ldgr-context`, and `/run-loop` become available. `/ldgr` runs the LDGR CLI in the project and pipes stdout/stderr back into the conversation; with no args it runs `ldgr context --brief`. `/run-loop [adapter] [loop args]` selects an installed adapter loop prompt and runs `ldgr loop run --agent agentctl`.\n\n\
 If your agent harness is not Pi or does not load project-local Pi extensions, point the agent at this document and ask it to adapt the installed extension for its harness. The extension is optional; core `ldgr ...` commands continue to work from the shell.\n",
     )?;
     println!("installed Pi extension .pi/extensions/ldgr-context.ts");

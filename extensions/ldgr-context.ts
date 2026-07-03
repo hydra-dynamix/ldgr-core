@@ -123,7 +123,7 @@ function renderLdgrMessage(args: string[], result: LdgrResult): string {
 
 export default function ldgrContext(pi: ExtensionAPI) {
   pi.registerCommand("run-loop", {
-    description: "Detect the active LDGR adapter and run its loop with Pi as the loop agent.",
+    description: "Detect the active LDGR adapter and run its loop through agentctl.",
     handler: async (argsText, ctx) => {
       try {
         const tokens = parseArgs(argsText.trim());
@@ -166,8 +166,8 @@ export default function ldgrContext(pi: ExtensionAPI) {
           "run",
           "--prompt",
           loopPromptPath(selected),
-          "--agent-argv",
-          JSON.stringify(["pi", "-p", "--approve", "--no-session"]),
+          "--agent",
+          "agentctl",
           "--stream-agent-output",
           ...tokens,
         ];
