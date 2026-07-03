@@ -321,6 +321,8 @@ fn run_process_with_stdin_env(
     output_paths: ProcessOutputPaths,
     timeout: Duration,
     envs: &[(&str, &str)],
+    heartbeat: Option<Duration>,
+    progress_label: Option<String>,
 ) -> anyhow::Result<ProcessCapture> {
     run_process_with_stdin_timeouts_env(
         argv,
@@ -331,6 +333,8 @@ fn run_process_with_stdin_env(
         LOOP_PROCESS_PIPE_DRAIN_TIMEOUT,
         LOOP_PROCESS_PIPE_DRAIN_TIMEOUT,
         envs,
+        heartbeat,
+        progress_label,
     )
 }
 
@@ -352,6 +356,8 @@ fn run_process_with_stdin_timeouts(
         pipe_drain_timeout,
         kill_drain_timeout,
         &[],
+        None,
+        None,
     )
 }
 
@@ -364,6 +370,8 @@ fn run_process_with_stdin_timeouts_env(
     pipe_drain_timeout: Duration,
     kill_drain_timeout: Duration,
     envs: &[(&str, &str)],
+    heartbeat: Option<Duration>,
+    progress_label: Option<String>,
 ) -> anyhow::Result<ProcessCapture> {
     if argv.is_empty() {
         bail!("process argv must not be empty");
@@ -417,8 +425,14 @@ fn run_process_with_stdin_timeouts_env(
         "stderr",
         output_paths.stderr.clone(),
     );
-    let status_result =
-        wait_child_with_timeout(&mut child, &process_tree, process_timeout, &command_text);
+    let status_result = wait_child_with_timeout(
+        &mut child,
+        &process_tree,
+        process_timeout,
+        &command_text,
+        heartbeat,
+        progress_label.as_deref(),
+    );
     let (stdout, stderr) = collect_process_streams(
         &stdout_reader,
         &stderr_reader,
@@ -492,8 +506,11 @@ fn wait_child_with_timeout(
     process_tree: &ProcessTree,
     timeout: Duration,
     command: &str,
+    heartbeat: Option<Duration>,
+    progress_label: Option<&str>,
 ) -> anyhow::Result<std::process::ExitStatus> {
     let started = Instant::now();
+    let mut last_heartbeat = started;
     loop {
         if let Some(status) = child
             .try_wait()
@@ -507,6 +524,16 @@ fn wait_child_with_timeout(
                 "process `{command}` timed out after {} seconds",
                 timeout.as_secs()
             );
+        }
+        if let Some(interval) = heartbeat {
+            if !interval.is_zero() && last_heartbeat.elapsed() >= interval {
+                let label = progress_label.unwrap_or(command);
+                eprintln!(
+                    "[ldgr loop] heartbeat {label}: subprocess still running after {}s",
+                    started.elapsed().as_secs()
+                );
+                last_heartbeat = Instant::now();
+            }
         }
         thread::sleep(Duration::from_millis(50));
     }

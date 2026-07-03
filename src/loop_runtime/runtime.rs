@@ -1,3 +1,56 @@
+fn live_progress(options: &LoopRuntimeOptions, message: impl AsRef<str>) {
+    if options.live_progress {
+        eprintln!("[ldgr loop] {}", message.as_ref());
+    }
+}
+
+fn live_progress_phase(options: &LoopRuntimeOptions, run_id: i64, phase: &str, report: &str) {
+    live_progress(options, format!("run={run_id} phase={phase}: {report}"));
+}
+
+fn live_progress_artifact(options: &LoopRuntimeOptions, run_id: i64, path: &Path, description: &str) {
+    live_progress(
+        options,
+        format!(
+            "run={run_id} artifact={}: {description}",
+            path.display()
+        ),
+    );
+}
+
+fn live_progress_latest_context(
+    connection: &Connection,
+    options: &LoopRuntimeOptions,
+    run_id: i64,
+) -> anyhow::Result<()> {
+    if !options.live_progress {
+        return Ok(());
+    }
+    let context = read_context(connection)?;
+    if let Some(observation) = context.latest_observations.first() {
+        live_progress(
+            options,
+            format!(
+                "run={run_id} latest_observation={} work={}: {}",
+                observation.observation_id, observation.work_slug, observation.body
+            ),
+        );
+    }
+    if let Some(decision) = context.latest_decision {
+        live_progress(
+            options,
+            format!(
+                "run={run_id} latest_decision={} work={} outcome={}: {}",
+                decision.decision_id,
+                decision.work_slug,
+                decision.outcome.as_str(),
+                decision.rationale
+            ),
+        );
+    }
+    Ok(())
+}
+
 pub fn run_loop_once(
     connection: &Connection,
     artifact_root: &Path,
@@ -24,12 +77,16 @@ pub fn run_loop_once(
     };
     let work_item = claimed.work_item;
     let run = claimed.run;
-    record_run_phase(
-        connection,
-        run.id,
-        "started",
-        &format!("Started bounded loop session for {}.", work_item.slug),
-    )?;
+    live_progress(
+        options,
+        format!(
+            "start run={} work={} title={} command={}",
+            run.id, work_item.slug, work_item.title, command_text
+        ),
+    );
+    let started_report = format!("Started bounded loop session for {}.", work_item.slug);
+    record_run_phase(connection, run.id, "started", &started_report)?;
+    live_progress_phase(options, run.id, "started", &started_report);
 
     for intervention in &steering_interventions {
         apply_loop_intervention(connection, intervention.id, Some(run.id))?;
@@ -72,19 +129,12 @@ fn run_loop_after_start(
     steering_interventions: &[LoopIntervention],
 ) -> anyhow::Result<LoopRuntimeResult> {
     let work_slug = work_item.slug.as_str();
-    record_run_phase(
-        connection,
-        run_id,
-        "rendering_prompt",
-        &format!("Rendering loop prompt for {work_slug}."),
-    )?;
+    let rendering_report = format!("Rendering loop prompt for {work_slug}.");
+    record_run_phase(connection, run_id, "rendering_prompt", &rendering_report)?;
+    live_progress_phase(options, run_id, "rendering_prompt", &rendering_report);
     let resolved_prompt = resolve_prompt_source(connection, &options.prompt)?;
-    record_run_phase(
-        connection,
-        run_id,
-        "prompt_source",
-        &resolved_prompt.description,
-    )?;
+    record_run_phase(connection, run_id, "prompt_source", &resolved_prompt.description)?;
+    live_progress_phase(options, run_id, "prompt_source", &resolved_prompt.description);
     let template = resolved_prompt.template.clone();
     let context = read_context(connection)?;
     let status = brief_context(
@@ -131,6 +181,12 @@ fn run_loop_after_start(
         &prompt_artifact_path,
         "Rendered autonomous loop prompt with rehydrated LDGR context.",
     )?;
+    live_progress_artifact(
+        options,
+        run_id,
+        &prompt_artifact_path,
+        "Rendered autonomous loop prompt with rehydrated LDGR context.",
+    );
     let provenance_path = artifact_root.join(format!("loop-run-{run_id}-prompt-provenance.json"));
     fs::write(
         &provenance_path,
@@ -150,6 +206,12 @@ fn run_loop_after_start(
         &provenance_path,
         "Exact prompt source/version/hash provenance for this loop run.",
     )?;
+    live_progress_artifact(
+        options,
+        run_id,
+        &provenance_path,
+        "Exact prompt source/version/hash provenance for this loop run.",
+    );
 
     let mut audit_artifact_path = None;
     let mut audit_exit_code = None;
@@ -335,12 +397,10 @@ fn run_role_sequence(
     let mut results = Vec::new();
     for role in LOOP_ROLES {
         let resolved_prompt = resolve_role_prompt_source(connection, &options.prompt, base_prompt, role)?;
-        record_run_phase(
-            connection,
-            run_id,
-            &format!("rendering_{role}_prompt"),
-            &format!("Rendering {role} role prompt for {}.", work_item.slug),
-        )?;
+        let render_role_report = format!("Rendering {role} role prompt for {}.", work_item.slug);
+        let render_role_phase = format!("rendering_{role}_prompt");
+        record_run_phase(connection, run_id, &render_role_phase, &render_role_report)?;
+        live_progress_phase(options, run_id, &render_role_phase, &render_role_report);
         let role_context = read_context(connection)?;
         let role_status = brief_context(
             &role_context,
@@ -399,12 +459,10 @@ fn run_role_sequence(
             &format!("Exact {role} role prompt source/version/hash provenance for this loop run."),
         )?;
 
-        record_run_phase(
-            connection,
-            run_id,
-            &format!("running_{role}_agent"),
-            &format!("Running fresh {role} agent command for {}.", work_item.slug),
-        )?;
+        let running_role_report = format!("Running fresh {role} agent command for {}.", work_item.slug);
+        let running_role_phase = format!("running_{role}_agent");
+        record_run_phase(connection, run_id, &running_role_phase, &running_role_report)?;
+        live_progress_phase(options, run_id, &running_role_phase, &running_role_report);
         let mut agent = run_role_agent(
             artifact_root,
             options,
@@ -436,25 +494,25 @@ fn run_role_sequence(
                 output_path.display()
             )
         })?;
+        let output_description = format!("Fresh {role} agent stdout/stderr capture.");
         add_artifact(
             connection,
             artifact_root,
             run_id,
             ArtifactKind::Report,
             &output_path,
-            &format!("Fresh {role} agent stdout/stderr capture."),
+            &output_description,
         )?;
+        live_progress_artifact(options, run_id, &output_path, &output_description);
         let exit_code = agent.exit_code;
-        add_observation(
-            connection,
-            run_id,
-            &format!(
-                "Generic loop {role} role completed for assigned work item {} with exit_code {:?}; output artifact: {}.",
-                work_item.slug,
-                exit_code,
-                output_path.display()
-            ),
-        )?;
+        let observation = format!(
+            "Generic loop {role} role completed for assigned work item {} with exit_code {:?}; output artifact: {}.",
+            work_item.slug,
+            exit_code,
+            output_path.display()
+        );
+        add_observation(connection, run_id, &observation)?;
+        live_progress(options, format!("run={run_id} observation: {observation}"));
         write_compat_agent_output_artifact(
             connection,
             artifact_root,
@@ -477,6 +535,7 @@ fn run_role_sequence(
             write_validator_advisory(connection, artifact_root, work_item, run_id, results.last().unwrap())?;
             execute_validator_revision_gate(connection, artifact_root, work_item, run_id, &agent)?;
         }
+        live_progress_latest_context(connection, options, run_id)?;
         if get_run(connection, run_id)?.status != RunStatus::Running {
             break;
         }
@@ -1144,6 +1203,8 @@ fn run_role_agent(
             process_output_paths(artifact_root, run_id, &format!("{role}-agent"))?,
             options.agent_timeout,
             &role_env,
+            options.live_progress.then_some(options.progress_heartbeat),
+            Some(format!("run={run_id} work={work_slug} role={role}")),
         ),
         LoopAgent::Agentctl => {
             let argv = default_agentctl_argv();
@@ -1154,6 +1215,8 @@ fn run_role_agent(
                 process_output_paths(artifact_root, run_id, &format!("{role}-agent"))?,
                 options.agent_timeout,
                 &role_env,
+                options.live_progress.then_some(options.progress_heartbeat),
+                Some(format!("run={run_id} work={work_slug} role={role}")),
             )
         }
     }

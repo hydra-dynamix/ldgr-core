@@ -35,6 +35,8 @@ pub struct LoopRuntimeOptions {
     pub project_complete_requested: bool,
     pub dry_run: bool,
     pub stream_agent_output: bool,
+    pub live_progress: bool,
+    pub progress_heartbeat: Duration,
     pub agent_timeout: Duration,
 }
 

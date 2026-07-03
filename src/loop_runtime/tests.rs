@@ -37,6 +37,8 @@ mod tests {
             project_complete_requested: false,
             dry_run,
             stream_agent_output: false,
+            live_progress: false,
+            progress_heartbeat: Duration::from_secs(0),
             agent_timeout: DEFAULT_LOOP_PROCESS_TIMEOUT,
         }
     }

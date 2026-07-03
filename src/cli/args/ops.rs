@@ -215,6 +215,14 @@ pub struct LoopRunArgs {
     #[arg(long)]
     pub stream_agent_output: bool,
 
+    /// Disable operator-visible loop progress lines while the loop runtime is active.
+    #[arg(long)]
+    pub no_live_progress: bool,
+
+    /// Seconds between quiet-subprocess heartbeat lines. Zero disables periodic heartbeats but keeps phase/artifact progress.
+    #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64))]
+    pub progress_heartbeat_seconds: u64,
+
     /// Maximum seconds to wait for each spawned agent process. Zero disables the wall-clock timeout.
     #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u64))]
     pub agent_timeout_seconds: u64,

@@ -2713,6 +2713,158 @@ fn autonomous_loop_runtime_streams_agent_output_only_when_requested() -> anyhow:
 }
 
 #[test]
+fn autonomous_loop_runtime_live_progress_can_be_disabled() -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    let db_path = project.path().join(".ldgr/ldgr.db");
+    let artifact_root = project.path().join(".ldgr/artifacts");
+    let prompt_path = project.path().join("loop-prompt.md");
+    let agent_path = project.path().join("agent.sh");
+    fs::write(&prompt_path, "{{ldgr_context}}")?;
+    fs::write(&agent_path, "#!/bin/sh\ncat >/dev/null\nprintf done\n")?;
+    let agent_argv = serde_json::to_string(&vec!["sh", agent_path.to_str().unwrap()])?;
+
+    run(project.path(), &db_path, &artifact_root, ["init"])?;
+    run(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        [
+            "work",
+            "create",
+            "live-progress",
+            "--title",
+            "Live progress",
+            "--description",
+            "Verify progress output.",
+        ],
+    )?;
+
+    command(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        [
+            "loop",
+            "run",
+            "--prompt",
+            "loop-prompt.md",
+            "--agent-argv",
+            agent_argv.as_str(),
+        ],
+    )?
+    .assert()
+    .success()
+    .stderr(
+        predicate::str::contains("[ldgr loop] start run=1 work=live-progress")
+            .and(predicate::str::contains("phase=running_planner_agent"))
+            .and(predicate::str::contains(
+                "loop-run-1-planner-agent-output.md",
+            )),
+    );
+
+    let project = TempDir::new()?;
+    let db_path = project.path().join(".ldgr/ldgr.db");
+    let artifact_root = project.path().join(".ldgr/artifacts");
+    fs::write(project.path().join("loop-prompt.md"), "{{ldgr_context}}")?;
+    fs::write(
+        project.path().join("agent.sh"),
+        "#!/bin/sh\ncat >/dev/null\nprintf done\n",
+    )?;
+    let agent_argv = serde_json::to_string(&vec![
+        "sh",
+        project.path().join("agent.sh").to_str().unwrap(),
+    ])?;
+    run(project.path(), &db_path, &artifact_root, ["init"])?;
+    run(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        [
+            "work",
+            "create",
+            "quiet-progress",
+            "--title",
+            "Quiet progress",
+            "--description",
+            "Verify disabled progress output.",
+        ],
+    )?;
+    command(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        [
+            "loop",
+            "run",
+            "--prompt",
+            "loop-prompt.md",
+            "--agent-argv",
+            agent_argv.as_str(),
+            "--no-live-progress",
+        ],
+    )?
+    .assert()
+    .success()
+    .stderr(predicate::str::contains("[ldgr loop]").not());
+
+    Ok(())
+}
+
+#[test]
+fn autonomous_loop_runtime_heartbeats_during_quiet_subprocess() -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    let db_path = project.path().join(".ldgr/ldgr.db");
+    let artifact_root = project.path().join(".ldgr/artifacts");
+    fs::write(project.path().join("loop-prompt.md"), "{{ldgr_context}}")?;
+    let agent_path = project.path().join("agent.sh");
+    fs::write(
+        &agent_path,
+        "#!/bin/sh\ncat >/dev/null\nsleep 2\nprintf 'BUFFERED_CHILD_OUTPUT\\n'\nif [ \"$LDGR_LOOP_ROLE\" = planner ]; then exit 7; fi\n",
+    )?;
+    let agent_argv = serde_json::to_string(&vec!["sh", agent_path.to_str().unwrap()])?;
+    run(project.path(), &db_path, &artifact_root, ["init"])?;
+    run(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        [
+            "work",
+            "create",
+            "quiet-child",
+            "--title",
+            "Quiet child",
+            "--description",
+            "Verify heartbeat output during buffered or quiet harness execution.",
+        ],
+    )?;
+
+    command(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        [
+            "loop",
+            "run",
+            "--prompt",
+            "loop-prompt.md",
+            "--agent-argv",
+            agent_argv.as_str(),
+            "--progress-heartbeat-seconds",
+            "1",
+            "--stream-agent-output",
+        ],
+    )?
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("BUFFERED_CHILD_OUTPUT"))
+    .stderr(predicate::str::contains(
+        "heartbeat run=1 work=quiet-child role=planner: subprocess still running",
+    ));
+
+    Ok(())
+}
+
+#[test]
 fn autonomous_loop_runtime_preserves_full_output_in_files() -> anyhow::Result<()> {
     let project = TempDir::new()?;
     let db_path = project.path().join(".ldgr/ldgr.db");
@@ -3042,7 +3194,19 @@ fi
     .stdout(predicate::str::contains("loop run=2 work=second-loop"))
     .stdout(predicate::str::contains(
         "Loop stopped after 2 iteration(s); no pending work items remain.",
-    ));
+    ))
+    .stderr(
+        predicate::str::contains("[ldgr loop] start run=1 work=first-loop")
+            .and(predicate::str::contains(
+                "[ldgr loop] start run=2 work=second-loop",
+            ))
+            .and(predicate::str::contains(
+                "latest_decision=1 work=first-loop outcome=continue",
+            ))
+            .and(predicate::str::contains(
+                "latest_decision=2 work=second-loop outcome=stop",
+            )),
+    );
 
     command(project.path(), &db_path, &artifact_root, ["work", "list"])?
         .assert()

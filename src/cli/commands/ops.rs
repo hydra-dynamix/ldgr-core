@@ -2272,6 +2272,8 @@ pub fn handle_loop(
                 project_complete_requested: args.project_complete_requested,
                 dry_run: args.dry_run,
                 stream_agent_output: args.stream_agent_output,
+                live_progress: !args.no_live_progress,
+                progress_heartbeat: Duration::from_secs(args.progress_heartbeat_seconds),
                 agent_timeout: Duration::from_secs(args.agent_timeout_seconds),
             };
             let mut completed_iterations = 0_u32;
