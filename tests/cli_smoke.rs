@@ -1452,6 +1452,9 @@ fn context_brief_prints_agent_on_ramp_without_full_cockpit_noise() -> anyhow::Re
     .stdout(predicate::str::contains(
         "handoff: active_run=true next_work=false needs_decision=true",
     ))
+    .stdout(predicate::str::contains(
+        "signoff: complete the active run with `ldgr run close ...` before signing off",
+    ))
     .stdout(predicate::str::contains("next_commands:"))
     .stdout(predicate::str::contains(
         "ldgr observe brief-next --body <evidence>",

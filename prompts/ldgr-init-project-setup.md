@@ -45,6 +45,7 @@ Keep the summary short. It should reduce ambiguity, not become a second planning
 - Record observations only when something durable changed or was learned.
 - Add artifacts for durable files or evidence the next run should inspect; use `ldgr artifact show` to verify the record.
 - Close the active run with `ldgr run close` once the bounded work is complete; it records the terminal run status and decision together.
+- Before signing off or returning a final answer, complete/close the active run unless you are explicitly handing off unfinished work and have recorded that handoff.
 - Include the next work item in that close command if one is known.
 
 ### 4. Queue only the next useful slice
@@ -78,7 +79,7 @@ Create a prompt file or LDGR artifact for future autonomous runs. It should inst
 - complete only that work item;
 - record observations, artifacts, and decisions;
 - queue follow-up work only when new scope is found;
-- finish the LDGR run with an accurate status;
+- finish the LDGR run with an accurate status before signing off;
 - report the next pending work item.
 
 ### 7. Validate the on-ramp

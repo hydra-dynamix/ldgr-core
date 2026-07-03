@@ -415,6 +415,11 @@ fn print_handoff(handoff: &BriefHandoff) {
         "handoff: active_run={} next_work={} needs_decision={}",
         handoff.has_active_run, handoff.has_next_work, handoff.needs_decision
     );
+    if handoff.has_active_run {
+        println!(
+            "signoff: complete the active run with `ldgr run close ...` before signing off unless you are explicitly handing off unfinished work"
+        );
+    }
 }
 
 fn print_active_runs(active_runs: &[BriefActiveRun]) {
