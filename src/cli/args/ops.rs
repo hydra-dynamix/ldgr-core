@@ -122,7 +122,7 @@ pub struct WebArgs {
 
 #[derive(Debug, Args)]
 #[command(
-    after_help = "Examples:\n  ldgr loop run --prompt prompts/loop-prompt.md --agent agentctl\n  ldgr loop run --prompt prompts/loop-prompt.md --dry-run\n  ldgr loop run --prompt prompts/loop-prompt.md --agent-argv '[\"my-agent\"]'\n\nLoop run executes one or more bounded cycles from the next pending work item."
+    after_help = "Examples:\n  ldgr loop run --prompt prompts/loop-prompt.md --agent agentctl\n  ldgr loop run --prompt prompts/loop-prompt.md --agent agentctl --until-empty\n  ldgr loop run --prompt prompts/loop-prompt.md --dry-run\n  ldgr loop run --prompt prompts/loop-prompt.md --agent-argv '[\"my-agent\"]'\n\nLoop run executes bounded cycles from pending work items. Each cycle is a fresh agent invocation that rehydrates from LDGR context. Use --until-empty to keep launching one fresh cycle at a time until no pending work remains or the loop blocks."
 )]
 pub struct LoopArgs {
     #[command(subcommand)]
@@ -181,9 +181,13 @@ pub struct LoopRunArgs {
     #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u64))]
     pub agent_timeout_seconds: u64,
 
-    /// Maximum number of loop sessions to run before returning.
+    /// Maximum number of loop sessions to run before returning. Ignored when --until-empty is set.
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
     pub max_iterations: u32,
+
+    /// Keep launching fresh single-agent loop cycles until no pending work remains or the loop blocks.
+    #[arg(long)]
+    pub until_empty: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]

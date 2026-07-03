@@ -1406,20 +1406,28 @@ pub fn handle_loop(
                 agent_timeout: Duration::from_secs(args.agent_timeout_seconds),
             };
             let mut completed_iterations = 0_u32;
-            for iteration in 1..=args.max_iterations {
+            let max_iterations = if args.until_empty {
+                u32::MAX
+            } else {
+                args.max_iterations
+            };
+            for iteration in 1..=max_iterations {
                 match run_loop_once(connection, artifact_root, &options)? {
                     LoopRuntimeOutcome::Completed(result) => {
                         print_loop_result(&result);
                         completed_iterations += 1;
                         if loop_result_failed(&result, &options) {
-                            if args.max_iterations > 1 {
+                            if args.until_empty || args.max_iterations > 1 {
                                 println!(
                                     "Loop stopped after {completed_iterations} iteration(s) because a subprocess failed."
                                 );
                             }
                             break;
                         }
-                        if iteration == args.max_iterations && args.max_iterations > 1 {
+                        if !args.until_empty
+                            && iteration == args.max_iterations
+                            && args.max_iterations > 1
+                        {
                             println!(
                                 "Loop stopped after reaching max_iterations={}.",
                                 args.max_iterations
@@ -1440,7 +1448,7 @@ pub fn handle_loop(
                         if completed_iterations == 0 {
                             bail!("No pending work items remain; add a next work item or record a stop decision only when the project is complete.");
                         }
-                        if args.max_iterations > 1 {
+                        if args.until_empty || args.max_iterations > 1 {
                             println!(
                                 "Loop stopped after {completed_iterations} iteration(s); no pending work items remain."
                             );
@@ -1462,7 +1470,7 @@ fn install_core_harness_resources() -> anyhow::Result<()> {
         ".ldgr/harness-setup.md",
         "# LDGR harness setup\n\n\
 `ldgr init` installed the Pi project-local extension `.pi/extensions/ldgr-context.ts`.\n\n\
-If your agent harness is Pi, run `/reload` so `/ldgr <args>`, `/ldgr-context`, and `/run-loop` become available. `/ldgr` runs the LDGR CLI in the project and pipes stdout/stderr back into the conversation; with no args it runs `ldgr context --brief`. `/run-loop [adapter] [loop args]` selects an installed adapter loop prompt and runs `ldgr loop run --agent agentctl`.\n\n\
+If your agent harness is Pi, run `/reload` so `/ldgr <args>`, `/ldgr-context`, and `/run-loop` become available. `/ldgr` runs the LDGR CLI in the project and pipes stdout/stderr back into the conversation; with no args it runs `ldgr context --brief`. `/run-loop [adapter] [loop args]` selects an installed adapter loop prompt and runs `ldgr loop run --agent agentctl --until-empty`, launching one fresh agent per LDGR work item until no pending work remains or the loop blocks.\n\n\
 If your agent harness is not Pi or does not load project-local Pi extensions, point the agent at this document and ask it to adapt the installed extension for its harness. The extension is optional; core `ldgr ...` commands continue to work from the shell.\n",
     )?;
     println!("installed Pi extension .pi/extensions/ldgr-context.ts");
