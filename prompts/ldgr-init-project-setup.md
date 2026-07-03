@@ -77,7 +77,10 @@ Create a prompt file or LDGR artifact for future autonomous runs. It should inst
 - take exactly one pending work item;
 - start one LDGR run;
 - complete only that work item;
-- record observations, artifacts, and decisions;
+- produce a compact machine-summarizable run record for routine cycles (for example `run_summary.json` with objective/hypothesis, changed files/surfaces, commands, metrics, outcome, artifact refs, and next work);
+- avoid duplicating the same evidence in observations, docs, decisions, and final prose;
+- reserve long narrative reports for promotion points such as claim changes, surprising failures, external-validity shifts, or milestone synthesis;
+- record observations, artifacts, and decisions only where they add durable continuity;
 - queue follow-up work only when new scope is found;
 - finish the LDGR run with an accurate status before signing off;
 - report the next pending work item.
