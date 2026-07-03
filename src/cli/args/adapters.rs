@@ -1,6 +1,6 @@
 use clap::{Args, Subcommand};
 
-const ADAPTER_HELP: &str = "Examples:\n  ldgr adapter install list\n  ldgr adapter install conduct\n  ldgr adapter list\n  ldgr adapter show conduct\n  ldgr conduct --help\n  ldgr adapter dispatch conduct-batch-status\n\nAdapters are installed under ~/.ldgr/<adapter>/adapter.toml. Core dynamically dispatches installed adapter namespaces declared by adapter.toml.";
+const ADAPTER_HELP: &str = "Examples:\n  ldgr adapter install\n  ldgr adapter install list\n  ldgr adapter install conduct\n  ldgr adapter list\n  ldgr adapter show conduct\n  ldgr conduct --help\n  ldgr adapter dispatch conduct-batch-status\n\nAdapters are installed under ~/.ldgr/<adapter>/adapter.toml. Core dynamically dispatches installed adapter namespaces declared by adapter.toml.";
 
 #[derive(Debug, Args)]
 #[command(after_help = ADAPTER_HELP)]
@@ -23,8 +23,8 @@ pub enum AdapterCommand {
 
 #[derive(Debug, Args)]
 pub struct AdapterInstallArgs {
-    /// Adapter slug to install, or `list` to show available adapters.
-    pub name: String,
+    /// Adapter slug to install, `list` to show available adapters, or omit for the selection menu.
+    pub name: Option<String>,
 
     /// Source checkout root containing adapter crates. Optional override for local source installs.
     #[arg(long)]

@@ -63,6 +63,22 @@ fn adapter_focused_help_keeps_adapter_discovery_blocks() -> anyhow::Result<()> {
 }
 
 #[test]
+fn adapter_install_without_name_shows_selection_fallback_not_help() -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    let mut command = isolated_command(project.path())?;
+    command.args(["adapter", "install"]);
+    command.assert().success().stdout(
+        predicate::str::contains("Available adapters:")
+            .and(predicate::str::contains("ldgr adapter install conduct"))
+            .and(predicate::str::contains(
+                "Run `ldgr adapter install <adapter>`",
+            ))
+            .and(predicate::str::contains("Usage: ldgr adapter install").not()),
+    );
+    Ok(())
+}
+
+#[test]
 fn full_help_shows_core_command_tree_and_research_split() -> anyhow::Result<()> {
     let project = TempDir::new()?;
     let mut command = isolated_command(project.path())?;

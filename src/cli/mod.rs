@@ -38,6 +38,7 @@ Autonomous loop:
   loop run --prompt prompts/loop-prompt.md --agent agentctl
 
 Adapters:
+  adapter install              # selection menu
   adapter install list
   adapter install <slug>
   adapter list

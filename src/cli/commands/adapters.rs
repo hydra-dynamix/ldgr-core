@@ -10,18 +10,23 @@ pub fn handle_adapter(args: AdapterArgs) -> anyhow::Result<()> {
     let registry = AdapterRegistry::discover();
     print_warnings(&registry);
     match args.command {
-        AdapterCommand::Install(args) => {
-            if args.name == "list" {
+        AdapterCommand::Install(args) => match args.name {
+            Some(name) if name == "list" => {
                 super::ops::print_available_adapter_catalog();
-                return Ok(());
+                Ok(())
             }
-            super::ops::handle_install_adapter(&CoreInstallAdapterArgs {
-                name: args.name,
+            Some(name) => super::ops::handle_install_adapter(&CoreInstallAdapterArgs {
+                name,
                 source_root: args.source_root,
                 install_root: args.install_root,
                 yes: args.yes,
-            })
-        }
+            }),
+            None => super::ops::handle_interactive_adapter_install(
+                args.source_root,
+                args.install_root,
+                args.yes,
+            ),
+        },
         AdapterCommand::List(args) => {
             if args.json {
                 println!("{}", serde_json::to_string_pretty(&registry)?);

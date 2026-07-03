@@ -132,6 +132,35 @@ pub fn handle_install(args: InstallArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+pub(crate) fn handle_interactive_adapter_install(
+    source_root: Option<PathBuf>,
+    install_root: Option<PathBuf>,
+    yes: bool,
+) -> anyhow::Result<()> {
+    if yes || !stdin_is_terminal() {
+        print_available_adapter_catalog();
+        println!("\nRun `ldgr adapter install <adapter>` to install one adapter, or run `ldgr adapter install` in an interactive terminal for the selection menu.");
+        return Ok(());
+    }
+    if install_root.is_some() {
+        bail!("--install-root requires an adapter name; run `ldgr adapter install <adapter> --install-root <path>`");
+    }
+    let adapters = select_adapter_bundles()?;
+    if adapters.is_empty() {
+        println!("No adapter selected.");
+        return Ok(());
+    }
+    for adapter in adapters {
+        handle_install_adapter(&InstallAdapterArgs {
+            name: adapter,
+            source_root: source_root.clone(),
+            install_root: None,
+            yes,
+        })?;
+    }
+    Ok(())
+}
+
 pub(crate) fn handle_install_adapter(args: &InstallAdapterArgs) -> anyhow::Result<()> {
     let adapter = resolve_adapter_install_name(&args.name, args.yes)?;
     let Some(entry) = available_adapter_catalog()
@@ -866,6 +895,10 @@ fn select_adapters(args: &InstallArgs) -> anyhow::Result<Vec<String>> {
     if args.yes || !stdin_is_terminal() {
         return Ok(Vec::new());
     }
+    select_adapter_bundles()
+}
+
+fn select_adapter_bundles() -> anyhow::Result<Vec<String>> {
     let entries = available_adapter_catalog();
     let items = entries
         .iter()
