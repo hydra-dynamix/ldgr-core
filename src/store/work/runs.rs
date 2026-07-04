@@ -110,6 +110,7 @@ pub fn finish_run(
     if status == RunStatus::Running {
         bail!("run finish requires a terminal status");
     }
+    enforce_role_run_closure_authority(run_id)?;
     let run = get_run_by_id(connection, run_id)?;
     if run.status != RunStatus::Running {
         bail!("run {run_id} is already {}", run.status);
@@ -154,6 +155,7 @@ pub fn close_run(
     if status == RunStatus::Running {
         bail!("run close requires a terminal status");
     }
+    enforce_role_run_closure_authority(run_id)?;
     enforce_loop_stop_authority(outcome)?;
     in_write_transaction(connection, |connection| {
         let run = get_run_by_id(connection, run_id)?;
@@ -192,13 +194,54 @@ fn enforce_loop_stop_authority(outcome: DecisionOutcome) -> anyhow::Result<()> {
     if std::env::var("LDGR_LOOP_STOP_AUTHORITY").ok().as_deref() != Some("planner") {
         return Ok(());
     }
+    // The final role authorized to close the run (validator) also holds stop
+    // authority, since it records the authoritative cycle decision after the
+    // full role sequence. Earlier roles may only recommend stopping via
+    // observations; the validator acts on those recommendations.
+    if std::env::var("LDGR_LOOP_MAY_CLOSE_RUN").ok().as_deref() == Some("1") {
+        return Ok(());
+    }
     let role = std::env::var("LDGR_LOOP_ROLE").unwrap_or_else(|_| "unknown".to_owned());
     if role == "planner" {
         return Ok(());
     }
     bail!(
-        "loop stop decisions require planner authority; role {role} may record recommendations but cannot close with outcome stop"
+        "loop stop decisions require planner or validator authority; role {role} may record recommendations but cannot close with outcome stop"
     )
+}
+
+/// Within a generic multi-role loop sequence, only the final role (validator)
+/// may close the assigned run with the cycle decision. The loop runtime sets
+/// `LDGR_LOOP_MAY_CLOSE_RUN=1` only for the final role subprocess so it can
+/// record the continue/stop decision after reviewing the full cycle. Earlier
+/// roles (planner/worker/scryb) are blocked from closing the run so the
+/// sequence completes and the worker actually executes.
+///
+/// The guard is a no-op in the loop runtime's own process because the runtime
+/// sets `LDGR_LOOP_ROLE` only on spawned role subprocesses, never on itself, so
+/// its own `close_run`/`finish_run` calls (including the validator revision
+/// gate) are unaffected.
+fn enforce_role_run_closure_authority(run_id: i64) -> anyhow::Result<()> {
+    let role = match std::env::var("LDGR_LOOP_ROLE") {
+        Ok(role) => role,
+        Err(_) => return Ok(()),
+    };
+    // The final role is explicitly authorized to close the assigned run.
+    if std::env::var("LDGR_LOOP_MAY_CLOSE_RUN").ok().as_deref() == Some("1") {
+        return Ok(());
+    }
+    // Only block closure of the assigned run; closures of unrelated runs
+    // (which should not occur from a role) are left to other invariants.
+    if let Ok(assigned) = std::env::var("LDGR_LOOP_ASSIGNED_RUN_ID") {
+        if let Ok(assigned_id) = assigned.parse::<i64>() {
+            if assigned_id == run_id {
+                bail!(
+                    "role {role} may not close run {run_id}; only the final role (validator) closes the run after the full sequence completes. Record observations/artifacts and let the validator close the run. To recommend stopping the loop, record a notice or observation instead of closing the run."
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 pub fn restore_work_item_pending_after_dry_run(

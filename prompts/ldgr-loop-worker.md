@@ -14,10 +14,10 @@ Role contract:
 - Record important evidence with LDGR observations and artifacts when appropriate, including changed surfaces, validation commands, results, and any limitations.
 - Run practical validation before claiming success; document failures honestly with `ldgr validation record` when useful.
 - Queue concrete follow-up LDGR work for discovered gaps that are outside this bounded item, or record follow-up recommendations as observations when queuing is not yet warranted.
-- Do not close the broader loop with `--outcome stop`; if no valuable branches appear to remain, record that as a recommendation for the planner.
+- Do not close the run with `ldgr run close`; the loop runtime owns run closure across the full role sequence. If no valuable branches appear to remain, record that as a recommendation for the planner.
 - Do not claim whole-project completion unless explicitly requested and independently validated.
 
-If core state needs correction, use `ldgr work edit`, `ldgr work status set`, `ldgr notice edit`, or `ldgr artifact show`. Run `<command> --help` before using an unfamiliar command shape.
+If core state needs correction, use `ldgr work edit`, `ldgr work status set`, `ldgr notice edit`, or `ldgr artifact show`. Do NOT call `ldgr run close` or `ldgr run finish`; the loop runtime owns run closure across the full role sequence. Run `<command> --help` before using an unfamiliar command shape.
 
 ## LDGR status
 

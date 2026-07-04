@@ -1183,11 +1183,15 @@ fn run_role_agent(
     rendered_prompt: &str,
 ) -> anyhow::Result<ProcessCapture> {
     let run_id_text = run_id.to_string();
+    // Only the final role (validator) is authorized to close the assigned run
+    // with the cycle decision, so the sequence completes before closure.
+    let may_close_flag = if role == "validator" { "1" } else { "0" };
     let role_env = [
         ("LDGR_LOOP_ROLE", role),
         ("LDGR_LOOP_STOP_AUTHORITY", "planner"),
         ("LDGR_LOOP_ASSIGNED_RUN_ID", run_id_text.as_str()),
         ("LDGR_LOOP_ASSIGNED_WORK_SLUG", work_slug),
+        ("LDGR_LOOP_MAY_CLOSE_RUN", may_close_flag),
     ];
     match &options.agent {
         LoopAgent::DryRun => Ok(ProcessCapture::from_memory(

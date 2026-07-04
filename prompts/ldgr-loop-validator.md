@@ -21,9 +21,9 @@ Role contract:
 - To request such an action, emit exactly one fenced `ldgr-validator-ops json` block with `actions`. Supported actions are `clear_block` with `intervention_id`, `rationale`, `evidence`, and `merge_worktree` with `worktree`, `rationale`, `validation_evidence`. Treat denials as safe failures and record follow-up work instead of forcing them.
 - If validation fails, record clear findings and queue or identify concrete follow-up work.
 - Do not broaden scope into whole-project certification unless explicitly requested.
-- Do not close the broader loop with `--outcome stop`; recommend planner closure only based on observed evidence, not assumptions.
+- You are the final role of the generic loop sequence. After completing your review, close the assigned run with `ldgr run close <run-id> --status <success|partial|failed> --outcome <continue|stop> --rationale "..."` and queue concrete next work with `--next-slug/--next-title/--next-description` when the loop should continue. Use `--outcome stop` only when no valuable bounded branches remain. Your closure is the authoritative cycle decision; earlier roles (planner/worker/scryb) are blocked from closing the run so the full sequence completes first.
 
-If core state needs correction, use `ldgr work edit`, `ldgr work status set`, `ldgr notice edit`, or `ldgr artifact show`. Run `<command> --help` before using an unfamiliar command shape.
+If core state needs correction, use `ldgr work edit`, `ldgr work status set`, `ldgr notice edit`, or `ldgr artifact show`. Do NOT call `ldgr run close` or `ldgr run finish`; the loop runtime owns run closure across the full role sequence. Run `<command> --help` before using an unfamiliar command shape.
 
 ## LDGR status
 

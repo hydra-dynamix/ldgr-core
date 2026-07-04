@@ -139,7 +139,8 @@ while [ "$#" -gt 0 ]; do
   if [ "$1" = "--install-root" ]; then shift; install_root="$1"; fi
   shift || true
 done
-mkdir -p "$install_root"
+mkdir -p "$install_root/prompts"
+printf 'example loop prompt\n' > "$install_root/prompts/example-loop.md"
 cat > "$install_root/adapter.toml" <<'TOML'
 [adapter]
 slug = "example"
@@ -183,6 +184,10 @@ chmod +x "$root/bin/ldgr-example-adapter"
     assert!(cargo_args.contains("ldgr-example-adapter"));
     let manifest = fs::read_to_string(home.join(".ldgr/example/adapter.toml"))?;
     assert!(manifest.contains(".local/bin/ldgr-example-adapter"));
+    assert_eq!(
+        fs::read_to_string(home.join(".ldgr/prompts/example-loop.md"))?,
+        "example loop prompt\n"
+    );
     Ok(())
 }
 
@@ -1947,6 +1952,41 @@ fn artifacts_can_be_recorded_outside_artifact_root() -> anyhow::Result<()> {
 }
 
 #[test]
+fn install_seeds_global_generic_loop_role_prompts() -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    let mut command = isolated_command(project.path())?;
+    command.current_dir(project.path()).args([
+        "install",
+        "--harness",
+        "pi",
+        "--yes",
+        "--no-agentctl",
+    ]);
+    command.assert().success().stdout(
+        predicate::str::contains("Seeded prompt")
+            .and(predicate::str::contains("ldgr-loop-planner.md"))
+            .and(predicate::str::contains("ldgr-loop-validator.md")),
+    );
+
+    let prompt_root = project.path().join(".ldgr/test-empty-home/.ldgr/prompts");
+    assert!(prompt_root.join("ldgr-core-loop.md").is_file());
+    assert!(prompt_root.join("ldgr-loop-invariants.md").is_file());
+    assert!(prompt_root.join("ldgr-loop-planner.md").is_file());
+    assert!(prompt_root.join("ldgr-loop-worker.md").is_file());
+    assert!(prompt_root.join("ldgr-loop-scryb.md").is_file());
+    assert!(prompt_root.join("ldgr-loop-validator.md").is_file());
+    assert!(
+        fs::read_to_string(prompt_root.join("ldgr-loop-validator.md"))?
+            .contains("ldgr-validator-revision json")
+    );
+    assert!(project
+        .path()
+        .join(".ldgr/test-empty-home/.pi/agent/extensions/ldgr-context.ts")
+        .is_file());
+    Ok(())
+}
+
+#[test]
 fn init_seeds_editable_generic_loop_role_prompts() -> anyhow::Result<()> {
     let project = TempDir::new()?;
     let db_path = project.path().join(".ldgr/ldgr.db");
@@ -2472,7 +2512,7 @@ fn autonomous_loop_runtime_allows_agent_to_finish_run_before_parent_capture() ->
     let agent_path = project.path().join("agent-finishes-run.sh");
     fs::write(
         &agent_path,
-        "#!/bin/sh\ncat >/dev/null\nLDGR_BIN=\"$1\"\nDB=\"$2\"\nARTIFACTS=\"$3\"\n\"$LDGR_BIN\" --db \"$DB\" --artifact-root \"$ARTIFACTS\" observation add 1 --body 'agent is finishing this run before parent capture'\n\"$LDGR_BIN\" --db \"$DB\" --artifact-root \"$ARTIFACTS\" run finish 1 --status success --notes 'agent finished run before parent capture'\n\"$LDGR_BIN\" --db \"$DB\" --artifact-root \"$ARTIFACTS\" decision record self-finish-loop --outcome stop --rationale 'agent finished and closed the work'\nprintf 'agent-finished-run\\n'\n",
+        "#!/bin/sh\ncat >/dev/null\nif [ \"$LDGR_LOOP_ROLE\" = validator ]; then\n  LDGR_BIN=\"$1\"\n  DB=\"$2\"\n  ARTIFACTS=\"$3\"\n  \"$LDGR_BIN\" --db \"$DB\" --artifact-root \"$ARTIFACTS\" observation add 1 --body 'agent is finishing this run before parent capture'\n  \"$LDGR_BIN\" --db \"$DB\" --artifact-root \"$ARTIFACTS\" run finish 1 --status success --notes 'agent finished run before parent capture'\n  \"$LDGR_BIN\" --db \"$DB\" --artifact-root \"$ARTIFACTS\" decision record self-finish-loop --outcome stop --rationale 'agent finished and closed the work'\nfi\nprintf 'agent-finished-run\\n'\n",
     )?;
     let ldgr_bin = assert_cmd::cargo::cargo_bin("ldgr");
     let agent_argv = serde_json::to_string(&vec![
@@ -2602,7 +2642,8 @@ fn autonomous_loop_runtime_rejects_non_planner_stop_decision() -> anyhow::Result
     let worker_output =
         fs::read_to_string(artifact_root.join("loop-run-1-worker-agent-output.md"))?;
     assert!(
-        worker_output.contains("loop stop decisions require planner authority"),
+        worker_output.contains("role worker may not close run 1")
+            || worker_output.contains("loop stop decisions require planner authority"),
         "{worker_output}"
     );
     command(project.path(), &db_path, &artifact_root, ["context"])?
@@ -2611,6 +2652,109 @@ fn autonomous_loop_runtime_rejects_non_planner_stop_decision() -> anyhow::Result
         .stdout(predicate::str::contains("latest_decision: none"))
         .stdout(predicate::str::contains(
             "loop_state: phase=needs_decision run=1 work=nonplanner-stop-loop status=failed",
+        ));
+
+    Ok(())
+}
+
+#[test]
+fn autonomous_loop_runtime_blocks_planner_run_closure_so_sequence_completes() -> anyhow::Result<()>
+{
+    // Regression: a capable planner would diagnose the work, then close the run
+    // (ldgr run close --outcome continue) before the worker executed, breaking
+    // the 4-role sequence. Roles may not close the assigned run; the loop
+    // runtime owns run closure across the full sequence.
+    let project = TempDir::new()?;
+    let db_path = project.path().join(".ldgr/ldgr.db");
+    let artifact_root = project.path().join(".ldgr/artifacts");
+    let prompt_root = project.path().join("prompts");
+    fs::create_dir_all(&prompt_root)?;
+    let prompt_path = prompt_root.join("ldgr-core-loop.md");
+    fs::write(&prompt_path, "BASE {{ldgr_context}}")?;
+    for role in ["planner", "worker", "scryb", "validator"] {
+        fs::write(
+            prompt_root.join(format!("ldgr-loop-{role}.md")),
+            format!("ROLE: {role}\n{{{{ldgr_context}}}}"),
+        )?;
+    }
+    // Planner attempts to close the run with outcome=continue; that must be
+    // rejected so worker/scryb/validator still execute.
+    let agent_path = project.path().join("agent-planner-closes.sh");
+    fs::write(
+        &agent_path,
+        "#!/bin/sh\ncat >/dev/null\nif [ \"$LDGR_LOOP_ROLE\" = planner ]; then\n  LDGR_BIN=\"$1\"\n  DB=\"$2\"\n  ARTIFACTS=\"$3\"\n  \"$LDGR_BIN\" --db \"$DB\" --artifact-root \"$ARTIFACTS\" run close 1 --status partial --outcome continue --rationale 'planner queued follow-up' --next-slug follow-up --next-title 'Follow up' --next-description 'Worker applies the fix.'\n  # Continue even though close was rejected: record an observation and proceed\n  printf 'planner planned\n'\n  exit 0\nfi\nprintf 'role=%s\n' \"$LDGR_LOOP_ROLE\"\n",
+    )?;
+    let ldgr_bin = assert_cmd::cargo::cargo_bin("ldgr");
+    let agent_argv = serde_json::to_string(&vec![
+        "sh".to_string(),
+        agent_path.to_str().unwrap().to_string(),
+        ldgr_bin.to_str().unwrap().to_string(),
+        db_path.to_str().unwrap().to_string(),
+        artifact_root.to_str().unwrap().to_string(),
+    ])?;
+
+    run(project.path(), &db_path, &artifact_root, ["init"])?;
+    run(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        [
+            "work",
+            "create",
+            "planner-closes-loop",
+            "--title",
+            "Planner closes loop",
+            "--description",
+            "Planner must not be able to close the run before worker executes.",
+        ],
+    )?;
+
+    command(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        [
+            "loop",
+            "run",
+            "--prompt",
+            prompt_path.to_str().expect("prompt path is UTF-8"),
+            "--agent-argv",
+            &agent_argv,
+        ],
+    )?
+    .assert()
+    .success()
+    .stdout(predicate::str::contains(
+        "loop run=1 work=planner-closes-loop",
+    ))
+    .stdout(predicate::str::contains("agent_exit_code: 0"));
+
+    // All four roles ran (worker/scryb/validator artifacts exist).
+    for role in ["planner", "worker", "scryb", "validator"] {
+        assert!(
+            artifact_root
+                .join(format!("loop-run-1-{role}-agent-output.md"))
+                .is_file(),
+            "missing {role} output artifact"
+        );
+    }
+    // The planner's run close attempt was rejected with the closure-authority
+    // message, recorded in the planner output artifact.
+    let planner_output =
+        fs::read_to_string(artifact_root.join("loop-run-1-planner-agent-output.md"))?;
+    assert!(
+        planner_output.contains("role planner may not close run 1"),
+        "{planner_output}"
+    );
+    // The run reached a terminal status only via the runtime's authoritative
+    // close at sequence end (not prematurely by the planner). The role loop
+    // finishes the run without recording a decision, so the loop surfaces a
+    // needs_decision phase; that is a separate follow-up, not this regression.
+    command(project.path(), &db_path, &artifact_root, ["status"])?
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "loop: phase=needs_decision run=1 work=planner-closes-loop status=success",
         ));
 
     Ok(())
@@ -3124,6 +3268,10 @@ fn autonomous_loop_runtime_repeats_until_no_pending_work_remains() -> anyhow::Re
         r#"#!/usr/bin/env bash
 set -euo pipefail
 prompt="$(cat)"
+if [ "$LDGR_LOOP_ROLE" != validator ]; then
+  printf 'role=%s\n' "$LDGR_LOOP_ROLE"
+  exit 0
+fi
 if grep -q '"work_slug": "second-loop"' <<<"$prompt"; then
   "$LDGR_BIN" --db "$LDGR_DB" --artifact-root "$LDGR_ARTIFACT_ROOT" run close 2 --status success --outcome stop --rationale "All loop work is complete."
 elif grep -q '"work_slug": "first-loop"' <<<"$prompt"; then
