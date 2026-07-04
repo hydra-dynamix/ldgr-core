@@ -69,10 +69,18 @@ function renderFeed(feed) {
   return `<div class="feed-card"><div class="feed-meta"><strong>${esc(feed.label)}</strong><span>${esc(feed.path)}</span><span>${esc(feed.size)} bytes</span></div><pre>${esc(feed.tail || '')}</pre></div>`;
 }
 
-function renderOperatorControls(draft) {
+function renderOperatorControls(draft, pendingInterventions = []) {
   const dryRunChecked = draft.dryRun ? ' checked' : '';
   const projectCompleteChecked = draft.projectComplete ? ' checked' : '';
+  const tokenStatus = storedControlToken()
+    ? '<span class="status success">control token loaded</span>'
+    : '<span class="status warning">open the tokenized URL printed by `ldgr web` to enable writes</span>';
   return `
+    <div class="operator-primer">
+      <p>${tokenStatus}</p>
+      <p class="muted">Controls append durable loop intervention events. Use Pause/Stop for the next cycle, Steering for prompt instructions, and Start loop cycle for one bounded run.</p>
+    </div>
+    ${renderPendingInterventions(pendingInterventions)}
     <div class="control-grid">
       <button type="button" class="control-button" data-action="request-intervention" data-intervention="pause">Pause next cycle</button>
       <button type="button" class="control-button" data-action="request-intervention" data-intervention="resume">Resume paused loop</button>
@@ -83,9 +91,22 @@ function renderOperatorControls(draft) {
     <label for="control-instruction">Instruction for the next loop prompt</label><textarea id="control-instruction">${esc(draft.instruction)}</textarea>
     <details class="inline-details">
       <summary>Loop start options</summary>
+      <p class="muted">Choose exactly one prompt source: prompt path, prompt slug, or bundle slug. The default prompt path matches ldgr init projects.</p>
       ${renderLoopStart(draft, dryRunChecked, projectCompleteChecked)}
     </details>
     <p id="control-status" class="muted">${esc(draft.status)}</p>`;
+}
+
+function renderPendingInterventions(interventions) {
+  if (!interventions.length) return '<section class="pending-interventions"><h3>Pending interventions</h3><p class="muted">No pending pause, stop, or steering requests.</p></section>';
+  return `<section class="pending-interventions"><h3>Pending interventions</h3>${interventions.map(intervention => `
+    <article class="compact-record">
+      <div class="record-title"><strong>${esc(intervention.action)}</strong>${status(intervention.status)}</div>
+      <p>${esc(intervention.reason)}</p>
+      ${intervention.instruction ? `<p class="context-line">${esc(intervention.instruction)}</p>` : ''}
+      <p class="muted">requested ${esc(intervention.requested_at || intervention.created_at)} by ${esc(intervention.requested_by || 'operator')}</p>
+      <button type="button" class="control-button" data-action="clear-intervention" data-intervention-id="${esc(intervention.id)}">Clear intervention</button>
+    </article>`).join('')}</section>`;
 }
 
 function renderLoopStart(draft, dryRunChecked, projectCompleteChecked) {

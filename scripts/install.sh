@@ -67,12 +67,22 @@ install_from_source() {
   if ! have cargo; then
     fail "no prebuilt release asset for $PLATFORM and cargo is not installed; set LDGR_VERSION or install Rust/cargo"
   fi
+  cargo_root="$TMP_DIR/cargo-root"
   log "No prebuilt release asset for $PLATFORM; falling back to cargo install from $REPO."
   if [ -n "$VERSION" ]; then
-    cargo install --git "https://github.com/$REPO" --tag "v$VERSION" --locked --force "$PACKAGE"
+    cargo install --git "https://github.com/$REPO" --tag "v$VERSION" --locked --force --root "$cargo_root" "$PACKAGE"
   else
-    cargo install --git "https://github.com/$REPO" --locked --force "$PACKAGE"
+    cargo install --git "https://github.com/$REPO" --locked --force --root "$cargo_root" "$PACKAGE"
   fi
+  mkdir -p "$INSTALL_DIR"
+  cp "$cargo_root/bin/$BINARY_FILE" "$INSTALL_DIR/$BINARY_FILE"
+  chmod +x "$INSTALL_DIR/$BINARY_FILE"
+  log "Installed $BINARY_FILE to $INSTALL_DIR/$BINARY_FILE"
+  case ":$PATH:" in
+    *":$INSTALL_DIR:"*) ;;
+    *) log "Add $INSTALL_DIR to PATH if needed." ;;
+  esac
+  "$INSTALL_DIR/$BINARY_FILE" --version
 }
 
 require uname

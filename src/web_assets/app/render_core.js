@@ -8,8 +8,9 @@ function render() {
   renderArtifactView(missionLog);
   renderWaveManagement(lastConduct);
   renderSidebar(context, missionLog, lastConduct);
-  $('operator-controls').innerHTML = renderOperatorControls(controlDraft());
-  $('controls-status').textContent = `${pendingInterventions(context).length} pending`;
+  const pending = pendingInterventions(context);
+  $('operator-controls').innerHTML = renderOperatorControls(controlDraft(), pending);
+  $('controls-status').textContent = `${pending.length} pending`;
 }
 
 function pendingInterventions(context) {
@@ -40,6 +41,7 @@ function renderShell(context) {
   const latestObservation = context.latest_observations && context.latest_observations[0];
   $('status-strip').innerHTML = [
     ['Active run', activeRun ? `run ${esc(activeRun.run_id)} · ${esc(activeRun.work_slug)}` : esc(loopState.current_phase || 'none'), 'active-run'],
+    ['Next work', context.next_work_item ? `${esc(context.next_work_item.slug)} · ${esc(context.next_work_item.status)}` : 'none', 'next-work'],
     ['Latest decision', latestDecision ? `${esc(latestDecision.outcome)} · ${esc(latestDecision.work_slug)}` : 'none', 'recent-decision'],
     ['Latest artifact', latestArtifact ? `${esc(latestArtifact.kind)} · ${esc(artifactName(latestArtifact.path))}` : 'none', 'artifacts'],
     ['Latest observation', latestObservation ? `${esc(latestObservation.created_at)} · ${esc(latestObservation.body)}` : 'none', 'latest-observation']
@@ -68,6 +70,7 @@ function renderSidebarCurrent(context) {
   const latestObservation = context.latest_observations && context.latest_observations[0];
   $('nav-current').innerHTML = [
     navButton('Active run', activeRun ? `run ${activeRun.run_id}` : 'none', 'set-inspector', {'inspector': 'active-run'}),
+    navButton('Next work', context.next_work_item ? context.next_work_item.slug : 'none', 'set-inspector', {'inspector': 'next-work'}),
     navButton('Latest decision', latestDecision ? latestDecision.work_slug : 'none', 'set-inspector', {'inspector': 'recent-decision'}),
     navButton('Latest artifact', latestArtifact ? artifactName(latestArtifact.path) : 'none', 'set-inspector', {'inspector': 'artifacts'}),
     navButton('Latest observation', latestObservation ? latestObservation.created_at : 'none', 'set-inspector', {'inspector': 'latest-observation'})
@@ -166,7 +169,7 @@ function inspectorBody(target, context, missionLog) {
   if (target === 'recent-decision') return inspectDecision(context, missionLog);
   if (target === 'artifacts') return inspectArtifacts(context);
   if (target === 'runs') return inspectRuns(context, missionLog);
-  return `${inspectActiveRun(context, missionLog)}${inspectArtifacts(context)}`;
+  return `${inspectActiveRun(context, missionLog)}${inspectNextWork(context, missionLog)}${inspectArtifacts(context)}`;
 }
 
 function inspectNextWork(context, missionLog) {

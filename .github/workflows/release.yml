@@ -109,6 +109,29 @@ jobs:
             shasum -a 256 "$archive" > "${archive}.sha256"
           fi
 
+      - name: Smoke release archive contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.meta.outputs.version }}"
+          platform="${{ matrix.platform }}"
+          binary_file="${BINARY}${{ matrix.binary_ext }}"
+          archive="dist/${RELEASE_NAME}-${version}-${platform}.tar.gz"
+          smoke_dir="$(mktemp -d)"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum -c "${archive}.sha256"
+          else
+            expected="$(awk '{print $1}' "${archive}.sha256")"
+            actual="$(shasum -a 256 "$archive" | awk '{print $1}')"
+            test "$expected" = "$actual"
+          fi
+          tar -xzf "$archive" -C "$smoke_dir"
+          test -x "$smoke_dir/${RELEASE_NAME}-${version}/${platform}/${binary_file}"
+          "$smoke_dir/${RELEASE_NAME}-${version}/${platform}/${binary_file}" --version
+          test -f "$smoke_dir/${RELEASE_NAME}-${version}/RELEASE-METADATA.json"
+          test -f "$smoke_dir/${RELEASE_NAME}-${version}/scripts/install.sh"
+          sh -n "$smoke_dir/${RELEASE_NAME}-${version}/scripts/install.sh"
+
       - name: Create or update GitHub release
         shell: bash
         run: |

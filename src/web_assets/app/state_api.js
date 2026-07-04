@@ -125,7 +125,7 @@ function controlDraft() {
     reason: $('control-reason') ? $('control-reason').value : 'Operator requested from cockpit',
     instruction: $('control-instruction') ? $('control-instruction').value : '',
     status: $('control-status') ? $('control-status').textContent : 'Controls write durable loop intervention events.',
-    prompt: $('loop-prompt') ? $('loop-prompt').value : 'prompts/loop-prompt.md',
+    prompt: $('loop-prompt') ? $('loop-prompt').value : '.ldgr/prompts/ldgr-core-loop.md',
     promptSlug: $('loop-prompt-slug') ? $('loop-prompt-slug').value : '',
     bundle: $('loop-bundle') ? $('loop-bundle').value : '',
     promptRole: $('loop-prompt-role') ? $('loop-prompt-role').value : '',

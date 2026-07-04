@@ -27,9 +27,12 @@ See `docs/ldgr-loop-philosophy.html` for the longer explanation of the loop.
 curl -fsSL https://raw.githubusercontent.com/hydra-dynamix/ldgr-core/main/scripts/install.sh | sh
 ```
 
-The installer detects the current OS/CPU, downloads the matching release archive,
-verifies its SHA-256 checksum when checksum tooling is available, and installs
-`ldgr` to `~/.local/bin` by default. Override with:
+The installer detects the current OS/CPU, resolves the latest GitHub release,
+downloads the matching CI-published release archive, verifies its SHA-256
+checksum when checksum tooling is available, and installs `ldgr` to
+`~/.local/bin` by default. Official prebuilt release artifacts are published by
+`.github/workflows/release.yml` for linux-x86_64, linux-aarch64, macOS Intel,
+macOS Apple Silicon, and Windows x86_64. Override with:
 
 ```sh
 LDGR_VERSION=0.1.1 LDGR_INSTALL_DIR="$HOME/bin" sh -c "$(curl -fsSL https://raw.githubusercontent.com/hydra-dynamix/ldgr-core/main/scripts/install.sh)"
@@ -45,7 +48,10 @@ cd ldgr-core
 cargo install --path .
 ```
 
-SQLite is bundled; source fallback requires a recent stable Rust toolchain.
+SQLite is bundled. Source fallback is a safety net for unpublished or missing
+platform assets and requires a recent stable Rust toolchain; it now stages the
+Cargo build and copies the resulting binary into the same `LDGR_INSTALL_DIR` as
+the prebuilt path.
 
 ## Quick start
 

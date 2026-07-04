@@ -39,6 +39,20 @@ mod tests {
             "loop-agent-timeout-seconds",
             "loop-stream-agent-output",
             "loop-max-iterations",
+            ".ldgr/prompts/ldgr-core-loop.md",
+            "Choose exactly one prompt source",
+        ] {
+            assert!(APP_JS.contains(expected), "{expected}");
+        }
+    }
+
+    #[test]
+    fn cockpit_asset_surfaces_operator_intervention_queue() {
+        for expected in [
+            "Pending interventions",
+            "Clear intervention",
+            "control token loaded",
+            "open the tokenized URL printed by `ldgr web`",
         ] {
             assert!(APP_JS.contains(expected), "{expected}");
         }
