@@ -36,6 +36,9 @@ pub(crate) const CLI_DEFAULT_HELP_SECTIONS: &str = r#"Core loop:
 
 Autonomous loop:
   loop run --prompt prompts/loop-prompt.md --agent agentctl
+  loop run --prompt prompts/base.md --prompt prompts/project-rules.md --agent agentctl
+  loop run --prompt-slug core-loop --prompt-slug project-rules --agent agentctl
+  loop run --prompt prompts/loop-prompt.md --agent agentctl --until-empty --summary-agent agentctl
 
 Adapters:
   adapter install              # selection menu
@@ -84,13 +87,13 @@ pub(crate) const CLI_FULL_HELP_SECTIONS: &str = r#"Core command tree:
     list
     record
   prompt
+    list
+    show
     create
     import
     update
-    activate
-  bundle
-    create
-    seal
+    compose
+    activate      # compatibility: verifies a global prompt exists
   adapter
     install
       list | <slug>
@@ -105,6 +108,11 @@ pub(crate) const CLI_FULL_HELP_SECTIONS: &str = r#"Core command tree:
     clear
   loop
     run
+      --prompt <path>                # repeatable; concatenates selected file fragments
+      --prompt-slug <slug>           # repeatable; reads ~/.ldgr/prompts/<slug>.md
+      --agent agentctl | --agent-argv '["cmd", "arg"]'
+      --until-empty | --max-iterations <n>
+      --summary-agent agentctl | --summary-argv '[...]'
 
 Research/readiness commands moved to `ldgr-research`:
   issue, blocker, fact, expectation, failure, milestone, target-profile,
@@ -161,10 +169,8 @@ enum Command {
     Validation(ValidationArgs),
     /// Record decisions and optional next work.
     Decision(DecisionArgs),
-    /// Manage durable loop prompt records.
+    /// Manage global loop prompt files under ~/.ldgr/prompts.
     Prompt(PromptArgs),
-    /// Manage sealed prompt bundles.
-    Bundle(BundleArgs),
     /// Print the compact agent-first status summary.
     Status(StatusArgs),
     /// Print the operational cockpit.
@@ -295,7 +301,6 @@ fn handle_cli(cli: Cli) -> anyhow::Result<()> {
         Command::Validation(args) => commands::runs::handle_validation(&open_store(&cli.db)?, args),
         Command::Decision(args) => commands::audit::handle_decision(&open_store(&cli.db)?, args),
         Command::Prompt(args) => commands::prompts::handle_prompt(&open_store(&cli.db)?, args),
-        Command::Bundle(args) => commands::prompts::handle_bundle(&open_store(&cli.db)?, args),
         Command::Status(args) => {
             commands::ops::handle_status(&open_store(&cli.db)?, &cli.artifact_root, args)
         }

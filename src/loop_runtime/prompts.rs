@@ -13,10 +13,9 @@ struct PromptProvenance {
     prompt_role: Option<String>,
     prompt_version: Option<i64>,
     prompt_hash: Option<String>,
-    bundle_slug: Option<String>,
-    bundle_hash: Option<String>,
     thinking_level_intent: Option<String>,
     advisory_intent: Option<String>,
+    components: Option<Vec<PromptProvenance>>,
 }
 
 fn resolve_prompt_source(
@@ -35,59 +34,107 @@ fn resolve_prompt_source(
                 prompt_role: None,
                 prompt_version: None,
                 prompt_hash: None,
-                bundle_slug: None,
-                bundle_hash: None,
                 thinking_level_intent: None,
                 advisory_intent: None,
+                components: None,
             },
         }),
         LoopPromptSource::StoredPrompt { slug } => {
-            let prompt = active_prompt(connection, slug)?;
+            let path = global_prompt_path(slug)?;
+            let body = fs::read_to_string(&path).with_context(|| {
+                format!("failed to read global prompt {} at {}", slug, path.display())
+            })?;
+            let hash = stable_content_hash(&body);
             Ok(ResolvedLoopPrompt {
-                template: prompt.body.clone(),
+                template: body,
                 description: format!(
-                    "Using prompt {} version={} hash={}.",
-                    prompt.slug, prompt.current_version, prompt.content_hash
+                    "Using global prompt {} path={} hash={}.",
+                    slug,
+                    path.display(),
+                    hash
                 ),
                 provenance: PromptProvenance {
-                    source_type: "prompt".to_owned(),
-                    path: prompt.source_path.clone(),
-                    prompt_slug: Some(prompt.slug),
-                    prompt_role: Some(prompt.role),
-                    prompt_version: Some(prompt.current_version),
-                    prompt_hash: Some(prompt.content_hash),
-                    bundle_slug: None,
-                    bundle_hash: None,
+                    source_type: "global_prompt".to_owned(),
+                    path: Some(path.display().to_string()),
+                    prompt_slug: Some(slug.clone()),
+                    prompt_role: None,
+                    prompt_version: None,
+                    prompt_hash: Some(hash),
                     thinking_level_intent: None,
                     advisory_intent: None,
+                    components: None,
                 },
             })
         }
-        LoopPromptSource::Bundle { slug, prompt_role } => {
-            let bundle = sealed_bundle(connection, slug)?;
-            let (_item, version) =
-                bundled_prompt_version(connection, bundle.id, prompt_role.as_deref())?;
+        LoopPromptSource::Composite { sources } => {
+            if sources.is_empty() {
+                bail!("composite loop prompt requires at least one prompt source");
+            }
+            let mut resolved_parts = Vec::new();
+            for source in sources {
+                resolved_parts.push(resolve_prompt_source(connection, source)?);
+            }
+            let template = resolved_parts
+                .iter()
+                .enumerate()
+                .map(|(index, part)| {
+                    format!(
+                        "<!-- ldgr-prompt-fragment {}: {} -->\n{}\n",
+                        index + 1,
+                        part.description,
+                        part.template.trim_end()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let prompt_hash = stable_content_hash(&template);
+            let description = format!(
+                "Using composite loop prompt with {} fragments hash={prompt_hash}.",
+                resolved_parts.len()
+            );
             Ok(ResolvedLoopPrompt {
-                template: version.body.clone(),
-                description: format!(
-                    "Using sealed bundle {} hash={} prompt_version={} prompt_hash={}.",
-                    bundle.slug, bundle.bundle_hash, version.version, version.content_hash
-                ),
+                template,
+                description,
                 provenance: PromptProvenance {
-                    source_type: "bundle".to_owned(),
-                    path: version.source_path.clone(),
+                    source_type: "composite".to_owned(),
+                    path: None,
                     prompt_slug: None,
-                    prompt_role: Some(version.role),
-                    prompt_version: Some(version.version),
-                    prompt_hash: Some(version.content_hash),
-                    bundle_slug: Some(bundle.slug),
-                    bundle_hash: Some(bundle.bundle_hash),
+                    prompt_role: None,
+                    prompt_version: None,
+                    prompt_hash: Some(prompt_hash),
                     thinking_level_intent: None,
                     advisory_intent: None,
+                    components: Some(
+                        resolved_parts
+                            .into_iter()
+                            .map(|part| part.provenance)
+                            .collect(),
+                    ),
                 },
             })
         }
     }
+}
+
+fn global_prompt_path(slug: &str) -> anyhow::Result<std::path::PathBuf> {
+    let root = std::env::var_os("LDGR_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".ldgr")))
+        .context("cannot resolve LDGR_HOME or HOME for global prompt lookup")?
+        .join("prompts");
+    let direct = root.join(slug);
+    if direct.is_file() {
+        return Ok(direct);
+    }
+    let markdown = root.join(format!("{slug}.md"));
+    if markdown.is_file() {
+        return Ok(markdown);
+    }
+    anyhow::bail!(
+        "unknown global prompt {slug}; expected {} or {}",
+        direct.display(),
+        markdown.display()
+    )
 }
 
 pub fn render_prompt_document(

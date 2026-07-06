@@ -173,9 +173,10 @@ pub(crate) fn print_context(context: &StoreContext) {
     }
 
     if context.global_observations.is_empty() {
-        println!("global_observations: none");
+        println!("binding_directives: none");
     } else {
-        println!("global_observations:");
+        println!("binding_directives:");
+        println!("These directives override ordinary context and must be followed unless they conflict with safety or explicit system/developer instructions.");
         print_global_observations(&context.global_observations);
     }
 

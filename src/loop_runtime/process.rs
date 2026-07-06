@@ -620,6 +620,20 @@ enum TerminationSignal {
 fn configure_process_group(command: &mut Command) {
     use std::os::unix::process::CommandExt;
     command.process_group(0);
+    unsafe {
+        command.pre_exec(|| {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::getppid() == 1 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "parent exited before loop subprocess was armed",
+                ));
+            }
+            Ok(())
+        });
+    }
 }
 
 #[cfg(windows)]

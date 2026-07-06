@@ -169,7 +169,6 @@ pub(crate) fn latest_events(
                  'global_observation',
                  'artifact',
                  'prompt',
-                 'prompt_bundle',
                  'decision',
                  'loop_intervention'
              )

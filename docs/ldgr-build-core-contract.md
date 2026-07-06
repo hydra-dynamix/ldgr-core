@@ -138,8 +138,10 @@ The research layer records and exposes:
 
 `ldgr-research` provides `profile create`, `profile list`, `profile show`, and
 `profile apply`. Core `ldgr` does not create, read, or migrate profile tables.
-Core loop execution stays explicit: pass `--prompt`, `--prompt-slug`, or
-`--bundle` to `ldgr loop run`.
+Core loop execution stays explicit: pass `--prompt` or `--prompt-slug` to
+`ldgr loop run`. Repeat `--prompt` and/or `--prompt-slug` when a project needs
+multiple instruction fragments concatenated into one rendered loop prompt, or
+use `ldgr prompt compose` to save that composition as a reusable global prompt.
 
 Adapters should create profiles in the research layer instead of requiring LDGR
 core to know adapter names, storage tables, or hard-coded domain paths.

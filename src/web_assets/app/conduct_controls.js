@@ -91,7 +91,7 @@ function renderOperatorControls(draft, pendingInterventions = []) {
     <label for="control-instruction">Instruction for the next loop prompt</label><textarea id="control-instruction">${esc(draft.instruction)}</textarea>
     <details class="inline-details">
       <summary>Loop start options</summary>
-      <p class="muted">Choose exactly one prompt source: prompt path, prompt slug, or bundle slug. The default prompt path matches ldgr init projects.</p>
+      <p class="muted">Choose one cockpit prompt source: prompt path or prompt slug. For composite prompts, use the CLI with repeated --prompt/--prompt-slug or `ldgr prompt compose`.</p>
       ${renderLoopStart(draft, dryRunChecked, projectCompleteChecked)}
     </details>
     <p id="control-status" class="muted">${esc(draft.status)}</p>`;
@@ -114,8 +114,6 @@ function renderLoopStart(draft, dryRunChecked, projectCompleteChecked) {
   return `
     <label for="loop-prompt">Prompt path</label><input id="loop-prompt" value="${esc(draft.prompt)}">
     <label for="loop-prompt-slug">Prompt slug</label><input id="loop-prompt-slug" value="${esc(draft.promptSlug)}">
-    <label for="loop-bundle">Bundle slug</label><input id="loop-bundle" value="${esc(draft.bundle)}">
-    <label for="loop-prompt-role">Bundle prompt role</label><input id="loop-prompt-role" value="${esc(draft.promptRole)}">
     <label for="loop-agent">Agent</label><select id="loop-agent"><option value="agentctl"${draft.agent === 'agentctl' ? ' selected' : ''}>agentctl</option></select>
     <label for="loop-agent-argv">Agent argv JSON</label><textarea id="loop-agent-argv" placeholder='optional, e.g. ["my-agent"]'>${esc(draft.agentArgv)}</textarea>
     <label for="loop-agent-timeout-seconds">Agent timeout seconds</label><input id="loop-agent-timeout-seconds" type="number" min="1" step="1" value="${esc(draft.agentTimeoutSeconds)}">
@@ -135,8 +133,6 @@ async function startLoop() {
   const body = new URLSearchParams({
     prompt: $('loop-prompt').value.trim(),
     prompt_slug: $('loop-prompt-slug').value.trim(),
-    bundle: $('loop-bundle').value.trim(),
-    prompt_role: $('loop-prompt-role').value.trim(),
     agent: agentArgv ? '' : $('loop-agent').value,
     agent_argv: agentArgv,
     agent_timeout_seconds: $('loop-agent-timeout-seconds').value.trim(),

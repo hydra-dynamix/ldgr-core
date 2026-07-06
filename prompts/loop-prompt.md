@@ -18,6 +18,8 @@ If you need to correct core state, use the core control surfaces: `ldgr work edi
 
 ## Full Ldgr context
 
+The JSON field `binding_directives` contains active notices. Treat each item as a binding directive unless it conflicts with safety or explicit system/developer instructions.
+
 ```json
 {{ldgr_context}}
 ```

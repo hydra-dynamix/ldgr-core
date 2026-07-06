@@ -44,7 +44,7 @@ pub struct AdapterProfileApplication {
     pub loop_prompt_relative_path: PathBuf,
     /// Fully resolved loop prompt file path.
     pub loop_prompt_path: PathBuf,
-    /// Durable prompt record after activation and validation.
+    /// Durable prompt record after profile application and validation.
     pub prompt: Prompt,
 }
 
@@ -140,23 +140,23 @@ fn validate_applied_prompt(
 ) -> anyhow::Result<()> {
     if prompt.slug != expected_slug {
         bail!(
-            "activated prompt slug mismatch: got {}, expected {expected_slug}",
+            "applied prompt slug mismatch: got {}, expected {expected_slug}",
             prompt.slug
         );
     }
     if prompt.role != expected_role {
         bail!(
-            "activated prompt role mismatch: got {}, expected {expected_role}",
+            "applied prompt role mismatch: got {}, expected {expected_role}",
             prompt.role
         );
     }
     if prompt.status != "active" {
-        bail!("activated prompt {} is not active", prompt.slug);
+        bail!("applied prompt {} is not active", prompt.slug);
     }
     let expected_hash = stable_content_hash(expected_body);
     if prompt.content_hash != expected_hash {
         bail!(
-            "activated prompt {} hash mismatch: got {}, expected {}",
+            "applied prompt {} hash mismatch: got {}, expected {}",
             prompt.slug,
             prompt.content_hash,
             expected_hash
@@ -164,7 +164,7 @@ fn validate_applied_prompt(
     }
     if prompt.source_path.as_deref() != Some(expected_source_path) {
         bail!(
-            "activated prompt {} source path mismatch: got {:?}, expected {}",
+            "applied prompt {} source path mismatch: got {:?}, expected {}",
             prompt.slug,
             prompt.source_path,
             expected_source_path

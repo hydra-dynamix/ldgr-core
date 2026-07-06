@@ -33,14 +33,13 @@ mod tests {
     fn cockpit_asset_exposes_supported_loop_launch_options() {
         for expected in [
             "loop-prompt-slug",
-            "loop-bundle",
-            "loop-prompt-role",
             "loop-agent-argv",
             "loop-agent-timeout-seconds",
             "loop-stream-agent-output",
             "loop-max-iterations",
             ".ldgr/prompts/ldgr-core-loop.md",
-            "Choose exactly one prompt source",
+            "Choose one cockpit prompt source",
+            "For composite prompts, use the CLI",
         ] {
             assert!(APP_JS.contains(expected), "{expected}");
         }
@@ -152,7 +151,7 @@ mod tests {
     }
 
     #[test]
-    fn loop_prompt_source_args_accepts_path_prompt_slug_or_bundle() -> anyhow::Result<()> {
+    fn loop_prompt_source_args_accepts_path_or_prompt_slug() -> anyhow::Result<()> {
         let temp = tempfile::tempdir()?;
         let prompt = temp.path().join("loop-prompt.md");
         fs::write(&prompt, "{{ldgr_context}}")?;
@@ -165,13 +164,6 @@ mod tests {
         assert_eq!(
             loop_prompt_source_args(&form(&[("prompt_slug", "surface")]))?,
             vec!["--prompt-slug", "surface"]
-        );
-        assert_eq!(
-            loop_prompt_source_args(&form(&[
-                ("bundle", "cleanroom"),
-                ("prompt_role", "surface-loop"),
-            ]))?,
-            vec!["--bundle", "cleanroom", "--prompt-role", "surface-loop"]
         );
         assert!(loop_prompt_source_args(&form(&[])).is_err());
         assert!(loop_prompt_source_args(&form(&[

@@ -1,9 +1,7 @@
+use super::helpers::{in_write_transaction, record_event};
+use super::types::Prompt;
 use anyhow::{bail, Context};
 use rusqlite::{params, Connection, OptionalExtension};
-use serde::Serialize;
-
-use super::helpers::{in_write_transaction, record_event};
-use super::types::{Prompt, PromptBundle, PromptBundleItem, PromptVersion};
 
 pub fn stable_content_hash(content: &str) -> String {
     format!("fnv1a64:{:016x}", fnv1a64(content.as_bytes()))
@@ -117,6 +115,20 @@ pub fn get_prompt(connection: &Connection, slug: &str) -> anyhow::Result<Option<
         .context("failed to read prompt")
 }
 
+pub fn list_prompts(connection: &Connection, status: Option<&str>) -> anyhow::Result<Vec<Prompt>> {
+    let sql = match status {
+        Some(_) => "SELECT id, slug, role, body, content_hash, status, current_version, current_version_id, source_path, description, created_at, updated_at FROM prompt WHERE status = ?1 ORDER BY slug",
+        None => "SELECT id, slug, role, body, content_hash, status, current_version, current_version_id, source_path, description, created_at, updated_at FROM prompt ORDER BY slug",
+    };
+    let mut statement = connection.prepare(sql).context("failed to list prompts")?;
+    let rows = match status {
+        Some(status) => statement.query_map(params![status], Prompt::from_row)?,
+        None => statement.query_map([], Prompt::from_row)?,
+    };
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to read prompts")
+}
+
 pub fn active_prompt(connection: &Connection, slug: &str) -> anyhow::Result<Prompt> {
     let prompt = get_prompt(connection, slug)?.with_context(|| format!("unknown prompt {slug}"))?;
     if prompt.status != "active" {
@@ -126,132 +138,6 @@ pub fn active_prompt(connection: &Connection, slug: &str) -> anyhow::Result<Prom
         );
     }
     Ok(prompt)
-}
-
-pub fn create_bundle(
-    connection: &Connection,
-    slug: &str,
-    prompt_slugs: &[String],
-) -> anyhow::Result<PromptBundle> {
-    validate_slug(slug)?;
-    if prompt_slugs.is_empty() {
-        bail!("bundle create requires at least one --prompt");
-    }
-    in_write_transaction(connection, |connection| {
-        let prompts = prompt_slugs
-            .iter()
-            .map(|prompt_slug| {
-                let prompt = active_prompt(connection, prompt_slug)?;
-                let version_id = prompt
-                    .current_version_id
-                    .with_context(|| format!("prompt {} has no current version", prompt.slug))?;
-                Ok((prompt, version_id))
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
-
-        connection.execute(
-            "INSERT INTO prompt_bundle (slug, status, manifest_json, bundle_hash) VALUES (?1, 'draft', '{}', '')",
-            params![slug],
-        )?;
-        let bundle_id = connection.last_insert_rowid();
-        for (prompt, version_id) in &prompts {
-            connection.execute(
-                "INSERT INTO prompt_bundle_item (bundle_id, prompt_id, prompt_version_id, prompt_slug, prompt_role, prompt_version, content_hash) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![bundle_id, prompt.id, version_id, prompt.slug, prompt.role, prompt.current_version, prompt.content_hash],
-            )?;
-        }
-        record_event(connection, "prompt_bundle", bundle_id, "create", "{}")?;
-        get_bundle(connection, slug)?.context("created bundle disappeared")
-    })
-}
-
-pub fn seal_bundle(connection: &Connection, slug: &str) -> anyhow::Result<PromptBundle> {
-    in_write_transaction(connection, |connection| {
-        let bundle =
-            get_bundle(connection, slug)?.with_context(|| format!("unknown bundle {slug}"))?;
-        if bundle.status == "sealed" {
-            return Ok(bundle);
-        }
-        if bundle.status != "draft" {
-            bail!("only draft bundles can be sealed");
-        }
-        let items = list_bundle_items(connection, bundle.id)?;
-        if items.is_empty() {
-            bail!("cannot seal empty bundle {slug}");
-        }
-        let manifest = BundleManifest {
-            slug: bundle.slug.clone(),
-            prompts: items.clone(),
-        };
-        let manifest_json = serde_json::to_string_pretty(&manifest)?;
-        let bundle_hash = stable_content_hash(&manifest_json);
-        connection.execute(
-            "UPDATE prompt_bundle SET status = 'sealed', manifest_json = ?1, bundle_hash = ?2 WHERE id = ?3",
-            params![manifest_json, bundle_hash, bundle.id],
-        )?;
-        record_event(connection, "prompt_bundle", bundle.id, "seal", "{}")?;
-        get_bundle(connection, slug)?.context("sealed bundle disappeared")
-    })
-}
-
-pub fn get_bundle(connection: &Connection, slug: &str) -> anyhow::Result<Option<PromptBundle>> {
-    connection
-        .query_row(
-            "SELECT id, slug, status, manifest_json, bundle_hash, created_at FROM prompt_bundle WHERE slug = ?1",
-            params![slug],
-            PromptBundle::from_row,
-        )
-        .optional()
-        .context("failed to read bundle")
-}
-
-pub fn sealed_bundle(connection: &Connection, slug: &str) -> anyhow::Result<PromptBundle> {
-    let bundle = get_bundle(connection, slug)?.with_context(|| format!("unknown bundle {slug}"))?;
-    if bundle.status != "sealed" {
-        bail!(
-            "bundle {slug} is {}; seal it before loop use",
-            bundle.status
-        );
-    }
-    Ok(bundle)
-}
-
-pub fn list_bundle_items(
-    connection: &Connection,
-    bundle_id: i64,
-) -> anyhow::Result<Vec<PromptBundleItem>> {
-    let mut statement = connection.prepare(
-        "SELECT id, bundle_id, prompt_id, prompt_version_id, prompt_slug, prompt_role, prompt_version, content_hash FROM prompt_bundle_item WHERE bundle_id = ?1 ORDER BY id",
-    )?;
-    let items = statement
-        .query_map(params![bundle_id], PromptBundleItem::from_row)?
-        .collect::<Result<Vec<_>, _>>()
-        .context("failed to list bundle items")?;
-    Ok(items)
-}
-
-pub fn bundled_prompt_version(
-    connection: &Connection,
-    bundle_id: i64,
-    role: Option<&str>,
-) -> anyhow::Result<(PromptBundleItem, PromptVersion)> {
-    let items = list_bundle_items(connection, bundle_id)?;
-    let item = if let Some(role) = role {
-        items
-            .into_iter()
-            .find(|item| item.prompt_role == role)
-            .with_context(|| format!("bundle does not contain prompt role {role}"))?
-    } else if items.len() == 1 {
-        items.into_iter().next().expect("one item")
-    } else {
-        bail!("bundle contains multiple prompts; pass --prompt-role");
-    };
-    let version = connection.query_row(
-        "SELECT id, prompt_id, version, role, body, content_hash, source_path, description, created_at FROM prompt_version WHERE id = ?1",
-        params![item.prompt_version_id],
-        PromptVersion::from_row,
-    )?;
-    Ok((item, version))
 }
 
 struct NewPromptVersion<'a> {
@@ -308,12 +194,6 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     hash
-}
-
-#[derive(Serialize)]
-struct BundleManifest {
-    slug: String,
-    prompts: Vec<PromptBundleItem>,
 }
 
 #[cfg(test)]
@@ -398,83 +278,6 @@ mod tests {
         assert!(result.is_err());
         let prompt = get_prompt(&connection, "surface")?.context("missing prompt")?;
         assert_eq!(prompt.status, "draft");
-
-        Ok(())
-    }
-
-    #[test]
-    fn create_bundle_prevalidates_prompt_references_before_inserting_bundle() -> anyhow::Result<()>
-    {
-        let connection = prompt_store_connection()?;
-        create_prompt(
-            &connection,
-            "surface",
-            "surface-loop",
-            "prompt body",
-            None,
-            None,
-        )?;
-        set_prompt_status(&connection, "surface", "active")?;
-
-        let result = create_bundle(
-            &connection,
-            "cleanroom",
-            &["surface".to_owned(), "missing".to_owned()],
-        );
-
-        assert!(result.is_err());
-        assert_eq!(count_rows(&connection, "prompt_bundle")?, 0);
-        assert_eq!(count_rows(&connection, "prompt_bundle_item")?, 0);
-
-        Ok(())
-    }
-
-    #[test]
-    fn create_bundle_rolls_back_when_event_recording_fails() -> anyhow::Result<()> {
-        let connection = prompt_store_connection()?;
-        create_prompt(
-            &connection,
-            "surface",
-            "surface-loop",
-            "prompt body",
-            None,
-            None,
-        )?;
-        set_prompt_status(&connection, "surface", "active")?;
-        connection.execute("DROP TABLE event_log", [])?;
-
-        let result = create_bundle(&connection, "cleanroom", &["surface".to_owned()]);
-
-        assert!(result.is_err());
-        assert_eq!(count_rows(&connection, "prompt_bundle")?, 0);
-        assert_eq!(count_rows(&connection, "prompt_bundle_item")?, 0);
-
-        Ok(())
-    }
-
-    #[test]
-    fn seal_bundle_rolls_back_when_event_recording_fails() -> anyhow::Result<()> {
-        let connection = prompt_store_connection()?;
-        create_prompt(
-            &connection,
-            "surface",
-            "surface-loop",
-            "prompt body",
-            None,
-            None,
-        )?;
-        set_prompt_status(&connection, "surface", "active")?;
-        create_bundle(&connection, "cleanroom", &["surface".to_owned()])?;
-        connection.execute("DROP TABLE event_log", [])?;
-
-        let result = seal_bundle(&connection, "cleanroom");
-
-        assert!(result.is_err());
-        let bundle = get_bundle(&connection, "cleanroom")?.context("missing bundle")?;
-        assert_eq!(bundle.status, "draft");
-        assert_eq!(bundle.manifest_json, "{}");
-        assert_eq!(bundle.bundle_hash, "");
-        assert_eq!(count_rows(&connection, "prompt_bundle_item")?, 1);
 
         Ok(())
     }

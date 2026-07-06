@@ -127,8 +127,6 @@ function controlDraft() {
     status: $('control-status') ? $('control-status').textContent : 'Controls write durable loop intervention events.',
     prompt: $('loop-prompt') ? $('loop-prompt').value : '.ldgr/prompts/ldgr-core-loop.md',
     promptSlug: $('loop-prompt-slug') ? $('loop-prompt-slug').value : '',
-    bundle: $('loop-bundle') ? $('loop-bundle').value : '',
-    promptRole: $('loop-prompt-role') ? $('loop-prompt-role').value : '',
     agent: $('loop-agent') ? $('loop-agent').value : 'agentctl',
     agentArgv: $('loop-agent-argv') ? $('loop-agent-argv').value : '',
     agentTimeoutSeconds: $('loop-agent-timeout-seconds') ? $('loop-agent-timeout-seconds').value : '43200',

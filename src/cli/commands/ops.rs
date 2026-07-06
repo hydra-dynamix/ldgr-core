@@ -34,10 +34,6 @@ use super::super::{CLI_DEFAULT_HELP_SECTIONS, INIT_PROJECT_SETUP_PROMPT};
 
 const LDGR_CONTEXT_EXTENSION: &str = include_str!("../../../extensions/ldgr-context.ts");
 const LDGR_CORE_LOOP_PROMPT: &str = include_str!("../../../prompts/loop-prompt.md");
-const LDGR_LOOP_PLANNER_PROMPT: &str = include_str!("../../../prompts/ldgr-loop-planner.md");
-const LDGR_LOOP_WORKER_PROMPT: &str = include_str!("../../../prompts/ldgr-loop-worker.md");
-const LDGR_LOOP_SCRYB_PROMPT: &str = include_str!("../../../prompts/ldgr-loop-scryb.md");
-const LDGR_LOOP_VALIDATOR_PROMPT: &str = include_str!("../../../prompts/ldgr-loop-validator.md");
 const LDGR_CORE_LOOP_PROMPT_FILE: &str = "ldgr-core-loop.md";
 const AGENTCTL_REPO: &str = "https://github.com/hydra-dynamix/agentctl";
 const LDGR_CORE_REPO: &str = "https://github.com/hydra-dynamix/ldgr-core";
@@ -2367,14 +2363,10 @@ fn seed_core_prompt_files(prompt_root: &Path) -> anyhow::Result<Vec<PathBuf>> {
     Ok(seeded)
 }
 
-fn core_prompt_files() -> [(&'static str, &'static str); 6] {
+fn core_prompt_files() -> [(&'static str, &'static str); 2] {
     [
         (LDGR_CORE_LOOP_PROMPT_FILE, LDGR_CORE_LOOP_PROMPT),
         (LOOP_INVARIANTS_PROMPT_FILE, LOOP_INVARIANTS_PROMPT),
-        ("ldgr-loop-planner.md", LDGR_LOOP_PLANNER_PROMPT),
-        ("ldgr-loop-worker.md", LDGR_LOOP_WORKER_PROMPT),
-        ("ldgr-loop-scryb.md", LDGR_LOOP_SCRYB_PROMPT),
-        ("ldgr-loop-validator.md", LDGR_LOOP_VALIDATOR_PROMPT),
     ]
 }
 
@@ -2470,20 +2462,22 @@ fn resolve_loop_prompt(
     connection: &rusqlite::Connection,
     args: &LoopRunArgs,
 ) -> anyhow::Result<LoopPromptSource> {
-    if let Some(prompt_path) = args.prompt.clone() {
-        return Ok(LoopPromptSource::Path(prompt_path));
+    let mut sources = Vec::new();
+    sources.extend(args.prompt.iter().cloned().map(LoopPromptSource::Path));
+    sources.extend(
+        args.prompt_slug
+            .iter()
+            .cloned()
+            .map(|slug| LoopPromptSource::StoredPrompt { slug }),
+    );
+    match sources.len() {
+        0 => {
+            let _ = connection;
+            bail!("loop run requires --prompt or --prompt-slug")
+        }
+        1 => Ok(sources.remove(0)),
+        _ => Ok(LoopPromptSource::Composite { sources }),
     }
-    if let Some(slug) = args.prompt_slug.clone() {
-        return Ok(LoopPromptSource::StoredPrompt { slug });
-    }
-    if let Some(slug) = args.bundle.clone() {
-        return Ok(LoopPromptSource::Bundle {
-            slug,
-            prompt_role: args.prompt_role.clone(),
-        });
-    }
-    let _ = connection;
-    bail!("loop run requires --prompt, --prompt-slug, or --bundle")
 }
 
 fn resolve_loop_agent(args: &LoopRunArgs) -> anyhow::Result<LoopAgent> {
@@ -2715,33 +2709,29 @@ prompt_stdin = true
     }
 
     #[test]
-    fn core_prompt_seed_installs_role_prompts_and_preserves_user_edits() -> anyhow::Result<()> {
+    fn core_prompt_seed_installs_loop_prompts_and_preserves_user_edits() -> anyhow::Result<()> {
         let root = tempfile::tempdir()?;
         let prompt_root = root.path().join("prompts");
 
         let seeded = seed_core_prompt_files(&prompt_root)?;
-        assert_eq!(seeded.len(), 6);
+        assert_eq!(seeded.len(), 2);
         assert!(prompt_root.join("ldgr-core-loop.md").is_file());
         assert!(prompt_root.join("ldgr-loop-invariants.md").is_file());
-        assert!(prompt_root.join("ldgr-loop-planner.md").is_file());
-        assert!(prompt_root.join("ldgr-loop-worker.md").is_file());
-        assert!(prompt_root.join("ldgr-loop-scryb.md").is_file());
-        assert!(prompt_root.join("ldgr-loop-validator.md").is_file());
-        assert!(
-            std::fs::read_to_string(prompt_root.join("ldgr-loop-worker.md"))?
-                .contains("fresh, ephemeral agent")
-        );
+        assert!(!prompt_root.join("ldgr-loop-planner.md").exists());
+        assert!(!prompt_root.join("ldgr-loop-worker.md").exists());
+        assert!(!prompt_root.join("ldgr-loop-scryb.md").exists());
+        assert!(!prompt_root.join("ldgr-loop-validator.md").exists());
         assert!(
             std::fs::read_to_string(prompt_root.join("ldgr-loop-invariants.md"))?
                 .contains("durable guidance for ephemeral agents")
         );
 
-        std::fs::write(prompt_root.join("ldgr-loop-planner.md"), "custom planner")?;
+        std::fs::write(prompt_root.join("ldgr-core-loop.md"), "custom loop")?;
         let reseeded = seed_core_prompt_files(&prompt_root)?;
         assert!(reseeded.is_empty());
         assert_eq!(
-            std::fs::read_to_string(prompt_root.join("ldgr-loop-planner.md"))?,
-            "custom planner"
+            std::fs::read_to_string(prompt_root.join("ldgr-core-loop.md"))?,
+            "custom loop"
         );
         Ok(())
     }

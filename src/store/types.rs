@@ -111,85 +111,6 @@ impl Prompt {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct PromptVersion {
-    pub id: i64,
-    pub prompt_id: i64,
-    pub version: i64,
-    pub role: String,
-    pub body: String,
-    pub content_hash: String,
-    pub source_path: Option<String>,
-    pub description: Option<String>,
-    pub created_at: String,
-}
-
-impl PromptVersion {
-    pub(crate) fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
-        Ok(Self {
-            id: row.get("id")?,
-            prompt_id: row.get("prompt_id")?,
-            version: row.get("version")?,
-            role: row.get("role")?,
-            body: row.get("body")?,
-            content_hash: row.get("content_hash")?,
-            source_path: row.get("source_path")?,
-            description: row.get("description")?,
-            created_at: row.get("created_at")?,
-        })
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct PromptBundle {
-    pub id: i64,
-    pub slug: String,
-    pub status: String,
-    pub manifest_json: String,
-    pub bundle_hash: String,
-    pub created_at: String,
-}
-
-impl PromptBundle {
-    pub(crate) fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
-        Ok(Self {
-            id: row.get("id")?,
-            slug: row.get("slug")?,
-            status: row.get("status")?,
-            manifest_json: row.get("manifest_json")?,
-            bundle_hash: row.get("bundle_hash")?,
-            created_at: row.get("created_at")?,
-        })
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct PromptBundleItem {
-    pub id: i64,
-    pub bundle_id: i64,
-    pub prompt_id: i64,
-    pub prompt_version_id: i64,
-    pub prompt_slug: String,
-    pub prompt_role: String,
-    pub prompt_version: i64,
-    pub content_hash: String,
-}
-
-impl PromptBundleItem {
-    pub(crate) fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
-        Ok(Self {
-            id: row.get("id")?,
-            bundle_id: row.get("bundle_id")?,
-            prompt_id: row.get("prompt_id")?,
-            prompt_version_id: row.get("prompt_version_id")?,
-            prompt_slug: row.get("prompt_slug")?,
-            prompt_role: row.get("prompt_role")?,
-            prompt_version: row.get("prompt_version")?,
-            content_hash: row.get("content_hash")?,
-        })
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Artifact {
     pub id: i64,
     pub run_id: i64,
@@ -303,6 +224,7 @@ pub struct StoreContext {
     pub latest_decision: Option<DecisionSummary>,
     pub latest_observations: Vec<ObservationSummary>,
     pub latest_validations: Vec<ValidationSummary>,
+    #[serde(rename = "binding_directives")]
     pub global_observations: Vec<GlobalObservation>,
     pub latest_artifacts: Vec<ArtifactSummary>,
     #[serde(skip_serializing_if = "Option::is_none")]

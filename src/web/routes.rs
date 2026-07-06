@@ -275,6 +275,7 @@ fn serve_loop_start(
             command.arg("--audit-argv").arg(audit_argv);
         }
     }
+    configure_reaped_child(&mut command);
     let rendered_command = render_command_redacted(&command);
     let child = match command
         .stdin(Stdio::null())
@@ -322,28 +323,41 @@ fn serve_loop_start(
 fn loop_prompt_source_args(form: &[(String, String)]) -> anyhow::Result<Vec<String>> {
     let prompt = optional_nonempty_form_value(form, "prompt");
     let prompt_slug = optional_nonempty_form_value(form, "prompt_slug");
-    let bundle = optional_nonempty_form_value(form, "bundle");
-    let count = [prompt, prompt_slug, bundle]
+    let count = [prompt, prompt_slug]
         .into_iter()
         .filter(|value| value.is_some())
         .count();
     if count != 1 {
-        bail!("exactly one of prompt, prompt_slug, or bundle must be provided");
+        bail!("cockpit launch requires exactly one of prompt or prompt_slug; use the CLI with repeated --prompt/--prompt-slug for composite prompts");
     }
     if let Some(prompt) = prompt {
         validate_prompt_path(prompt)?;
         return Ok(vec!["--prompt".to_owned(), prompt.to_owned()]);
     }
-    if let Some(prompt_slug) = prompt_slug {
-        return Ok(vec!["--prompt-slug".to_owned(), prompt_slug.to_owned()]);
+    let prompt_slug = prompt_slug.expect("prompt_slug is present when prompt is absent");
+    Ok(vec!["--prompt-slug".to_owned(), prompt_slug.to_owned()])
+}
+
+fn configure_reaped_child(command: &mut Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+        unsafe {
+            command.pre_exec(|| {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::getppid() == 1 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "parent exited before loop runtime child was armed",
+                    ));
+                }
+                Ok(())
+            });
+        }
     }
-    let bundle = bundle.expect("bundle is present when prompt and prompt_slug are absent");
-    let mut args = vec!["--bundle".to_owned(), bundle.to_owned()];
-    if let Some(prompt_role) = optional_nonempty_form_value(form, "prompt_role") {
-        args.push("--prompt-role".to_owned());
-        args.push(prompt_role.to_owned());
-    }
-    Ok(args)
 }
 
 fn render_command_redacted(command: &Command) -> String {

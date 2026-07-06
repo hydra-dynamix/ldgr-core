@@ -27,6 +27,12 @@ fn top_level_help_shows_core_loop_and_hides_mature_project_surface() -> anyhow::
             .and(predicate::str::contains("observe <run-id-or-work-slug>"))
             .and(predicate::str::contains("decision record <work-slug>"))
             .and(predicate::str::contains(
+                "loop run --prompt prompts/base.md --prompt prompts/project-rules.md",
+            ))
+            .and(predicate::str::contains(
+                "loop run --prompt-slug core-loop --prompt-slug project-rules",
+            ))
+            .and(predicate::str::contains(
                 "Default help shows the day-one workflow",
             ))
             .and(predicate::str::contains("target-profile").not())
@@ -60,6 +66,26 @@ fn adapter_focused_help_keeps_adapter_discovery_blocks() -> anyhow::Result<()> {
         predicate::str::contains("Discover installed adapter manifests")
             .and(predicate::str::contains("Available adapters:"))
             .and(predicate::str::contains("ldgr adapter install conduct")),
+    );
+    Ok(())
+}
+
+#[test]
+fn loop_help_documents_composite_prompt_sources() -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    let mut command = isolated_command(project.path())?;
+    command.args(["loop", "run", "--help"]);
+    command.assert().success().stdout(
+        predicate::str::contains("--prompt <PROMPT>")
+            .and(predicate::str::contains(
+                "Repeat --prompt and/or --prompt-slug",
+            ))
+            .and(predicate::str::contains(
+                "--prompt prompts/loop-prompt.md --prompt prompts/project-rules.md",
+            ))
+            .and(predicate::str::contains(
+                "--prompt-slug core-loop --prompt-slug web-project-rules",
+            )),
     );
     Ok(())
 }
@@ -242,9 +268,9 @@ fn full_help_shows_core_command_tree_and_research_split() -> anyhow::Result<()> 
                 "  notice\n    list\n    add\n    edit\n    clear",
             ))
             .and(predicate::str::contains(
-                "  prompt\n    create\n    import\n    update\n    activate",
+                "  prompt\n    list\n    show\n    create\n    import\n    update\n    compose\n    activate",
             ))
-            .and(predicate::str::contains("  bundle\n    create\n    seal"))
+            .and(predicate::str::contains("  bundle\n    create\n    seal").not())
             .and(predicate::str::contains(
                 "Research/readiness commands moved to `ldgr-research`",
             ))
@@ -1952,7 +1978,7 @@ fn artifacts_can_be_recorded_outside_artifact_root() -> anyhow::Result<()> {
 }
 
 #[test]
-fn install_seeds_global_generic_loop_role_prompts() -> anyhow::Result<()> {
+fn install_seeds_global_loop_prompts() -> anyhow::Result<()> {
     let project = TempDir::new()?;
     let mut command = isolated_command(project.path())?;
     command.current_dir(project.path()).args([
@@ -1964,21 +1990,17 @@ fn install_seeds_global_generic_loop_role_prompts() -> anyhow::Result<()> {
     ]);
     command.assert().success().stdout(
         predicate::str::contains("Seeded prompt")
-            .and(predicate::str::contains("ldgr-loop-planner.md"))
-            .and(predicate::str::contains("ldgr-loop-validator.md")),
+            .and(predicate::str::contains("ldgr-core-loop.md"))
+            .and(predicate::str::contains("ldgr-loop-invariants.md")),
     );
 
     let prompt_root = project.path().join(".ldgr/test-empty-home/.ldgr/prompts");
     assert!(prompt_root.join("ldgr-core-loop.md").is_file());
     assert!(prompt_root.join("ldgr-loop-invariants.md").is_file());
-    assert!(prompt_root.join("ldgr-loop-planner.md").is_file());
-    assert!(prompt_root.join("ldgr-loop-worker.md").is_file());
-    assert!(prompt_root.join("ldgr-loop-scryb.md").is_file());
-    assert!(prompt_root.join("ldgr-loop-validator.md").is_file());
-    assert!(
-        fs::read_to_string(prompt_root.join("ldgr-loop-validator.md"))?
-            .contains("ldgr-validator-revision json")
-    );
+    assert!(!prompt_root.join("ldgr-loop-planner.md").exists());
+    assert!(!prompt_root.join("ldgr-loop-worker.md").exists());
+    assert!(!prompt_root.join("ldgr-loop-scryb.md").exists());
+    assert!(!prompt_root.join("ldgr-loop-validator.md").exists());
     assert!(project
         .path()
         .join(".ldgr/test-empty-home/.pi/agent/extensions/ldgr-context.ts")
@@ -1987,7 +2009,7 @@ fn install_seeds_global_generic_loop_role_prompts() -> anyhow::Result<()> {
 }
 
 #[test]
-fn init_seeds_editable_generic_loop_role_prompts() -> anyhow::Result<()> {
+fn init_seeds_editable_loop_prompts() -> anyhow::Result<()> {
     let project = TempDir::new()?;
     let db_path = project.path().join(".ldgr/ldgr.db");
     let artifact_root = project.path().join(".ldgr/artifacts");
@@ -1997,27 +2019,23 @@ fn init_seeds_editable_generic_loop_role_prompts() -> anyhow::Result<()> {
     let prompt_root = project.path().join(".ldgr/prompts");
     assert!(prompt_root.join("ldgr-core-loop.md").is_file());
     assert!(prompt_root.join("ldgr-loop-invariants.md").is_file());
-    assert!(prompt_root.join("ldgr-loop-planner.md").is_file());
-    assert!(prompt_root.join("ldgr-loop-worker.md").is_file());
-    assert!(prompt_root.join("ldgr-loop-scryb.md").is_file());
-    assert!(prompt_root.join("ldgr-loop-validator.md").is_file());
+    assert!(!prompt_root.join("ldgr-loop-planner.md").exists());
+    assert!(!prompt_root.join("ldgr-loop-worker.md").exists());
+    assert!(!prompt_root.join("ldgr-loop-scryb.md").exists());
+    assert!(!prompt_root.join("ldgr-loop-validator.md").exists());
     let invariants_prompt = fs::read_to_string(prompt_root.join("ldgr-loop-invariants.md"))?;
     assert!(invariants_prompt.contains("durable guidance for ephemeral agents"));
-    assert!(invariants_prompt.contains("proportionate validator rigor"));
-    let validator_prompt = fs::read_to_string(prompt_root.join("ldgr-loop-validator.md"))?;
-    assert!(validator_prompt.contains("fresh, ephemeral agent"));
-    assert!(validator_prompt.contains("ldgr-validator-revision json"));
-    assert!(validator_prompt.contains("proportionate, risk-based acceptance"));
+    assert!(invariants_prompt.contains("Complete exactly the assigned bounded work item"));
 
-    fs::write(prompt_root.join("ldgr-loop-worker.md"), "custom worker")?;
+    fs::write(prompt_root.join("ldgr-core-loop.md"), "custom loop")?;
     fs::write(
         prompt_root.join("ldgr-loop-invariants.md"),
         "custom invariants",
     )?;
     run(project.path(), &db_path, &artifact_root, ["init"])?;
     assert_eq!(
-        fs::read_to_string(prompt_root.join("ldgr-loop-worker.md"))?,
-        "custom worker"
+        fs::read_to_string(prompt_root.join("ldgr-core-loop.md"))?,
+        "custom loop"
     );
     assert_eq!(
         fs::read_to_string(prompt_root.join("ldgr-loop-invariants.md"))?,
@@ -2094,7 +2112,7 @@ fn context_reports_clear_loop_invariants_fallback_when_prompt_missing() -> anyho
 }
 
 #[test]
-fn prompt_and_bundle_commands_match_documented_loop_surface() -> anyhow::Result<()> {
+fn prompt_commands_match_documented_loop_surface() -> anyhow::Result<()> {
     let project = TempDir::new()?;
     let db_path = project.path().join(".ldgr/ldgr.db");
     let artifact_root = project.path().join(".ldgr/artifacts");
@@ -2127,7 +2145,7 @@ fn prompt_and_bundle_commands_match_documented_loop_surface() -> anyhow::Result<
     .assert()
     .success()
     .stdout(predicate::str::contains(
-        "created prompt surface version=1 status=draft",
+        "created global prompt surface path=",
     ));
     command(
         project.path(),
@@ -2144,7 +2162,7 @@ fn prompt_and_bundle_commands_match_documented_loop_surface() -> anyhow::Result<
     .assert()
     .success()
     .stdout(predicate::str::contains(
-        "updated prompt surface version=2 status=draft",
+        "updated global prompt surface path=",
     ));
     command(
         project.path(),
@@ -2155,7 +2173,35 @@ fn prompt_and_bundle_commands_match_documented_loop_surface() -> anyhow::Result<
     .assert()
     .success()
     .stdout(predicate::str::contains(
-        "activated prompt surface version=2 status=active",
+        "global prompt surface is available path=",
+    ));
+    command(project.path(), &db_path, &artifact_root, ["prompt", "list"])?
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("surface path="));
+    command(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        ["prompt", "show", "surface"],
+    )?
+    .assert()
+    .success()
+    .stdout(
+        predicate::str::contains("prompt: surface")
+            .and(predicate::str::contains("path:"))
+            .and(predicate::str::contains("body:\nsurface prompt v2")),
+    );
+    command(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        ["prompt", "show", "surface", "--body"],
+    )?
+    .assert()
+    .success()
+    .stdout(predicate::str::contains(
+        "surface prompt v2 {{ldgr_context}}",
     ));
     command(
         project.path(),
@@ -2174,44 +2220,39 @@ fn prompt_and_bundle_commands_match_documented_loop_surface() -> anyhow::Result<
     .assert()
     .success()
     .stdout(predicate::str::contains(
-        "imported prompt implementation version=1 status=draft",
+        "imported global prompt implementation path=",
     ));
-    run(
-        project.path(),
-        &db_path,
-        &artifact_root,
-        ["prompt", "activate", "implementation"],
-    )?;
     command(
         project.path(),
         &db_path,
         &artifact_root,
         [
-            "bundle",
-            "create",
-            "cleanroom",
-            "--prompt",
+            "prompt",
+            "compose",
+            "project-loop",
+            "--source",
             "surface",
-            "--prompt",
+            "--source",
             "implementation",
         ],
     )?
     .assert()
     .success()
     .stdout(predicate::str::contains(
-        "created bundle cleanroom status=draft",
+        "composed global prompt project-loop path=",
     ));
     command(
         project.path(),
         &db_path,
         &artifact_root,
-        ["bundle", "seal", "cleanroom"],
+        ["prompt", "show", "project-loop", "--body"],
     )?
     .assert()
     .success()
-    .stdout(predicate::str::contains(
-        "sealed bundle cleanroom status=sealed hash=fnv1a64:",
-    ));
+    .stdout(
+        predicate::str::contains("surface prompt v2")
+            .and(predicate::str::contains("implementation prompt")),
+    );
     run(
         project.path(),
         &db_path,
@@ -2219,11 +2260,11 @@ fn prompt_and_bundle_commands_match_documented_loop_surface() -> anyhow::Result<
         [
             "work",
             "create",
-            "bundle-loop",
+            "global-prompt-loop",
             "--title",
-            "Bundle loop",
+            "Global prompt loop",
             "--description",
-            "Verify bundle-backed prompt rendering.",
+            "Verify global prompt rendering.",
         ],
     )?;
 
@@ -2231,19 +2272,13 @@ fn prompt_and_bundle_commands_match_documented_loop_surface() -> anyhow::Result<
         project.path(),
         &db_path,
         &artifact_root,
-        [
-            "loop",
-            "run",
-            "--bundle",
-            "cleanroom",
-            "--prompt-role",
-            "surface-loop",
-            "--dry-run",
-        ],
+        ["loop", "run", "--prompt-slug", "project-loop", "--dry-run"],
     )?
     .assert()
     .success()
-    .stdout(predicate::str::contains("loop run=1 work=bundle-loop"));
+    .stdout(predicate::str::contains(
+        "loop run=1 work=global-prompt-loop",
+    ));
 
     let rendered_prompt = fs::read_to_string(artifact_root.join("loop-run-1-prompt.md"))?;
     assert!(
@@ -2251,28 +2286,24 @@ fn prompt_and_bundle_commands_match_documented_loop_surface() -> anyhow::Result<
         "{rendered_prompt}"
     );
     assert!(
+        rendered_prompt.contains("implementation prompt"),
+        "{rendered_prompt}"
+    );
+    assert!(
         !rendered_prompt.contains("surface prompt v1"),
         "{rendered_prompt}"
     );
     assert!(
-        rendered_prompt.contains(r#""work_slug": "bundle-loop""#),
+        rendered_prompt.contains(r#""work_slug": "global-prompt-loop""#),
         "{rendered_prompt}"
     );
     let provenance = fs::read_to_string(artifact_root.join("loop-run-1-prompt-provenance.json"))?;
     assert!(
-        provenance.contains(r#""source_type": "bundle""#),
+        provenance.contains(r#""source_type": "global_prompt""#),
         "{provenance}"
     );
     assert!(
-        provenance.contains(r#""bundle_slug": "cleanroom""#),
-        "{provenance}"
-    );
-    assert!(
-        provenance.contains(r#""prompt_role": "surface-loop""#),
-        "{provenance}"
-    );
-    assert!(
-        provenance.contains(r#""prompt_version": 2"#),
+        provenance.contains(r#""prompt_slug": "project-loop""#),
         "{provenance}"
     );
 
@@ -2512,7 +2543,7 @@ fn autonomous_loop_runtime_allows_agent_to_finish_run_before_parent_capture() ->
     let agent_path = project.path().join("agent-finishes-run.sh");
     fs::write(
         &agent_path,
-        "#!/bin/sh\ncat >/dev/null\nif [ \"$LDGR_LOOP_ROLE\" = validator ]; then\n  LDGR_BIN=\"$1\"\n  DB=\"$2\"\n  ARTIFACTS=\"$3\"\n  \"$LDGR_BIN\" --db \"$DB\" --artifact-root \"$ARTIFACTS\" observation add 1 --body 'agent is finishing this run before parent capture'\n  \"$LDGR_BIN\" --db \"$DB\" --artifact-root \"$ARTIFACTS\" run finish 1 --status success --notes 'agent finished run before parent capture'\n  \"$LDGR_BIN\" --db \"$DB\" --artifact-root \"$ARTIFACTS\" decision record self-finish-loop --outcome stop --rationale 'agent finished and closed the work'\nfi\nprintf 'agent-finished-run\\n'\n",
+        "#!/bin/sh\ncat >/dev/null\nLDGR_BIN=\"$1\"\nDB=\"$2\"\nARTIFACTS=\"$3\"\n\"$LDGR_BIN\" --db \"$DB\" --artifact-root \"$ARTIFACTS\" observation add 1 --body 'agent is finishing this run before parent capture'\n\"$LDGR_BIN\" --db \"$DB\" --artifact-root \"$ARTIFACTS\" run finish 1 --status success --notes 'agent finished run before parent capture'\n\"$LDGR_BIN\" --db \"$DB\" --artifact-root \"$ARTIFACTS\" decision record self-finish-loop --outcome stop --rationale 'agent finished and closed the work'\nprintf 'agent-finished-run\\n'\n",
     )?;
     let ldgr_bin = assert_cmd::cargo::cargo_bin("ldgr");
     let agent_argv = serde_json::to_string(&vec![
@@ -2570,192 +2601,6 @@ fn autonomous_loop_runtime_allows_agent_to_finish_run_before_parent_capture() ->
         ))
         .stdout(predicate::str::contains("loop-run-1-agent-output.md"))
         .stdout(predicate::str::contains("phase=failed").not());
-
-    Ok(())
-}
-
-#[test]
-fn autonomous_loop_runtime_rejects_non_planner_stop_decision() -> anyhow::Result<()> {
-    let project = TempDir::new()?;
-    let db_path = project.path().join(".ldgr/ldgr.db");
-    let artifact_root = project.path().join(".ldgr/artifacts");
-    let prompt_root = project.path().join("prompts");
-    fs::create_dir_all(&prompt_root)?;
-    let prompt_path = prompt_root.join("ldgr-core-loop.md");
-    fs::write(&prompt_path, "BASE {{ldgr_context}}")?;
-    for role in ["planner", "worker", "scryb", "validator"] {
-        fs::write(
-            prompt_root.join(format!("ldgr-loop-{role}.md")),
-            format!("ROLE: {role}\n{{{{ldgr_context}}}}"),
-        )?;
-    }
-    let agent_path = project.path().join("agent-nonplanner-stop.sh");
-    fs::write(
-        &agent_path,
-        "#!/bin/sh\ncat >/dev/null\nif [ \"$LDGR_LOOP_ROLE\" = worker ]; then\n  LDGR_BIN=\"$1\"\n  DB=\"$2\"\n  ARTIFACTS=\"$3\"\n  \"$LDGR_BIN\" --db \"$DB\" --artifact-root \"$ARTIFACTS\" run close 1 --status success --outcome stop --rationale 'worker recommends stopping'\n  exit $?\nfi\nprintf 'role=%s\\n' \"$LDGR_LOOP_ROLE\"\n",
-    )?;
-    let ldgr_bin = assert_cmd::cargo::cargo_bin("ldgr");
-    let agent_argv = serde_json::to_string(&vec![
-        "sh".to_string(),
-        agent_path.to_str().unwrap().to_string(),
-        ldgr_bin.to_str().unwrap().to_string(),
-        db_path.to_str().unwrap().to_string(),
-        artifact_root.to_str().unwrap().to_string(),
-    ])?;
-
-    run(project.path(), &db_path, &artifact_root, ["init"])?;
-    run(
-        project.path(),
-        &db_path,
-        &artifact_root,
-        [
-            "work",
-            "create",
-            "nonplanner-stop-loop",
-            "--title",
-            "Nonplanner stop loop",
-            "--description",
-            "Worker must not be able to stop the broader loop.",
-        ],
-    )?;
-
-    command(
-        project.path(),
-        &db_path,
-        &artifact_root,
-        [
-            "loop",
-            "run",
-            "--prompt",
-            prompt_path.to_str().expect("prompt path is UTF-8"),
-            "--agent-argv",
-            &agent_argv,
-        ],
-    )?
-    .assert()
-    .success()
-    .stdout(predicate::str::contains(
-        "loop run=1 work=nonplanner-stop-loop",
-    ))
-    .stdout(predicate::str::contains("agent_exit_code: 1"));
-
-    let worker_output =
-        fs::read_to_string(artifact_root.join("loop-run-1-worker-agent-output.md"))?;
-    assert!(
-        worker_output.contains("role worker may not close run 1")
-            || worker_output.contains("loop stop decisions require planner authority"),
-        "{worker_output}"
-    );
-    command(project.path(), &db_path, &artifact_root, ["context"])?
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("latest_decision: none"))
-        .stdout(predicate::str::contains(
-            "loop_state: phase=needs_decision run=1 work=nonplanner-stop-loop status=failed",
-        ));
-
-    Ok(())
-}
-
-#[test]
-fn autonomous_loop_runtime_blocks_planner_run_closure_so_sequence_completes() -> anyhow::Result<()>
-{
-    // Regression: a capable planner would diagnose the work, then close the run
-    // (ldgr run close --outcome continue) before the worker executed, breaking
-    // the 4-role sequence. Roles may not close the assigned run; the loop
-    // runtime owns run closure across the full sequence.
-    let project = TempDir::new()?;
-    let db_path = project.path().join(".ldgr/ldgr.db");
-    let artifact_root = project.path().join(".ldgr/artifacts");
-    let prompt_root = project.path().join("prompts");
-    fs::create_dir_all(&prompt_root)?;
-    let prompt_path = prompt_root.join("ldgr-core-loop.md");
-    fs::write(&prompt_path, "BASE {{ldgr_context}}")?;
-    for role in ["planner", "worker", "scryb", "validator"] {
-        fs::write(
-            prompt_root.join(format!("ldgr-loop-{role}.md")),
-            format!("ROLE: {role}\n{{{{ldgr_context}}}}"),
-        )?;
-    }
-    // Planner attempts to close the run with outcome=continue; that must be
-    // rejected so worker/scryb/validator still execute.
-    let agent_path = project.path().join("agent-planner-closes.sh");
-    fs::write(
-        &agent_path,
-        "#!/bin/sh\ncat >/dev/null\nif [ \"$LDGR_LOOP_ROLE\" = planner ]; then\n  LDGR_BIN=\"$1\"\n  DB=\"$2\"\n  ARTIFACTS=\"$3\"\n  \"$LDGR_BIN\" --db \"$DB\" --artifact-root \"$ARTIFACTS\" run close 1 --status partial --outcome continue --rationale 'planner queued follow-up' --next-slug follow-up --next-title 'Follow up' --next-description 'Worker applies the fix.'\n  # Continue even though close was rejected: record an observation and proceed\n  printf 'planner planned\n'\n  exit 0\nfi\nprintf 'role=%s\n' \"$LDGR_LOOP_ROLE\"\n",
-    )?;
-    let ldgr_bin = assert_cmd::cargo::cargo_bin("ldgr");
-    let agent_argv = serde_json::to_string(&vec![
-        "sh".to_string(),
-        agent_path.to_str().unwrap().to_string(),
-        ldgr_bin.to_str().unwrap().to_string(),
-        db_path.to_str().unwrap().to_string(),
-        artifact_root.to_str().unwrap().to_string(),
-    ])?;
-
-    run(project.path(), &db_path, &artifact_root, ["init"])?;
-    run(
-        project.path(),
-        &db_path,
-        &artifact_root,
-        [
-            "work",
-            "create",
-            "planner-closes-loop",
-            "--title",
-            "Planner closes loop",
-            "--description",
-            "Planner must not be able to close the run before worker executes.",
-        ],
-    )?;
-
-    command(
-        project.path(),
-        &db_path,
-        &artifact_root,
-        [
-            "loop",
-            "run",
-            "--prompt",
-            prompt_path.to_str().expect("prompt path is UTF-8"),
-            "--agent-argv",
-            &agent_argv,
-        ],
-    )?
-    .assert()
-    .success()
-    .stdout(predicate::str::contains(
-        "loop run=1 work=planner-closes-loop",
-    ))
-    .stdout(predicate::str::contains("agent_exit_code: 0"));
-
-    // All four roles ran (worker/scryb/validator artifacts exist).
-    for role in ["planner", "worker", "scryb", "validator"] {
-        assert!(
-            artifact_root
-                .join(format!("loop-run-1-{role}-agent-output.md"))
-                .is_file(),
-            "missing {role} output artifact"
-        );
-    }
-    // The planner's run close attempt was rejected with the closure-authority
-    // message, recorded in the planner output artifact.
-    let planner_output =
-        fs::read_to_string(artifact_root.join("loop-run-1-planner-agent-output.md"))?;
-    assert!(
-        planner_output.contains("role planner may not close run 1"),
-        "{planner_output}"
-    );
-    // The run reached a terminal status only via the runtime's authoritative
-    // close at sequence end (not prematurely by the planner). The role loop
-    // finishes the run without recording a decision, so the loop surfaces a
-    // needs_decision phase; that is a separate follow-up, not this regression.
-    command(project.path(), &db_path, &artifact_root, ["status"])?
-        .assert()
-        .success()
-        .stdout(predicate::str::contains(
-            "loop: phase=needs_decision run=1 work=planner-closes-loop status=success",
-        ));
 
     Ok(())
 }
@@ -2900,10 +2745,8 @@ fn autonomous_loop_runtime_live_progress_can_be_disabled() -> anyhow::Result<()>
     .success()
     .stderr(
         predicate::str::contains("[ldgr loop] start run=1 work=live-progress")
-            .and(predicate::str::contains("phase=running_planner_agent"))
-            .and(predicate::str::contains(
-                "loop-run-1-planner-agent-output.md",
-            )),
+            .and(predicate::str::contains("phase=running_agent"))
+            .and(predicate::str::contains("loop-run-1-agent-output.md")),
     );
 
     let project = TempDir::new()?;
@@ -3002,7 +2845,7 @@ fn autonomous_loop_runtime_heartbeats_during_quiet_subprocess() -> anyhow::Resul
     .success()
     .stdout(predicate::str::contains("BUFFERED_CHILD_OUTPUT"))
     .stderr(predicate::str::contains(
-        "heartbeat run=1 work=quiet-child role=planner: subprocess still running",
+        "heartbeat run=1 work=quiet-child: subprocess still running",
     ));
 
     Ok(())
@@ -3018,7 +2861,7 @@ fn autonomous_loop_runtime_preserves_full_output_in_files() -> anyhow::Result<()
     let agent_path = project.path().join("large-output-agent.sh");
     fs::write(
         &agent_path,
-        "#!/bin/sh\ncat >/dev/null\nyes A | tr -d '\\n' | head -c 70000\nprintf 'STDOUT_TAIL\\n'\nyes B | tr -d '\\n' | head -c 70000 >&2\nprintf 'STDERR_TAIL\\n' >&2\n",
+        "#!/bin/sh\ncat >/dev/null\npython3 - <<'PY'\nimport sys\nsys.stdout.write('A' * 70000)\nsys.stdout.write('STDOUT_TAIL\\n')\nsys.stderr.write('B' * 70000)\nsys.stderr.write('STDERR_TAIL\\n')\nPY\n",
     )?;
     let agent_argv = serde_json::to_string(&vec!["sh", agent_path.to_str().unwrap()])?;
 
@@ -3173,7 +3016,7 @@ fn global_notices_and_held_work_steer_context_without_canceling_work() -> anyhow
         .stdout(predicate::str::contains(
             "work_items: pending=1 running=0 held=1 done=0 canceled=0",
         ))
-        .stdout(predicate::str::contains("global_observations:"))
+        .stdout(predicate::str::contains("binding_directives:"))
         .stdout(predicate::str::contains(
             "Research is waiting on dev-dependency",
         ))
@@ -3268,10 +3111,6 @@ fn autonomous_loop_runtime_repeats_until_no_pending_work_remains() -> anyhow::Re
         r#"#!/usr/bin/env bash
 set -euo pipefail
 prompt="$(cat)"
-if [ "$LDGR_LOOP_ROLE" != validator ]; then
-  printf 'role=%s\n' "$LDGR_LOOP_ROLE"
-  exit 0
-fi
 if grep -q '"work_slug": "second-loop"' <<<"$prompt"; then
   "$LDGR_BIN" --db "$LDGR_DB" --artifact-root "$LDGR_ARTIFACT_ROOT" run close 2 --status success --outcome stop --rationale "All loop work is complete."
 elif grep -q '"work_slug": "first-loop"' <<<"$prompt"; then

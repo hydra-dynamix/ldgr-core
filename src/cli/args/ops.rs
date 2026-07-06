@@ -148,7 +148,7 @@ pub struct WebArgs {
 
 #[derive(Debug, Args)]
 #[command(
-    after_help = "Examples:\n  ldgr loop run --prompt prompts/loop-prompt.md --agent agentctl\n  ldgr loop run --prompt prompts/loop-prompt.md --agent agentctl --until-empty --summary-agent agentctl\n  ldgr loop run --prompt prompts/loop-prompt.md --dry-run\n  ldgr loop run --prompt prompts/loop-prompt.md --agent-argv '[\"my-agent\"]'\n\nLoop run executes bounded cycles from pending work items. Each cycle runs fresh role invocations that rehydrate from LDGR context. Use --until-empty to keep launching one fresh cycle at a time until no pending work remains or the loop blocks."
+    after_help = "Examples:\n  ldgr loop run --prompt prompts/loop-prompt.md --agent agentctl\n  ldgr loop run --prompt prompts/loop-prompt.md --prompt prompts/project-rules.md --agent agentctl\n  ldgr loop run --prompt-slug core-loop --prompt-slug web-project-rules --agent agentctl\n  ldgr loop run --prompt prompts/loop-prompt.md --agent agentctl --until-empty --summary-agent agentctl\n  ldgr loop run --prompt prompts/loop-prompt.md --dry-run\n  ldgr loop run --prompt prompts/loop-prompt.md --agent-argv '[\"my-agent\"]'\n\nLoop run executes bounded single-agent cycles from pending work items. Repeat --prompt and/or --prompt-slug to concatenate selected instruction fragments into one rendered loop prompt. Each cycle launches one fresh agent process that rehydrates from LDGR context. Use --until-empty to keep launching one fresh cycle at a time until no pending work remains or the loop blocks."
 )]
 pub struct LoopArgs {
     #[command(subcommand)]
@@ -162,22 +162,17 @@ pub enum LoopCommand {
 }
 
 #[derive(Debug, Args)]
+#[command(
+    after_help = "Examples:\n  ldgr loop run --prompt prompts/loop-prompt.md --agent agentctl\n  ldgr loop run --prompt prompts/loop-prompt.md --prompt prompts/project-rules.md --agent agentctl\n  ldgr loop run --prompt-slug core-loop --prompt-slug web-project-rules --agent agentctl\n  ldgr loop run --prompt prompts/loop-prompt.md --agent agentctl --until-empty --summary-agent agentctl\n  ldgr loop run --prompt prompts/loop-prompt.md --dry-run\n  ldgr loop run --prompt prompts/loop-prompt.md --agent-argv '[\"my-agent\"]'\n\nLoop run executes bounded single-agent cycles from pending work items. Repeat --prompt and/or --prompt-slug to concatenate selected instruction fragments into one rendered loop prompt. Each cycle launches one fresh agent process that rehydrates from LDGR context. Use --until-empty to keep launching one fresh cycle at a time until no pending work remains or the loop blocks."
+)]
 pub struct LoopRunArgs {
-    /// Editable prompt document used as the model system prompt template.
-    #[arg(long, conflicts_with_all = ["prompt_slug", "bundle"])]
-    pub prompt: Option<PathBuf>,
+    /// Editable prompt document used as a loop prompt template fragment. Repeat to concatenate fragments.
+    #[arg(long)]
+    pub prompt: Vec<PathBuf>,
 
-    /// Stored active prompt slug to render without reading an external prompt file.
-    #[arg(long, conflicts_with_all = ["prompt", "bundle"])]
-    pub prompt_slug: Option<String>,
-
-    /// Sealed bundle slug to render without reading loose external prompt files.
-    #[arg(long, conflicts_with_all = ["prompt", "prompt_slug"])]
-    pub bundle: Option<String>,
-
-    /// Prompt role to select when --bundle contains multiple prompts.
-    #[arg(long, requires = "bundle")]
-    pub prompt_role: Option<String>,
+    /// Global prompt slug under ~/.ldgr/prompts/<slug>.md. Repeat to concatenate fragments.
+    #[arg(long)]
+    pub prompt_slug: Vec<String>,
 
     /// Built-in agent preset. Values: agentctl. Use --agent-argv for custom commands.
     #[arg(long, value_enum)]
@@ -191,7 +186,7 @@ pub struct LoopRunArgs {
     #[arg(long)]
     pub audit_argv: Option<String>,
 
-    /// Built-in post-run summarizer preset. Values: agentctl. Runs once after each completed worker cycle.
+    /// Built-in post-run summarizer preset. Values: agentctl. Runs once after each completed loop cycle.
     #[arg(long, value_enum)]
     pub summary_agent: Option<CliLoopAgent>,
 

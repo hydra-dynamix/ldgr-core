@@ -308,6 +308,7 @@ ldgr work create first-slice \
 
 ldgr loop run \
   --prompt prompts/loop-prompt.md \
+  --prompt prompts/project-rules.md \
   --agent-argv '["codex", "exec", "..."]' \
   --max-iterations 10 \
   --stream-agent-output

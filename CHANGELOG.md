@@ -7,15 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-07-06
+
+### Changed
+
+- Restore `ldgr loop run` to the single-agent loop model while keeping composable prompt sources, `--until-empty`, summaries, and prompt provenance.
+- Seed only the core loop prompt and loop invariants prompt; remove generic multi-role planner/worker/scryb/validator prompt seeding from the default install/init path.
+- Rename active notice context to `binding_directives` so operators and agents can post durable steering that later loop agents treat as binding.
+- Refresh help and onboarding docs for global prompt files, prompt composition, and the single-agent loop runtime.
+
+### Removed
+
+- Remove remaining prompt-bundle store/schema/runtime internals and related tests from the active core code path.
+
+### Fixed
+
+- Ensure spawned loop subprocesses and web-launched loop runtimes are grouped and signaled on timeout or parent shutdown to reduce orphaned agent processes.
+
+## [0.1.2] - 2026-07-05
+
 ### Added
 
 - Add `ldgr loop run --until-empty` to keep launching fresh single-agent loop cycles until no pending work remains or the loop blocks.
 - Add optional one-shot post-cycle summaries via `--summary-agent agentctl` / `--summary-argv`, appended to `.ldgr/logs/loop-summary.md` without making the worker agent write narrative reports.
 - Install the core loop prompt and include `core` alongside installed adapter loops such as conduct/research in the Pi `/run-loop` selector.
 - Add routine-cycle guidance to prefer compact machine-summarizable run summaries and reserve long narrative reports for promotion points.
-- Add `scripts/install.sh`, an OS/architecture-aware release installer for clean `curl | sh` installation of `ldgr`.
+- Add `scripts/install.sh`, an OS/architecture-aware release installer for clean `curl | sh` installation of `ldgr` from GitHub release assets.
 - Add `ldgr observe` as an observation shorthand, including `ldgr observe <run-id-or-work-slug> --body ...`.
 - Allow run references in run/evidence commands to use either numeric run IDs or work-item slugs.
+- Make prompt slugs resolve to one global prompt layer under `$LDGR_HOME/prompts` or `~/.ldgr/prompts`, with `ldgr prompt list/show/create/import/update/compose` managing those files.
+- Remove the user-facing prompt bundle command and `ldgr loop run --bundle`; use `ldgr prompt compose` to save reusable prompt compositions.
+- Allow `ldgr loop run` to concatenate repeated `--prompt` and/or `--prompt-slug` fragments into one rendered loop prompt with composite provenance.
+- Move coordinated open-source binary release publishing to the root integration checkout so component artifacts are built from pinned root submodule revisions.
 
 ### Fixed
 

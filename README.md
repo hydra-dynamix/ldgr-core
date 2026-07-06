@@ -35,7 +35,7 @@ checksum when checksum tooling is available, and installs `ldgr` to
 macOS Apple Silicon, and Windows x86_64. Override with:
 
 ```sh
-LDGR_VERSION=0.1.1 LDGR_INSTALL_DIR="$HOME/bin" sh -c "$(curl -fsSL https://raw.githubusercontent.com/hydra-dynamix/ldgr-core/main/scripts/install.sh)"
+LDGR_VERSION=0.1.3 LDGR_INSTALL_DIR="$HOME/bin" sh -c "$(curl -fsSL https://raw.githubusercontent.com/hydra-dynamix/ldgr-core/main/scripts/install.sh)"
 ```
 
 Source install remains available:
@@ -89,52 +89,44 @@ Use `ldgr --help` or `ldgr <command> --help` to explore the command surface.
 `ldgr loop run` drives an agent through one or more bounded cycles: each cycle
 picks the next pending work item, renders a prompt with the current ledger
 context, pipes it to the configured agent, and records the output as a run
-artifact. Use `--max-iterations N` to run multiple cycles; the loop stops early
-when work is blocked, no pending work remains, or a subprocess fails.
+artifact. Use `--until-empty` to keep launching fresh cycles until no pending work remains or the loop blocks; use `--max-iterations N` to cap repeated cycles when not running until empty.
 
 ```sh
-ldgr loop run --prompt prompts/loop-prompt.md --agent agentctl    # use the ldgr-loop agentctl entry from ldgr install
-ldgr loop run --prompt-slug surface --agent agentctl       # use an active stored prompt
-ldgr loop run --bundle cleanroom --prompt-role surface-loop # use a sealed bundle
+ldgr loop run --prompt prompts/loop-prompt.md --agent agentctl     # use the ldgr-loop agentctl entry from ldgr install
+ldgr loop run --prompt prompts/base.md --prompt prompts/project-rules.md --agent agentctl # concatenate file prompt fragments
+ldgr loop run --prompt-slug surface --prompt-slug project-rules --agent agentctl # concatenate global prompts from ~/.ldgr/prompts
 ldgr loop run --prompt prompts/loop-prompt.md --agent-argv '["my-agent"]' # any command that reads the prompt on stdin
-ldgr loop run --prompt prompts/loop-prompt.md --dry-run            # render artifacts without spawning anything
+ldgr loop run --prompt prompts/loop-prompt.md --dry-run             # render artifacts without spawning anything
 ```
+
+Repeat `--prompt` and/or `--prompt-slug` when a project needs multiple distinct instruction fragments. `--prompt-slug <slug>` reads `$LDGR_HOME/prompts/<slug>.md` or `~/.ldgr/prompts/<slug>.md`. LDGR concatenates the selected fragments in CLI order, renders one prompt, and records composite provenance listing each source path, prompt slug, and hash where available.
 
 `ldgr install` writes `~/.agentctl/config.toml` entries named `ldgr-loop` and
 `ldgr-loop-<harness>` so the built-in `--agent agentctl` runner can call
 `agentctl run ldgr-loop` and stream the rendered prompt through stdin.
 
-Prompt records live in the ledger with slug, role, body, hash, status, and
-version history. Updating a prompt creates a new version while preserving prior
-content. Prompt bundles seal active prompt versions into an immutable manifest
-and bundle hash:
+Prompts are one global file layer under `$LDGR_HOME/prompts/` or
+`~/.ldgr/prompts/`. The prompt slug maps to `<slug>.md` in that directory:
 
 ```sh
+ldgr prompt list
+ldgr prompt show surface
 ldgr prompt create surface --role surface-loop --body '... {{ldgr_context}} ...'
 ldgr prompt import implementation --role implementation-loop --path prompts/impl.md
 ldgr prompt update surface --path prompts/surface-v2.md
-ldgr prompt activate surface
-ldgr bundle create cleanroom --prompt surface --prompt implementation
-ldgr bundle seal cleanroom
+ldgr prompt compose project-loop --source surface --source implementation --source ./prompts/project-rules.md
 ```
 
-Loop runs that use stored prompts or bundles write prompt provenance artifacts
-with the exact prompt slug, version, content hash, and bundle hash used.
+Loop runs write prompt provenance artifacts with the exact path, prompt slug,
+content hash, and composite component list where applicable.
 
-`ldgr init` seeds an editable project prompt file at
-`.ldgr/prompts/ldgr-core-loop.md`, and `ldgr install` seeds the same default
-under `~/.ldgr/prompts/`. Existing files are preserved so local prompt
-customization does not require recompiling LDGR. Use the prompt store to version
-customizations when you want durable prompt provenance:
+`ldgr install` seeds global defaults under `~/.ldgr/prompts/`. Existing files
+are preserved so prompt customization does not require recompiling LDGR. `ldgr
+init` may still copy editable project prompt files under `.ldgr/prompts/` for
+path-based `--prompt` use, but slug-based lookup uses the global prompt
+directory only.
 
-```sh
-ldgr prompt import my-loop --role loop --path .ldgr/prompts/ldgr-core-loop.md
-ldgr prompt activate my-loop
-# after editing the file:
-ldgr prompt update my-loop --path .ldgr/prompts/ldgr-core-loop.md
-```
-
-Operator steering outside a run is represented as notices:
+Durable steering outside a run is represented as notices. Active notices appear in loop context as `binding_directives`, so operators or agents can post course corrections that later loop agents must treat as binding unless they conflict with safety or explicit system/developer instructions:
 
 ```sh
 ldgr notice add --kind notification --body "Prefer the simpler fix in module Z."

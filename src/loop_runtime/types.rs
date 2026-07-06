@@ -11,14 +11,13 @@ use rusqlite::Connection;
 
 use crate::cli::render::brief_context::{brief_context, BriefContextOptions};
 use crate::store::{
-    active_prompt, add_artifact, add_observation, apply_loop_intervention, bundled_prompt_version,
-    claim_next_pending_run, clear_loop_intervention, close_run, finish_run, get_run,
-    oldest_running_work_item, pending_loop_interventions, read_context, record_run_phase,
-    restore_work_item_pending_after_dry_run, sealed_bundle, ArtifactKind, DecisionOutcome,
-    LoopIntervention, LoopInterventionAction, NextWorkSpec, RunStatus,
+    add_artifact, add_observation, apply_loop_intervention, claim_next_pending_run, finish_run,
+    get_run, oldest_running_work_item, pending_loop_interventions, read_context, record_run_phase,
+    restore_work_item_pending_after_dry_run, stable_content_hash, ArtifactKind, LoopIntervention,
+    LoopInterventionAction, RunStatus,
 };
 use crate::tool_runner::render_command;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 const LOOP_PROCESS_OUTPUT_PREVIEW_BYTES: usize = 64 * 1024;
 pub const DEFAULT_LOOP_PROCESS_TIMEOUT: Duration = Duration::from_secs(12 * 60 * 60);
@@ -53,9 +52,8 @@ pub enum LoopPromptSource {
     StoredPrompt {
         slug: String,
     },
-    Bundle {
-        slug: String,
-        prompt_role: Option<String>,
+    Composite {
+        sources: Vec<LoopPromptSource>,
     },
 }
 

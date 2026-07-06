@@ -194,10 +194,8 @@ fn enforce_loop_stop_authority(outcome: DecisionOutcome) -> anyhow::Result<()> {
     if std::env::var("LDGR_LOOP_STOP_AUTHORITY").ok().as_deref() != Some("planner") {
         return Ok(());
     }
-    // The final role authorized to close the run (validator) also holds stop
-    // authority, since it records the authoritative cycle decision after the
-    // full role sequence. Earlier roles may only recommend stopping via
-    // observations; the validator acts on those recommendations.
+    // Single-agent loop subprocesses may close their assigned run when the
+    // runtime explicitly exports LDGR_LOOP_MAY_CLOSE_RUN=1.
     if std::env::var("LDGR_LOOP_MAY_CLOSE_RUN").ok().as_deref() == Some("1") {
         return Ok(());
     }
@@ -206,21 +204,14 @@ fn enforce_loop_stop_authority(outcome: DecisionOutcome) -> anyhow::Result<()> {
         return Ok(());
     }
     bail!(
-        "loop stop decisions require planner or validator authority; role {role} may record recommendations but cannot close with outcome stop"
+        "loop stop decisions require explicit loop closure authority; role {role} may record recommendations but cannot close with outcome stop"
     )
 }
 
-/// Within a generic multi-role loop sequence, only the final role (validator)
-/// may close the assigned run with the cycle decision. The loop runtime sets
-/// `LDGR_LOOP_MAY_CLOSE_RUN=1` only for the final role subprocess so it can
-/// record the continue/stop decision after reviewing the full cycle. Earlier
-/// roles (planner/worker/scryb) are blocked from closing the run so the
-/// sequence completes and the worker actually executes.
-///
-/// The guard is a no-op in the loop runtime's own process because the runtime
-/// sets `LDGR_LOOP_ROLE` only on spawned role subprocesses, never on itself, so
-/// its own `close_run`/`finish_run` calls (including the validator revision
-/// gate) are unaffected.
+/// Compatibility guard for older role-based loop subprocesses. Current loop
+/// runs export `LDGR_LOOP_MAY_CLOSE_RUN=1` to the single assigned agent, so this
+/// guard is normally inactive. It remains to prevent stale role wrappers from
+/// closing an assigned run unless they were explicitly granted closure authority.
 fn enforce_role_run_closure_authority(run_id: i64) -> anyhow::Result<()> {
     let role = match std::env::var("LDGR_LOOP_ROLE") {
         Ok(role) => role,
@@ -236,7 +227,7 @@ fn enforce_role_run_closure_authority(run_id: i64) -> anyhow::Result<()> {
         if let Ok(assigned_id) = assigned.parse::<i64>() {
             if assigned_id == run_id {
                 bail!(
-                    "role {role} may not close run {run_id}; only the final role (validator) closes the run after the full sequence completes. Record observations/artifacts and let the validator close the run. To recommend stopping the loop, record a notice or observation instead of closing the run."
+                    "role {role} may not close run {run_id}; this stale role wrapper lacks explicit loop closure authority. Record observations/artifacts or run the current single-agent loop instead."
                 );
             }
         }

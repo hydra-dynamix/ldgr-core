@@ -10,9 +10,9 @@ These project-agnostic operating rules are durable guidance for ephemeral agents
 - Reuse and extend existing project systems before replacing them.
 - Record durable evidence for material changes, surprising findings, validation results, decisions, and handoffs.
 - Keep evidence specific: include commands run, files changed or inspected, outputs observed, and unresolved failures.
-- Apply proportionate validator rigor: block unsafe, unsupported, or materially incomplete work; do not demand perfection for low-risk, reversible, well-evidenced changes.
-- Respect role authority boundaries: workers implement, validators evaluate, planners select next work, and operators override all roles.
-- Do not mutate ledger state, files, external services, or long-running processes unless the current role and work item authorize that mutation.
+- Apply proportionate rigor: block unsafe, unsupported, or materially incomplete work; do not demand perfection for low-risk, reversible, well-evidenced changes.
+- Respect authority boundaries: the assigned work item defines scope, binding directives steer execution, and operators override autonomous choices.
+- Do not mutate ledger state, files, external services, or long-running processes unless the current work item and prompt authorize that mutation.
 - Avoid broad refactors, new frameworks, and future-proofing unless required for the current bounded outcome.
 - Close or explicitly hand off active runs before signing off.
 - Report concisely: summarize what changed, how it was validated, what remains uncertain, and the next concrete work item.

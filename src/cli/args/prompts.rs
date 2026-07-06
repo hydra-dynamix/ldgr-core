@@ -2,9 +2,7 @@ use std::path::PathBuf;
 
 use clap::{Args, Subcommand};
 
-const PROMPT_HELP: &str = "Examples:\n  ldgr prompt create surface --role surface-loop --body '... {{ldgr_context}} ...'\n  ldgr prompt import implementation --role implementation-loop --path prompts/impl.md\n  ldgr prompt update surface --path prompts/surface-v2.md\n  ldgr prompt activate surface\n\nPrompt records are ledger-owned prompt templates. Loop runs consume active prompts with `ldgr loop run --prompt-slug <slug>`.";
-
-const BUNDLE_HELP: &str = "Examples:\n  ldgr bundle create cleanroom --prompt surface --prompt implementation\n  ldgr bundle seal cleanroom\n\nBundles seal active prompt versions so loop runs can consume an immutable prompt set with `ldgr loop run --bundle <slug>`.";
+const PROMPT_HELP: &str = "Examples:\n  ldgr prompt list\n  ldgr prompt show surface\n  ldgr prompt show surface --body\n  ldgr prompt create surface --role surface-loop --body '... {{ldgr_context}} ...'\n  ldgr prompt import implementation --role implementation-loop --path prompts/impl.md\n  ldgr prompt update surface --path prompts/surface-v2.md\n  ldgr prompt compose project-loop --source surface --source ./prompts/project-rules.md\n  ldgr loop run --prompt-slug project-loop --agent agentctl\n\nPrompts are global files under $LDGR_HOME/prompts or ~/.ldgr/prompts. The prompt slug maps to <slug>.md in that directory. Use list/show to discover global prompts. Use compose to concatenate prompt slugs and/or file paths once and store the result as a reusable global prompt.";
 
 #[derive(Debug, Args)]
 #[command(after_help = PROMPT_HELP)]
@@ -15,14 +13,38 @@ pub struct PromptArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum PromptCommand {
+    /// List global prompt files.
+    List(ListPromptArgs),
+    /// Show one global prompt file.
+    Show(ShowPromptArgs),
     /// Create a draft prompt from inline body text.
     Create(CreatePromptArgs),
     /// Import a draft prompt from a file.
     Import(ImportPromptArgs),
-    /// Update a prompt body from a file, creating a new version.
+    /// Update a prompt body from a file.
     Update(UpdatePromptArgs),
-    /// Mark a prompt active for loop use.
+    /// Compose prompt slugs and/or paths into a reusable global prompt.
+    Compose(ComposePromptArgs),
+    /// Compatibility check: verify a global prompt slug exists.
     Activate(ActivatePromptArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ListPromptArgs {
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ShowPromptArgs {
+    pub slug: String,
+
+    /// Print only the current prompt body.
+    #[arg(long)]
+    pub body: bool,
+
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -65,34 +87,16 @@ pub struct UpdatePromptArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct ComposePromptArgs {
+    /// New global prompt slug to write under ~/.ldgr/prompts/<slug>.md.
+    pub slug: String,
+
+    /// Prompt slug or file path. Repeat in the desired concatenation order.
+    #[arg(long = "source", required = true)]
+    pub sources: Vec<String>,
+}
+
+#[derive(Debug, Args)]
 pub struct ActivatePromptArgs {
-    pub slug: String,
-}
-
-#[derive(Debug, Args)]
-#[command(after_help = BUNDLE_HELP)]
-pub struct BundleArgs {
-    #[command(subcommand)]
-    pub command: BundleCommand,
-}
-
-#[derive(Debug, Subcommand)]
-pub enum BundleCommand {
-    /// Create a draft bundle from active prompt slugs.
-    Create(CreateBundleArgs),
-    /// Seal a draft bundle for loop use.
-    Seal(SealBundleArgs),
-}
-
-#[derive(Debug, Args)]
-pub struct CreateBundleArgs {
-    pub slug: String,
-
-    #[arg(long = "prompt", required = true)]
-    pub prompts: Vec<String>,
-}
-
-#[derive(Debug, Args)]
-pub struct SealBundleArgs {
     pub slug: String,
 }

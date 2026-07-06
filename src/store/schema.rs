@@ -91,27 +91,6 @@ CREATE TABLE IF NOT EXISTS prompt_version (
     UNIQUE(prompt_id, version)
 );
 
-CREATE TABLE IF NOT EXISTS prompt_bundle (
-    id INTEGER PRIMARY KEY,
-    slug TEXT NOT NULL UNIQUE,
-    status TEXT NOT NULL DEFAULT 'draft' CHECK (status IN ('draft', 'sealed', 'retired')),
-    manifest_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(manifest_json)),
-    bundle_hash TEXT NOT NULL DEFAULT '',
-    created_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-
-CREATE TABLE IF NOT EXISTS prompt_bundle_item (
-    id INTEGER PRIMARY KEY,
-    bundle_id INTEGER NOT NULL REFERENCES prompt_bundle(id) ON DELETE CASCADE,
-    prompt_id INTEGER NOT NULL REFERENCES prompt(id) ON DELETE RESTRICT,
-    prompt_version_id INTEGER NOT NULL REFERENCES prompt_version(id) ON DELETE RESTRICT,
-    prompt_slug TEXT NOT NULL,
-    prompt_role TEXT NOT NULL,
-    prompt_version INTEGER NOT NULL,
-    content_hash TEXT NOT NULL,
-    UNIQUE(bundle_id, prompt_slug)
-);
-
 CREATE TABLE IF NOT EXISTS decision (
     id INTEGER PRIMARY KEY,
     work_item_id INTEGER NOT NULL REFERENCES work_item(id) ON DELETE CASCADE,
@@ -153,8 +132,6 @@ const CORE_TABLES: &[&str] = &[
     "artifact",
     "prompt",
     "prompt_version",
-    "prompt_bundle",
-    "prompt_bundle_item",
     "decision",
     "event_log",
     "loop_intervention",
@@ -256,24 +233,6 @@ const PROMPT_VERSION_COLUMNS: &[ColumnSchema] = &[
     column("description", "TEXT", false, None, false),
     column("created_at", "TEXT", true, Some("datetime('now')"), false),
 ];
-const PROMPT_BUNDLE_COLUMNS: &[ColumnSchema] = &[
-    column("id", "INTEGER", false, None, true),
-    column("slug", "TEXT", true, None, false),
-    column("status", "TEXT", true, Some("'draft'"), false),
-    column("manifest_json", "TEXT", true, Some("'{}'"), false),
-    column("bundle_hash", "TEXT", true, Some("''"), false),
-    column("created_at", "TEXT", true, Some("datetime('now')"), false),
-];
-const PROMPT_BUNDLE_ITEM_COLUMNS: &[ColumnSchema] = &[
-    column("id", "INTEGER", false, None, true),
-    column("bundle_id", "INTEGER", true, None, false),
-    column("prompt_id", "INTEGER", true, None, false),
-    column("prompt_version_id", "INTEGER", true, None, false),
-    column("prompt_slug", "TEXT", true, None, false),
-    column("prompt_role", "TEXT", true, None, false),
-    column("prompt_version", "INTEGER", true, None, false),
-    column("content_hash", "TEXT", true, None, false),
-];
 const DECISION_COLUMNS: &[ColumnSchema] = &[
     column("id", "INTEGER", false, None, true),
     column("work_item_id", "INTEGER", true, None, false),
@@ -321,11 +280,6 @@ const PROMPT_FOREIGN_KEYS: &[ForeignKeySchema] = &[foreign_key(
 )];
 const PROMPT_VERSION_FOREIGN_KEYS: &[ForeignKeySchema] =
     &[foreign_key("prompt_id", "prompt", "id", "CASCADE")];
-const PROMPT_BUNDLE_ITEM_FOREIGN_KEYS: &[ForeignKeySchema] = &[
-    foreign_key("bundle_id", "prompt_bundle", "id", "CASCADE"),
-    foreign_key("prompt_id", "prompt", "id", "RESTRICT"),
-    foreign_key("prompt_version_id", "prompt_version", "id", "RESTRICT"),
-];
 const DECISION_FOREIGN_KEYS: &[ForeignKeySchema] = &[
     foreign_key("work_item_id", "work_item", "id", "CASCADE"),
     foreign_key("next_work_item_id", "work_item", "id", "SET NULL"),
@@ -352,12 +306,6 @@ const PROMPT_REQUIRED_SQL: &[&str] = &[
     "CHECK (status IN ('draft', 'active', 'retired'))",
 ];
 const PROMPT_VERSION_REQUIRED_SQL: &[&str] = &["UNIQUE(prompt_id, version)"];
-const PROMPT_BUNDLE_REQUIRED_SQL: &[&str] = &[
-    "slug TEXT NOT NULL UNIQUE",
-    "CHECK (status IN ('draft', 'sealed', 'retired'))",
-    "CHECK (json_valid(manifest_json))",
-];
-const PROMPT_BUNDLE_ITEM_REQUIRED_SQL: &[&str] = &["UNIQUE(bundle_id, prompt_slug)"];
 const DECISION_REQUIRED_SQL: &[&str] = &["CHECK (outcome IN ('continue', 'stop', 'inconclusive'))"];
 const EVENT_LOG_REQUIRED_SQL: &[&str] = &["CHECK (json_valid(payload_json))"];
 const LOOP_INTERVENTION_REQUIRED_SQL: &[&str] = &[
@@ -409,18 +357,6 @@ const EXPECTED_SCHEMA: &[TableSchema] = &[
         PROMPT_VERSION_COLUMNS,
         PROMPT_VERSION_FOREIGN_KEYS,
         PROMPT_VERSION_REQUIRED_SQL,
-    ),
-    table(
-        "prompt_bundle",
-        PROMPT_BUNDLE_COLUMNS,
-        NO_FOREIGN_KEYS,
-        PROMPT_BUNDLE_REQUIRED_SQL,
-    ),
-    table(
-        "prompt_bundle_item",
-        PROMPT_BUNDLE_ITEM_COLUMNS,
-        PROMPT_BUNDLE_ITEM_FOREIGN_KEYS,
-        PROMPT_BUNDLE_ITEM_REQUIRED_SQL,
     ),
     table(
         "decision",
@@ -496,8 +432,6 @@ CREATE INDEX IF NOT EXISTS idx_global_observation_status_kind ON global_observat
 CREATE INDEX IF NOT EXISTS idx_artifact_run ON artifact(run_id);
 CREATE INDEX IF NOT EXISTS idx_prompt_status ON prompt(status);
 CREATE INDEX IF NOT EXISTS idx_prompt_version_prompt ON prompt_version(prompt_id);
-CREATE INDEX IF NOT EXISTS idx_prompt_bundle_status ON prompt_bundle(status);
-CREATE INDEX IF NOT EXISTS idx_prompt_bundle_item_bundle ON prompt_bundle_item(bundle_id);
 CREATE INDEX IF NOT EXISTS idx_decision_work_item ON decision(work_item_id);
 CREATE INDEX IF NOT EXISTS idx_event_log_entity ON event_log(entity_type, entity_id);
 CREATE INDEX IF NOT EXISTS idx_loop_intervention_status ON loop_intervention(status);
@@ -807,8 +741,6 @@ mod tests {
             "artifact",
             "prompt",
             "prompt_version",
-            "prompt_bundle",
-            "prompt_bundle_item",
             "decision",
             "event_log",
             "loop_intervention",
