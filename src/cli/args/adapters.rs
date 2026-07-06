@@ -1,6 +1,6 @@
 use clap::{Args, Subcommand};
 
-const ADAPTER_HELP: &str = "Examples:\n  ldgr adapter install\n  ldgr adapter install list\n  ldgr adapter install conduct\n  ldgr adapter list\n  ldgr adapter show conduct\n  ldgr conduct --help\n  ldgr adapter dispatch conduct-batch-status\n\nAdapters are installed under ~/.ldgr/<adapter>/adapter.toml. Core dynamically dispatches installed adapter namespaces declared by adapter.toml.";
+const ADAPTER_HELP: &str = "Examples:\n  ldgr adapter install\n  ldgr adapter install list\n  ldgr adapter install conduct\n  ldgr adapter list\n  ldgr adapter show conduct\n  ldgr conduct --help\n  ldgr adapter dispatch conduct-batch-status\n\nAdapters are installed under ~/.ldgr/adapters/<adapter>/adapter.toml. Core dynamically dispatches installed adapter namespaces declared by adapter.toml.";
 
 #[derive(Debug, Args)]
 #[command(after_help = ADAPTER_HELP)]
@@ -30,7 +30,7 @@ pub struct AdapterInstallArgs {
     #[arg(long)]
     pub source_root: Option<std::path::PathBuf>,
 
-    /// Exact install directory. Defaults to ~/.ldgr/<adapter>.
+    /// Exact install directory. Defaults to ~/.ldgr/adapters/<adapter>.
     #[arg(long)]
     pub install_root: Option<std::path::PathBuf>,
 

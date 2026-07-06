@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-07-06
+
+### Changed
+
+- Install adapter bundles under the single global `~/.ldgr/adapters/<adapter>` root and remove direct `~/.ldgr/<adapter>` discovery fallbacks.
+- Route adapter-owned prompts, skills, commands, and extensions through configured harness paths in `~/.ldgr/config.json`, preserving Pi setup while supporting Codex prompt/skill paths.
+- Update adapter install docs and smoke coverage for harness-aware resource installation.
+
 ### Added
 
 - Add `ldgr loop run --until-empty` to keep launching fresh single-agent loop cycles until no pending work remains or the loop blocks.

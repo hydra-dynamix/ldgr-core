@@ -37,7 +37,7 @@ pub struct InstallArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum InstallCommand {
-    /// Install an open-source adapter bundle into ~/.ldgr/<adapter>.
+    /// Install an open-source adapter bundle into ~/.ldgr/adapters/<adapter>.
     Adapter(InstallAdapterArgs),
 }
 
@@ -50,7 +50,7 @@ pub struct InstallAdapterArgs {
     #[arg(long)]
     pub source_root: Option<PathBuf>,
 
-    /// Exact install directory. Defaults to ~/.ldgr/<adapter>.
+    /// Exact install directory. Defaults to ~/.ldgr/adapters/<adapter>.
     #[arg(long)]
     pub install_root: Option<PathBuf>,
 

@@ -9,18 +9,18 @@ LDGR adapter profiles are declarative bundles installed under the user LDGR home
 Install adapter bundles under:
 
 ```text
-~/.ldgr/<adapter>/adapter.toml
+~/.ldgr/adapters/<adapter>/adapter.toml
 ```
 
 Example:
 
 ```text
-~/.ldgr/code/adapter.toml
-~/.ldgr/code/prompts/ldgr-loop-next-work.md
-~/.ldgr/code/templates/task-spec.md
+~/.ldgr/adapters/code/adapter.toml
+~/.ldgr/adapters/code/prompts/ldgr-loop-next-work.md
+~/.ldgr/adapters/code/templates/task-spec.md
 ```
 
-Discovery reads `LDGR_ADAPTER_PATH`, project `.ldgr` for explicit development overrides, `LDGR_HOME`, and `~/.ldgr`. Each adapter root should contain `<slug>/adapter.toml`, or a direct `adapter.toml` for single-bundle roots.
+Discovery reads `LDGR_ADAPTER_PATH`, project `.ldgr/adapters` for explicit development overrides, `LDGR_HOME/adapters`, and `~/.ldgr/adapters`. Each adapter root should contain `<slug>/adapter.toml`, or a direct `adapter.toml` for single-bundle roots.
 
 ## Install
 
@@ -30,7 +30,7 @@ ldgr adapter install conduct
 ldgr adapter install research
 ```
 
-`ldgr adapter install list` shows installable adapters and where they come from. Core installation acquires or runs the adapter binary, then delegates setup to the adapter-owned installer. The adapter writes its bundle to `~/.ldgr/<adapter>`, installs adapter-owned skills/extensions into configured harness locations, and records license paths in `~/.ldgr/config.json` when the adapter supports commercial licensing.
+`ldgr adapter install list` shows installable adapters and where they come from. Core installation acquires or runs the adapter binary, then delegates setup to the adapter-owned installer. The adapter writes its bundle to `~/.ldgr/adapters/<adapter>`, installs adapter-owned prompts, skills, commands, and extensions into the paths declared by configured harness entries in `~/.ldgr/config.json`, and records license paths there when the adapter supports commercial licensing.
 
 The older `ldgr install adapter <slug>` path remains a compatibility alias for source-checkout installs.
 

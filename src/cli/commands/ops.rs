@@ -94,10 +94,10 @@ pub fn handle_install(args: InstallArgs) -> anyhow::Result<()> {
         "agentctl_config": agentctl_config,
         "core_loop_prompt": core_loop_prompt,
         "adapter_files": {
-            "default_global_path": "~/.ldgr/<adapter>",
-            "note": "Adapter bundle files install globally under ~/.ldgr/<adapter>; adapter-owned skills/extensions install into the configured harness locations."
+            "default_global_path": "~/.ldgr/adapters/<adapter>",
+            "note": "Adapter bundle files install globally under ~/.ldgr/adapters/<adapter>; adapter-owned prompts, skills, commands, and extensions install into paths declared by the configured harness entries."
         },
-        "notes": "Adapters should read this file, validate their own license when applicable, install adapter bundle files under ~/.ldgr/<adapter> by default, then install adapter-owned skills/extensions into the configured harness locations."
+        "notes": "Adapters should read this file, validate their own license when applicable, install adapter bundle files under ~/.ldgr/adapters/<adapter> by default, then install adapter-owned prompts, skills, commands, and extensions into paths declared by the configured harness entries."
     });
     let config_path = ldgr_home.join("config.json");
     fs::write(
@@ -116,7 +116,9 @@ pub fn handle_install(args: InstallArgs) -> anyhow::Result<()> {
         println!("│  Restart/reload Claude Code, then use /ldgr <args>.");
     }
     if harnesses.contains(&HarnessKind::Codex) {
-        println!("│  Codex will use ~/.codex/instructions.md; ask it for /ldgr <args> behavior.");
+        println!(
+            "│  Codex will use prompts under ~/.codex/prompts; ask it for /ldgr <args> behavior."
+        );
     }
     if harnesses.contains(&HarnessKind::Openclaw) {
         println!(
@@ -136,7 +138,7 @@ pub fn handle_install(args: InstallArgs) -> anyhow::Result<()> {
             })?;
         }
     }
-    println!("└─ Adapter bundles install under ~/.ldgr/<adapter>.");
+    println!("└─ Adapter bundles install under ~/.ldgr/adapters/<adapter>.");
     Ok(())
 }
 
@@ -184,7 +186,7 @@ pub(crate) fn handle_install_adapter(args: &InstallAdapterArgs) -> anyhow::Resul
     let install_root = args
         .install_root
         .clone()
-        .unwrap_or_else(|| home.join(".ldgr").join(&adapter));
+        .unwrap_or_else(|| home.join(".ldgr/adapters").join(&adapter));
     println!("◇ Installing LDGR adapter `{adapter}`");
     println!("├─ Install root {}", install_root.display());
     if let Some(source_root) = &args.source_root {
@@ -777,23 +779,27 @@ fn install_adapter_harness_assets(
     install_root: &Path,
     home: &Path,
 ) -> anyhow::Result<()> {
+    let config = read_ldgr_harness_config(home);
     let prompts = install_root.join("prompts");
     if prompts.is_dir() {
-        let prompt_root = home.join(".ldgr/prompts");
-        copy_directory_children(&prompts, &prompt_root)?;
-        println!("├─ LDGR prompts {}", prompt_root.display());
+        for prompt_root in configured_prompt_dirs(home, &config) {
+            copy_directory_children(&prompts, &prompt_root)?;
+            println!("├─ Harness prompts {}", prompt_root.display());
+        }
     }
     let skills = install_root.join("skills");
     if skills.is_dir() {
-        let pi_skills = home.join(".pi/agent/skills");
-        copy_directory_children(&skills, &pi_skills)?;
-        println!("├─ Harness skills {}", pi_skills.display());
+        for skill_root in configured_skill_dirs(home, &config) {
+            copy_directory_children(&skills, &skill_root)?;
+            println!("├─ Harness skills {}", skill_root.display());
+        }
     }
     let extensions = install_root.join("extensions");
     if extensions.is_dir() {
-        let pi_extensions = home.join(".pi/agent/extensions");
-        copy_directory_children(&extensions, &pi_extensions)?;
-        println!("├─ Pi extensions {}", pi_extensions.display());
+        for extension_root in configured_extension_dirs(home, &config) {
+            copy_directory_children(&extensions, &extension_root)?;
+            println!("├─ Harness extensions {}", extension_root.display());
+        }
     }
     let marker = home.join(".ldgr/installed-adapters").join(adapter);
     write_file(
@@ -801,6 +807,91 @@ fn install_adapter_harness_assets(
         &format!("install_root={}\n", install_root.display()),
     )?;
     Ok(())
+}
+
+fn read_ldgr_harness_config(home: &Path) -> Option<serde_json::Value> {
+    let text = fs::read_to_string(home.join(".ldgr/config.json")).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+fn configured_prompt_dirs(home: &Path, config: &Option<serde_json::Value>) -> Vec<PathBuf> {
+    let mut dirs = configured_path_dirs(home, config, "prompt_paths");
+    if dirs.is_empty() {
+        dirs.push(home.join(".ldgr/prompts"));
+    }
+    dedup_paths(dirs)
+}
+
+fn configured_skill_dirs(home: &Path, config: &Option<serde_json::Value>) -> Vec<PathBuf> {
+    let mut dirs = configured_path_dirs(home, config, "skill_paths");
+    if dirs.is_empty() {
+        dirs.push(home.join(".pi/agent/skills"));
+    }
+    dedup_paths(dirs)
+}
+
+fn configured_extension_dirs(home: &Path, config: &Option<serde_json::Value>) -> Vec<PathBuf> {
+    let mut dirs = configured_path_dirs(home, config, "extension_paths")
+        .into_iter()
+        .map(|path| {
+            if path.extension().is_some() {
+                path.parent().map(Path::to_path_buf).unwrap_or(path)
+            } else {
+                path
+            }
+        })
+        .collect::<Vec<_>>();
+    if dirs.is_empty() {
+        dirs.push(home.join(".pi/agent/extensions"));
+    }
+    dedup_paths(dirs)
+}
+
+fn configured_path_dirs(
+    home: &Path,
+    config: &Option<serde_json::Value>,
+    key: &str,
+) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(config) = config {
+        if let Some(installed) = config.get("installed").and_then(|value| value.as_array()) {
+            for harness in installed {
+                if let Some(paths) = harness.get(key).and_then(|value| value.as_array()) {
+                    dirs.extend(
+                        paths
+                            .iter()
+                            .filter_map(json_path)
+                            .map(|path| expand_home_path(home, path)),
+                    );
+                }
+            }
+        }
+    }
+    dirs
+}
+
+fn json_path(value: &serde_json::Value) -> Option<&str> {
+    value.as_str().filter(|value| !value.trim().is_empty())
+}
+
+fn expand_home_path(home: &Path, value: &str) -> PathBuf {
+    if value == "~" {
+        home.to_path_buf()
+    } else if let Some(rest) = value.strip_prefix("~/") {
+        home.join(rest)
+    } else {
+        PathBuf::from(value)
+    }
+}
+
+fn dedup_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut deduped = Vec::new();
+    for path in paths {
+        if !deduped.iter().any(|existing| existing == &path) {
+            deduped.push(path);
+        }
+    }
+    deduped
 }
 
 fn copy_directory_children(from: &Path, to: &Path) -> anyhow::Result<()> {
@@ -1179,15 +1270,17 @@ fn install_pi_harness(home: &Path) -> anyhow::Result<serde_json::Value> {
 fn install_codex_harness(home: &Path) -> anyhow::Result<serde_json::Value> {
     let doc = home.join(".codex/ldgr/LDGR.md");
     write_file(&doc, LDGR_HARNESS_GUIDE)?;
-    let instructions = home.join(".codex/instructions.md");
-    append_marked_section(&instructions, "ldgr-core", CODEX_INSTRUCTIONS)?;
+    let instructions = home.join(".codex/prompts/ldgr-core.md");
+    write_file(&instructions, CODEX_INSTRUCTIONS)?;
     println!("├─ Codex guide {}", doc.display());
-    println!("├─ Codex instructions {}", instructions.display());
+    println!("├─ Codex prompt {}", instructions.display());
     Ok(serde_json::json!({
         "harness": "codex",
-        "instruction_path": instructions,
+        "prompt_paths": [home.join(".codex/prompts")],
+        "skill_paths": [home.join(".codex/skills")],
+        "prompt_file": instructions,
         "guide_path": doc,
-        "extension_equivalent": "Codex CLI has plugin/MCP surfaces, but no local Pi-style slash-command extension was detected; LDGR installs global instructions and a guide instead."
+        "extension_equivalent": "Codex CLI has plugin/MCP surfaces, but no local Pi-style slash-command extension was detected; LDGR installs global prompts, skills, and a guide instead."
     }))
 }
 
@@ -1229,32 +1322,6 @@ fn write_file(path: &Path, content: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn append_marked_section(path: &Path, marker: &str, content: &str) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let start = format!("<!-- LDGR:{marker}:START -->");
-    let end = format!("<!-- LDGR:{marker}:END -->");
-    let section = format!("{start}\n{}\n{end}\n", content.trim_end());
-    let existing = fs::read_to_string(path).unwrap_or_default();
-    let next =
-        if let (Some(start_idx), Some(end_idx)) = (existing.find(&start), existing.find(&end)) {
-            let after = end_idx + end.len();
-            format!(
-                "{}{}{}",
-                &existing[..start_idx],
-                section.trim_end(),
-                &existing[after..]
-            )
-        } else if existing.trim().is_empty() {
-            section
-        } else {
-            format!("{}\n\n{}", existing.trim_end(), section)
-        };
-    fs::write(path, next)?;
-    Ok(())
-}
-
 fn home_dir() -> anyhow::Result<PathBuf> {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
@@ -1280,7 +1347,7 @@ const LDGR_HARNESS_GUIDE: &str = r#"# LDGR harness guide
 
 Use LDGR as the durable project ledger. Start with `ldgr status`; expand to `ldgr context --brief` or `ldgr context` when needed. When a user asks for `/ldgr <args>` behavior in a harness without a local extension API, run `ldgr <args>` from the shell and paste stdout/stderr back into the conversation.
 
-Adapter installers should read `~/.ldgr/config.json`, validate their own license when applicable, install adapter bundle files under `~/.ldgr/<adapter>` by default, and install adapter-owned skills/extensions into the configured harness locations.
+Adapter installers should read `~/.ldgr/config.json`, validate their own license when applicable, install adapter bundle files under `~/.ldgr/adapters/<adapter>` by default, and install adapter-owned prompts, skills, commands, and extensions into the paths declared by each configured harness entry.
 "#;
 
 const CODEX_INSTRUCTIONS: &str = r#"# LDGR
@@ -1768,6 +1835,36 @@ prompt_stdin = true
             .path()
             .join(".ldgr/installed-adapters/research")
             .is_file());
+        Ok(())
+    }
+
+    #[test]
+    fn adapter_harness_assets_follow_configured_prompt_paths() -> anyhow::Result<()> {
+        let install_root = tempfile::tempdir()?;
+        let home = tempfile::tempdir()?;
+        std::fs::create_dir_all(install_root.path().join("prompts"))?;
+        std::fs::write(
+            install_root.path().join("prompts/research-loop.md"),
+            "prompt",
+        )?;
+        std::fs::create_dir_all(home.path().join(".ldgr"))?;
+        std::fs::write(
+            home.path().join(".ldgr/config.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "installed": [{
+                    "harness": "codex",
+                    "prompt_paths": [home.path().join(".codex/prompts")]
+                }]
+            }))?,
+        )?;
+
+        install_adapter_harness_assets("research", install_root.path(), home.path())?;
+
+        assert_eq!(
+            std::fs::read_to_string(home.path().join(".codex/prompts/research-loop.md"))?,
+            "prompt"
+        );
+        assert!(!home.path().join(".ldgr/prompts/research-loop.md").exists());
         Ok(())
     }
 

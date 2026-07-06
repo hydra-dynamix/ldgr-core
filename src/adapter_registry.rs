@@ -265,12 +265,12 @@ pub fn adapter_search_roots() -> Vec<PathBuf> {
     if let Some(paths) = env::var_os("LDGR_ADAPTER_PATH") {
         roots.extend(env::split_paths(&paths));
     }
-    roots.push(PathBuf::from(".ldgr"));
+    roots.push(PathBuf::from(".ldgr/adapters"));
     if let Some(home) = env::var_os("LDGR_HOME") {
-        roots.push(PathBuf::from(home));
+        roots.push(PathBuf::from(home).join("adapters"));
     }
     if let Some(home) = env::var_os("HOME") {
-        roots.push(PathBuf::from(home).join(".ldgr"));
+        roots.push(PathBuf::from(home).join(".ldgr/adapters"));
     }
     roots
 }
