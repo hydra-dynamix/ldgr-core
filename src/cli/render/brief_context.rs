@@ -1,7 +1,7 @@
 use serde::Serialize;
 
 use crate::adapter_registry::AdapterRegistry;
-use crate::store::{ConductLifecycleSummary, StoreContext};
+use crate::store::StoreContext;
 
 use super::display_optional_id;
 
@@ -24,7 +24,6 @@ pub(crate) struct BriefContext {
     pub latest_observations: Vec<BriefObservation>,
     pub latest_validations: Vec<BriefValidation>,
     pub installed_adapter_namespaces: Vec<BriefAdapterNamespace>,
-    pub conduct_lifecycle: Option<ConductLifecycleSummary>,
     pub handoff: BriefHandoff,
     pub next_commands: Vec<String>,
     pub brief_context_command: String,
@@ -95,6 +94,7 @@ pub(crate) struct BriefAdapterNamespace {
     pub command: String,
     pub help_command: String,
     pub instruction: String,
+    pub status_command: Option<String>,
     pub summary: Option<String>,
 }
 
@@ -192,7 +192,6 @@ pub(crate) fn brief_context(context: &StoreContext, options: BriefContextOptions
             })
             .collect(),
         installed_adapter_namespaces,
-        conduct_lifecycle: context.conduct_lifecycle.clone(),
         handoff: handoff.clone(),
         next_commands: next_commands_with_registry(context, &handoff, &registry),
         brief_context_command: "ldgr status".to_owned(),
@@ -231,7 +230,6 @@ pub(crate) fn print_brief_context(context: &BriefContext) {
     print_latest_observations(&context.latest_observations);
     print_latest_validations(&context.latest_validations);
     print_adapter_namespaces(&context.installed_adapter_namespaces);
-    print_conduct_lifecycle(context.conduct_lifecycle.as_ref());
     print_next_commands(&context.next_commands);
     println!("brief_context: {}", context.brief_context_command);
     println!("full_context: {}", context.full_context_command);
@@ -335,6 +333,7 @@ fn installed_adapter_namespaces(registry: &AdapterRegistry) -> Vec<BriefAdapterN
             command: domain.command,
             help_command: domain.help_command,
             instruction: domain.instruction,
+            status_command: domain.status_command,
             summary: domain.summary,
         })
         .collect()
@@ -427,13 +426,17 @@ fn print_adapter_namespaces(namespaces: &[BriefAdapterNamespace]) {
             namespace.adapter, namespace.namespace, namespace.command, namespace.help_command
         );
         println!("  instruction: {}", namespace.instruction);
+        if let Some(status_command) = &namespace.status_command {
+            println!("  status_command: {status_command}");
+        }
         if let Some(summary) = &namespace.summary {
             println!("  summary: {}", compact_text(summary, COMMAND_WIDTH));
         }
     }
 }
 
-fn print_conduct_lifecycle(summary: Option<&ConductLifecycleSummary>) {
+#[cfg(any())]
+fn print_legacy_adapter_lifecycle(summary: Option<&serde_json::Value>) {
     let Some(summary) = summary else {
         return;
     };

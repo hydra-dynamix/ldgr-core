@@ -12,7 +12,7 @@ use crate::loop_runtime::{
     run_loop_once, LoopAgent, LoopPromptSource, LoopRuntimeOptions, LoopRuntimeOutcome,
     LoopRuntimeResult,
 };
-use crate::store::{init_store, read_context_with_conduct_lifecycle};
+use crate::store::{init_store, read_context};
 use crate::tool_runner::parse_argv_json;
 use crate::web::{generate_control_token, serve, WebOptions};
 
@@ -2080,10 +2080,10 @@ const CLAW_LDGR_COMMAND: &str = r#"Run `ldgr $ARGUMENTS` in the current project 
 
 pub fn handle_status(
     connection: &rusqlite::Connection,
-    artifact_root: &Path,
+    _artifact_root: &Path,
     args: StatusArgs,
 ) -> anyhow::Result<()> {
-    let context = read_context_with_conduct_lifecycle(connection, artifact_root)?;
+    let context = read_context(connection)?;
     let brief = brief_context(&context, brief_options(args.recent, args.width));
     emit(args.json, &brief, print_brief_context)?;
     if !args.json {
@@ -2094,10 +2094,10 @@ pub fn handle_status(
 
 pub fn handle_context(
     connection: &rusqlite::Connection,
-    artifact_root: &Path,
+    _artifact_root: &Path,
     args: ContextArgs,
 ) -> anyhow::Result<()> {
-    let context = read_context_with_conduct_lifecycle(connection, artifact_root)?;
+    let context = read_context(connection)?;
     if args.brief {
         let brief = brief_context(&context, brief_options(args.recent, args.width));
         return emit(args.json, &brief, print_brief_context);
@@ -2127,6 +2127,9 @@ fn print_installed_adapter_summary() {
             domain.adapter, domain.namespace, domain.command
         );
         println!("  instruction: {}", domain.instruction);
+        if let Some(status_command) = &domain.status_command {
+            println!("  status_command: {status_command}");
+        }
     }
 }
 

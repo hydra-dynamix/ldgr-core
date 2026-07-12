@@ -54,15 +54,11 @@ function setView(view, options = {}) {
   if (location.pathname === '/' || location.pathname === '/index.html') $('detail-panel').classList.remove('visible');
   if (options.updateHash !== false && location.hash !== `#${view}` && (location.pathname === '/' || location.pathname === '/index.html')) history.replaceState(null, '', `#${view}`);
   if (options.scroll !== false) window.scrollTo({top: 0, behavior: 'smooth'});
-  if (view === 'waves') {
-    renderWaveManagement(lastConduct || {available: false, message: 'Loading conduct wave state...', batches: [], feeds: []});
-    loadConduct();
-  }
 }
 
 function initialViewFromHash() {
   const candidate = location.hash.replace('#', '');
-  return ['current', 'decisions', 'artifacts', 'waves', 'controls'].includes(candidate) ? candidate : 'current';
+  return ['current', 'decisions', 'artifacts', 'controls'].includes(candidate) ? candidate : 'current';
 }
 
 function renderMissionLog() {

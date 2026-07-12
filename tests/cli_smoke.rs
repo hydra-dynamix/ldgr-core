@@ -19,6 +19,11 @@ fn init_status_and_context_share_installed_domain_help_projection() -> anyhow::R
     let project = TempDir::new()?;
     let adapter = project.path().join("adapter");
     write_adapter_namespace_fixture(&adapter, "fixture", "fixture", "[\"true\"]")?;
+    let manifest = fs::read_to_string(adapter.join("adapter.toml"))?.replace(
+        "namespace = \"fixture\"",
+        "namespace = \"fixture\"\nstatus_args = [\"status\"]",
+    );
+    fs::write(adapter.join("adapter.toml"), manifest)?;
     let instruction = "Run ldgr fixture --help for the extended command surface.";
 
     let mut init = isolated_command(project.path())?;
@@ -37,6 +42,9 @@ fn init_status_and_context_share_installed_domain_help_projection() -> anyhow::R
         .stdout(predicate::str::contains(instruction))
         .stdout(predicate::str::contains(
             "\"help_command\": \"ldgr fixture --help\"",
+        ))
+        .stdout(predicate::str::contains(
+            "\"status_command\": \"ldgr fixture status\"",
         ));
 
     let mut context = isolated_command(project.path())?;

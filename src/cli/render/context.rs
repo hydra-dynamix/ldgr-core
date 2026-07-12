@@ -115,7 +115,8 @@ pub(crate) fn print_context(context: &StoreContext) {
         }
     }
 
-    if let Some(summary) = &context.conduct_lifecycle {
+    #[cfg(any())]
+    if let Some(summary) = &context.legacy_adapter_lifecycle {
         println!(
             "conduct_lifecycle: batch_id={} status={} current_wave={} blocked_count={}",
             summary.batch_id,

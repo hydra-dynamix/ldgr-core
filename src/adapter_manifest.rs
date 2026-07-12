@@ -107,6 +107,8 @@ pub struct ManifestCommandNamespace {
     pub help: ManifestCommandHelp,
     #[serde(default)]
     pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub status_args: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

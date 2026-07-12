@@ -3,7 +3,6 @@
 include!("server.rs");
 include!("http.rs");
 include!("routes.rs");
-include!("conduct.rs");
 include!("artifacts.rs");
 include!("assets.rs");
 include!("tests.rs");

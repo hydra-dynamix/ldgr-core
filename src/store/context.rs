@@ -13,16 +13,6 @@ pub fn read_context(connection: &Connection) -> anyhow::Result<StoreContext> {
     base_context(connection)
 }
 
-pub fn read_context_with_conduct_lifecycle(
-    connection: &Connection,
-    artifact_root: &Path,
-) -> anyhow::Result<StoreContext> {
-    let mut context = base_context(connection)?;
-    context.conduct_lifecycle = conduct_lifecycle_summary(connection, artifact_root, &context)?;
-    attach_stale_conduct_next_work_warning(&mut context);
-    Ok(context)
-}
-
 fn base_context(connection: &Connection) -> anyhow::Result<StoreContext> {
     Ok(StoreContext {
         pending_work_items: count_work_items_by_status(connection, WorkItemStatus::Pending)?,
@@ -46,179 +36,183 @@ fn base_context(connection: &Connection) -> anyhow::Result<StoreContext> {
             CONTEXT_GLOBAL_OBSERVATION_LIMIT,
         )?,
         latest_artifacts: latest_artifacts(connection, CONTEXT_LATEST_ARTIFACT_LIMIT)?,
-        conduct_lifecycle: None,
         loop_interventions: list_loop_interventions(connection, CONTEXT_LOOP_INTERVENTION_LIMIT)?,
         latest_events: latest_events(connection, CONTEXT_LATEST_EVENT_LIMIT)?,
     })
 }
 
-fn conduct_lifecycle_summary(
-    connection: &Connection,
-    artifact_root: &Path,
-    context: &StoreContext,
-) -> anyhow::Result<Option<ConductLifecycleSummary>> {
-    let batch_id = infer_conduct_batch_id(context);
-    if batch_id.is_none() && !context_mentions_conduct(context) {
-        return Ok(None);
+#[cfg(any())]
+mod legacy_adapter_specific_context {
+    use super::*;
+
+    fn conduct_lifecycle_summary(
+        connection: &Connection,
+        artifact_root: &Path,
+        context: &StoreContext,
+    ) -> anyhow::Result<Option<ConductLifecycleSummary>> {
+        let batch_id = infer_conduct_batch_id(context);
+        if batch_id.is_none() && !context_mentions_conduct(context) {
+            return Ok(None);
+        }
+        for artifact in list_artifacts(connection, None, 10_000)? {
+            let path = artifact_root.join(&artifact.path);
+            let Ok(text) = fs::read_to_string(&path) else {
+                continue;
+            };
+            let Some(summary) = parse_conduct_batch_state(&text, artifact.artifact_id) else {
+                continue;
+            };
+            if batch_id
+                .as_deref()
+                .is_none_or(|expected| expected == summary.batch_id)
+            {
+                return Ok(Some(summary));
+            }
+        }
+        Ok(batch_id.map(|batch_id| ConductLifecycleSummary {
+            batch_id: batch_id.clone(),
+            status: "unknown".to_owned(),
+            worker_counts: ConductWorkerCounts {
+                total: 0,
+                complete: 0,
+                active: 0,
+                blocked: 0,
+                terminal: 0,
+            },
+            graph_artifact_id: None,
+            ticket_index_artifact_id: None,
+            batch_state_artifact_id: None,
+            current_wave: None,
+            blocked_count: 0,
+            next_valid_action: format!("ldgr conduct batch status --batch-id {batch_id} --json"),
+            stale_next_work: None,
+        }))
     }
-    for artifact in list_artifacts(connection, None, 10_000)? {
-        let path = artifact_root.join(&artifact.path);
-        let Ok(text) = fs::read_to_string(&path) else {
-            continue;
+
+    fn parse_conduct_batch_state(
+        text: &str,
+        batch_state_artifact_id: i64,
+    ) -> Option<ConductLifecycleSummary> {
+        if !text.contains("kind: batch_state") || !text.contains("status: accepted") {
+            return None;
+        }
+        let mut batch_id = None;
+        let mut status = None;
+        let mut graph_artifact_id = None;
+        let mut ticket_index_artifact_id = None;
+        let mut current_wave = None;
+        let mut worker_statuses = Vec::new();
+        let mut blocked_count = 0usize;
+        let mut section = "";
+        let mut in_state_block = false;
+        for line in text.lines() {
+            if line.trim_start().starts_with("```ldgr-batch-state") {
+                in_state_block = true;
+                continue;
+            }
+            if in_state_block && line.trim_start().starts_with("```") {
+                break;
+            }
+            if !in_state_block {
+                continue;
+            }
+            let trimmed = line.trim();
+            match trimmed {
+                "workers:" => section = "workers",
+                "blocked:" => section = "blocked",
+                "waves:" => section = "waves",
+                _ => {}
+            }
+            if let Some(value) = trimmed.strip_prefix("batch_id: ") {
+                batch_id = Some(unquote_yaml_scalar(value));
+            } else if let Some(value) = trimmed.strip_prefix("graph_artifact_id: artifact:") {
+                graph_artifact_id = value.parse::<i64>().ok();
+            } else if let Some(value) = trimmed.strip_prefix("ticket_index_artifact_id: artifact:")
+            {
+                ticket_index_artifact_id = value.parse::<i64>().ok();
+            } else if let Some(value) = trimmed.strip_prefix("current_wave: ") {
+                let value = unquote_yaml_scalar(value);
+                if value != "null" {
+                    current_wave = Some(value);
+                }
+            } else if section != "workers" {
+                if let Some(value) = trimmed.strip_prefix("status: ") {
+                    status.get_or_insert_with(|| unquote_yaml_scalar(value));
+                }
+            }
+            if section == "workers" && line.starts_with("    status: ") {
+                worker_statuses.push(unquote_yaml_scalar(line.trim_start_matches("    status: ")));
+            }
+            if section == "blocked" && trimmed.starts_with("- ticket_id: ") {
+                blocked_count += 1;
+            }
+        }
+        let batch_id = batch_id?;
+        let status = status.unwrap_or_else(|| "unknown".to_owned());
+        let worker_counts = conduct_worker_counts(&worker_statuses);
+        let next_valid_action =
+            conduct_next_valid_action(&batch_id, &status, &worker_counts, blocked_count);
+        Some(ConductLifecycleSummary {
+            batch_id,
+            status,
+            worker_counts,
+            graph_artifact_id,
+            ticket_index_artifact_id,
+            batch_state_artifact_id: Some(batch_state_artifact_id),
+            current_wave,
+            blocked_count,
+            next_valid_action,
+            stale_next_work: None,
+        })
+    }
+
+    fn attach_stale_conduct_next_work_warning(context: &mut StoreContext) {
+        let Some(work_item) = &context.next_work_item else {
+            return;
         };
-        let Some(summary) = parse_conduct_batch_state(&text, artifact.artifact_id) else {
-            continue;
+        let Some(summary) = &mut context.conduct_lifecycle else {
+            return;
         };
-        if batch_id
-            .as_deref()
-            .is_none_or(|expected| expected == summary.batch_id)
+        if summary.batch_state_artifact_id.is_none()
+            || !conduct_batch_is_terminal_or_wave_complete(summary)
         {
-            return Ok(Some(summary));
+            return;
         }
-    }
-    Ok(batch_id.map(|batch_id| ConductLifecycleSummary {
-        batch_id: batch_id.clone(),
-        status: "unknown".to_owned(),
-        worker_counts: ConductWorkerCounts {
-            total: 0,
-            complete: 0,
-            active: 0,
-            blocked: 0,
-            terminal: 0,
-        },
-        graph_artifact_id: None,
-        ticket_index_artifact_id: None,
-        batch_state_artifact_id: None,
-        current_wave: None,
-        blocked_count: 0,
-        next_valid_action: format!("ldgr conduct batch status --batch-id {batch_id} --json"),
-        stale_next_work: None,
-    }))
-}
-
-fn parse_conduct_batch_state(
-    text: &str,
-    batch_state_artifact_id: i64,
-) -> Option<ConductLifecycleSummary> {
-    if !text.contains("kind: batch_state") || !text.contains("status: accepted") {
-        return None;
-    }
-    let mut batch_id = None;
-    let mut status = None;
-    let mut graph_artifact_id = None;
-    let mut ticket_index_artifact_id = None;
-    let mut current_wave = None;
-    let mut worker_statuses = Vec::new();
-    let mut blocked_count = 0usize;
-    let mut section = "";
-    let mut in_state_block = false;
-    for line in text.lines() {
-        if line.trim_start().starts_with("```ldgr-batch-state") {
-            in_state_block = true;
-            continue;
+        let next_work_fields = [
+            work_item.slug.as_str(),
+            work_item.title.as_str(),
+            work_item.description.as_str(),
+        ];
+        if !next_work_fields
+            .iter()
+            .filter_map(|field| extract_conduct_batch_id(field))
+            .any(|batch_id| batch_id == summary.batch_id)
+        {
+            return;
         }
-        if in_state_block && line.trim_start().starts_with("```") {
-            break;
+        let reason = format!(
+            "stale conduct work; batch {} is {}",
+            summary.batch_id, summary.status
+        );
+        let mut suggested_commands = vec![
+            format!(
+                "ldgr work status set {} done --reason \"{}\"",
+                work_item.slug, reason
+            ),
+            format!(
+                "ldgr work status set {} held --reason \"{}\"",
+                work_item.slug, reason
+            ),
+        ];
+        if summary.next_valid_action.starts_with("ldgr ") {
+            suggested_commands.push(summary.next_valid_action.clone());
+        } else {
+            suggested_commands.push(format!(
+                "ldgr conduct batch status --batch-id {} --json",
+                summary.batch_id
+            ));
         }
-        if !in_state_block {
-            continue;
-        }
-        let trimmed = line.trim();
-        match trimmed {
-            "workers:" => section = "workers",
-            "blocked:" => section = "blocked",
-            "waves:" => section = "waves",
-            _ => {}
-        }
-        if let Some(value) = trimmed.strip_prefix("batch_id: ") {
-            batch_id = Some(unquote_yaml_scalar(value));
-        } else if let Some(value) = trimmed.strip_prefix("graph_artifact_id: artifact:") {
-            graph_artifact_id = value.parse::<i64>().ok();
-        } else if let Some(value) = trimmed.strip_prefix("ticket_index_artifact_id: artifact:") {
-            ticket_index_artifact_id = value.parse::<i64>().ok();
-        } else if let Some(value) = trimmed.strip_prefix("current_wave: ") {
-            let value = unquote_yaml_scalar(value);
-            if value != "null" {
-                current_wave = Some(value);
-            }
-        } else if section != "workers" {
-            if let Some(value) = trimmed.strip_prefix("status: ") {
-                status.get_or_insert_with(|| unquote_yaml_scalar(value));
-            }
-        }
-        if section == "workers" && line.starts_with("    status: ") {
-            worker_statuses.push(unquote_yaml_scalar(line.trim_start_matches("    status: ")));
-        }
-        if section == "blocked" && trimmed.starts_with("- ticket_id: ") {
-            blocked_count += 1;
-        }
-    }
-    let batch_id = batch_id?;
-    let status = status.unwrap_or_else(|| "unknown".to_owned());
-    let worker_counts = conduct_worker_counts(&worker_statuses);
-    let next_valid_action =
-        conduct_next_valid_action(&batch_id, &status, &worker_counts, blocked_count);
-    Some(ConductLifecycleSummary {
-        batch_id,
-        status,
-        worker_counts,
-        graph_artifact_id,
-        ticket_index_artifact_id,
-        batch_state_artifact_id: Some(batch_state_artifact_id),
-        current_wave,
-        blocked_count,
-        next_valid_action,
-        stale_next_work: None,
-    })
-}
-
-fn attach_stale_conduct_next_work_warning(context: &mut StoreContext) {
-    let Some(work_item) = &context.next_work_item else {
-        return;
-    };
-    let Some(summary) = &mut context.conduct_lifecycle else {
-        return;
-    };
-    if summary.batch_state_artifact_id.is_none()
-        || !conduct_batch_is_terminal_or_wave_complete(summary)
-    {
-        return;
-    }
-    let next_work_fields = [
-        work_item.slug.as_str(),
-        work_item.title.as_str(),
-        work_item.description.as_str(),
-    ];
-    if !next_work_fields
-        .iter()
-        .filter_map(|field| extract_conduct_batch_id(field))
-        .any(|batch_id| batch_id == summary.batch_id)
-    {
-        return;
-    }
-    let reason = format!(
-        "stale conduct work; batch {} is {}",
-        summary.batch_id, summary.status
-    );
-    let mut suggested_commands = vec![
-        format!(
-            "ldgr work status set {} done --reason \"{}\"",
-            work_item.slug, reason
-        ),
-        format!(
-            "ldgr work status set {} held --reason \"{}\"",
-            work_item.slug, reason
-        ),
-    ];
-    if summary.next_valid_action.starts_with("ldgr ") {
-        suggested_commands.push(summary.next_valid_action.clone());
-    } else {
-        suggested_commands.push(format!(
-            "ldgr conduct batch status --batch-id {} --json",
-            summary.batch_id
-        ));
-    }
-    summary.stale_next_work = Some(ConductStaleNextWorkWarning {
+        summary.stale_next_work = Some(ConductStaleNextWorkWarning {
         work_slug: work_item.slug.clone(),
         message: format!(
             "next work {} references conduct batch {} but latest batch_state artifact {} reports status {}",
@@ -229,135 +223,138 @@ fn attach_stale_conduct_next_work_warning(context: &mut StoreContext) {
         ),
         suggested_commands,
     });
-}
+    }
 
-fn conduct_batch_is_terminal_or_wave_complete(summary: &ConductLifecycleSummary) -> bool {
-    matches!(
-        summary.status.as_str(),
-        "wave_complete" | "complete" | "blocked" | "failed" | "canceled" | "partial"
-    ) || (summary.worker_counts.total > 0
-        && summary.worker_counts.active == 0
-        && summary.worker_counts.terminal == summary.worker_counts.total)
-}
+    fn conduct_batch_is_terminal_or_wave_complete(summary: &ConductLifecycleSummary) -> bool {
+        matches!(
+            summary.status.as_str(),
+            "wave_complete" | "complete" | "blocked" | "failed" | "canceled" | "partial"
+        ) || (summary.worker_counts.total > 0
+            && summary.worker_counts.active == 0
+            && summary.worker_counts.terminal == summary.worker_counts.total)
+    }
 
-fn conduct_worker_counts(statuses: &[String]) -> ConductWorkerCounts {
-    let complete = statuses
-        .iter()
-        .filter(|status| status.as_str() == "complete")
-        .count();
-    let blocked = statuses
-        .iter()
-        .filter(|status| {
-            matches!(
-                status.as_str(),
-                "blocked" | "failed" | "validation_failed" | "timeout" | "conflict" | "stale"
-            )
-        })
-        .count();
-    let terminal = statuses
-        .iter()
-        .filter(|status| {
-            matches!(
-                status.as_str(),
-                "complete"
-                    | "blocked"
-                    | "failed"
-                    | "validation_failed"
-                    | "timeout"
-                    | "conflict"
-                    | "stale"
-            )
-        })
-        .count();
-    ConductWorkerCounts {
-        total: statuses.len(),
-        complete,
-        active: statuses.len().saturating_sub(terminal),
-        blocked,
-        terminal,
-    }
-}
-
-fn conduct_next_valid_action(
-    batch_id: &str,
-    status: &str,
-    worker_counts: &ConductWorkerCounts,
-    blocked_count: usize,
-) -> String {
-    if worker_counts.blocked > 0 || status == "blocked" {
-        return format!("inspect blocked workers for batch {batch_id}");
-    }
-    if worker_counts.active > 0 || matches!(status, "running" | "waiting" | "launched") {
-        return format!("ldgr conduct batch refresh --batch-id {batch_id}");
-    }
-    if status == "wave_complete" && blocked_count > 0 {
-        return format!("ldgr conduct batch launch --batch-id {batch_id} --graph <graph.md>");
-    }
-    if status == "wave_complete" || worker_counts.complete == worker_counts.total {
-        return format!("review batch {batch_id} results and close/advance conduct work");
-    }
-    format!("ldgr conduct batch status --batch-id {batch_id} --json")
-}
-
-fn infer_conduct_batch_id(context: &StoreContext) -> Option<String> {
-    conduct_context_fields(context)
-        .into_iter()
-        .find_map(extract_conduct_batch_id)
-}
-
-fn context_mentions_conduct(context: &StoreContext) -> bool {
-    conduct_context_fields(context)
-        .into_iter()
-        .any(|field| field.to_ascii_lowercase().contains("conduct"))
-}
-
-fn conduct_context_fields(context: &StoreContext) -> Vec<&str> {
-    let mut fields = Vec::new();
-    if let Some(work_item) = &context.next_work_item {
-        fields.push(work_item.slug.as_str());
-        fields.push(work_item.title.as_str());
-        fields.push(work_item.description.as_str());
-    }
-    if let Some(work_slug) = &context.loop_state.work_slug {
-        fields.push(work_slug.as_str());
-    }
-    fields.push(context.loop_state.progress_report.as_str());
-    for run in &context.active_runs {
-        fields.push(run.work_slug.as_str());
-        if let Some(command) = &run.command {
-            fields.push(command.as_str());
+    fn conduct_worker_counts(statuses: &[String]) -> ConductWorkerCounts {
+        let complete = statuses
+            .iter()
+            .filter(|status| status.as_str() == "complete")
+            .count();
+        let blocked = statuses
+            .iter()
+            .filter(|status| {
+                matches!(
+                    status.as_str(),
+                    "blocked" | "failed" | "validation_failed" | "timeout" | "conflict" | "stale"
+                )
+            })
+            .count();
+        let terminal = statuses
+            .iter()
+            .filter(|status| {
+                matches!(
+                    status.as_str(),
+                    "complete"
+                        | "blocked"
+                        | "failed"
+                        | "validation_failed"
+                        | "timeout"
+                        | "conflict"
+                        | "stale"
+                )
+            })
+            .count();
+        ConductWorkerCounts {
+            total: statuses.len(),
+            complete,
+            active: statuses.len().saturating_sub(terminal),
+            blocked,
+            terminal,
         }
     }
-    for observation in &context.latest_observations {
-        fields.push(observation.body.as_str());
-    }
-    for observation in &context.global_observations {
-        fields.push(observation.body.as_str());
-    }
-    fields
-}
 
-fn extract_conduct_batch_id(text: &str) -> Option<String> {
-    for marker in ["--batch-id", "batch_id", "batch-id", "batch="] {
-        if let Some(index) = text.find(marker) {
-            let value = text[index + marker.len()..]
-                .trim_start_matches(|ch: char| ch == ':' || ch == '=' || ch.is_whitespace())
-                .trim_start_matches('`')
-                .chars()
-                .take_while(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '/'))
-                .collect::<String>()
-                .trim_end_matches(['.', ',', ';', ')', ']'])
-                .to_owned();
-            if !value.is_empty() {
-                return Some(value);
+    fn conduct_next_valid_action(
+        batch_id: &str,
+        status: &str,
+        worker_counts: &ConductWorkerCounts,
+        blocked_count: usize,
+    ) -> String {
+        if worker_counts.blocked > 0 || status == "blocked" {
+            return format!("inspect blocked workers for batch {batch_id}");
+        }
+        if worker_counts.active > 0 || matches!(status, "running" | "waiting" | "launched") {
+            return format!("ldgr conduct batch refresh --batch-id {batch_id}");
+        }
+        if status == "wave_complete" && blocked_count > 0 {
+            return format!("ldgr conduct batch launch --batch-id {batch_id} --graph <graph.md>");
+        }
+        if status == "wave_complete" || worker_counts.complete == worker_counts.total {
+            return format!("review batch {batch_id} results and close/advance conduct work");
+        }
+        format!("ldgr conduct batch status --batch-id {batch_id} --json")
+    }
+
+    fn infer_conduct_batch_id(context: &StoreContext) -> Option<String> {
+        conduct_context_fields(context)
+            .into_iter()
+            .find_map(extract_conduct_batch_id)
+    }
+
+    fn context_mentions_conduct(context: &StoreContext) -> bool {
+        conduct_context_fields(context)
+            .into_iter()
+            .any(|field| field.to_ascii_lowercase().contains("conduct"))
+    }
+
+    fn conduct_context_fields(context: &StoreContext) -> Vec<&str> {
+        let mut fields = Vec::new();
+        if let Some(work_item) = &context.next_work_item {
+            fields.push(work_item.slug.as_str());
+            fields.push(work_item.title.as_str());
+            fields.push(work_item.description.as_str());
+        }
+        if let Some(work_slug) = &context.loop_state.work_slug {
+            fields.push(work_slug.as_str());
+        }
+        fields.push(context.loop_state.progress_report.as_str());
+        for run in &context.active_runs {
+            fields.push(run.work_slug.as_str());
+            if let Some(command) = &run.command {
+                fields.push(command.as_str());
             }
         }
+        for observation in &context.latest_observations {
+            fields.push(observation.body.as_str());
+        }
+        for observation in &context.global_observations {
+            fields.push(observation.body.as_str());
+        }
+        fields
     }
-    None
-}
 
-fn unquote_yaml_scalar(value: &str) -> String {
-    value.trim().trim_matches('"').trim_matches('\'').to_owned()
+    fn extract_conduct_batch_id(text: &str) -> Option<String> {
+        for marker in ["--batch-id", "batch_id", "batch-id", "batch="] {
+            if let Some(index) = text.find(marker) {
+                let value = text[index + marker.len()..]
+                    .trim_start_matches(|ch: char| ch == ':' || ch == '=' || ch.is_whitespace())
+                    .trim_start_matches('`')
+                    .chars()
+                    .take_while(|ch| {
+                        ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '/')
+                    })
+                    .collect::<String>()
+                    .trim_end_matches(['.', ',', ';', ')', ']'])
+                    .to_owned();
+                if !value.is_empty() {
+                    return Some(value);
+                }
+            }
+        }
+        None
+    }
+
+    fn unquote_yaml_scalar(value: &str) -> String {
+        value.trim().trim_matches('"').trim_matches('\'').to_owned()
+    }
 }
 
 pub fn request_loop_intervention(

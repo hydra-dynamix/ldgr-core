@@ -4,8 +4,6 @@ const text = value => value == null ? 'none' : String(value);
 let lastSnapshotJson = '';
 let lastContext = null;
 let lastMissionLog = null;
-let lastConduct = null;
-let conductLoadInFlight = false;
 let currentView = initialViewFromHash();
 let currentDetailRoute = '';
 let selectedArtifactId = null;
@@ -96,23 +94,6 @@ async function load() {
   render();
   await renderRoute();
   $('last-refresh').textContent = 'Updated ' + new Date().toLocaleTimeString();
-  if (currentView === 'waves') loadConduct();
-}
-
-async function loadConduct() {
-  if (conductLoadInFlight) return;
-  conductLoadInFlight = true;
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort('conduct wave request timeout'), 15000);
-  try {
-    lastConduct = await apiJson('/api/conduct/waves', {signal: controller.signal});
-  } catch (error) {
-    lastConduct = {available: false, error: String(error), batches: [], feeds: []};
-  } finally {
-    clearTimeout(timeout);
-    conductLoadInFlight = false;
-  }
-  if (currentView === 'waves') renderWaveManagement(lastConduct);
 }
 
 function isEditingControl() {
@@ -140,4 +121,3 @@ function controlDraft() {
     startStatus: $('loop-start-status') ? $('loop-start-status').textContent : 'Start launches one bounded loop cycle in the background.'
   };
 }
-
