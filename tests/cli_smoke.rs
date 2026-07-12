@@ -12,6 +12,22 @@ use predicates::prelude::*;
 use tempfile::TempDir;
 
 #[test]
+fn adapter_install_list_reads_explicit_release_index_without_recompile() -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    let index = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/release-index/open-and-commercial.json");
+    let mut command = isolated_command(project.path())?;
+    command
+        .env("LDGR_ADAPTER_INDEX", index)
+        .args(["adapter", "install", "list"]);
+    command
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("evidence — LDGR Evidence adapter"));
+    Ok(())
+}
+
+#[test]
 fn top_level_help_shows_core_loop_and_hides_mature_project_surface() -> anyhow::Result<()> {
     let project = TempDir::new()?;
     let mut command = isolated_command(project.path())?;

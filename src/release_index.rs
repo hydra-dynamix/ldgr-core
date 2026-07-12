@@ -1,9 +1,98 @@
 use std::collections::HashMap;
+use std::fs;
+use std::path::Path;
+use std::process::Command;
 
 use anyhow::{bail, Context};
+use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 
 pub const ADAPTER_RELEASE_INDEX_SCHEMA_VERSION: u32 = 1;
+pub const ADAPTER_RELEASE_INDEX_ENV: &str = "LDGR_ADAPTER_INDEX";
+pub const DEFAULT_ADAPTER_RELEASE_INDEX_URL: &str =
+    "https://raw.githubusercontent.com/hydra-dynamix/ldgr-releases/main/index.json";
+
+pub fn load_configured_release_index() -> anyhow::Result<AdapterReleaseIndex> {
+    let source = std::env::var(ADAPTER_RELEASE_INDEX_ENV)
+        .unwrap_or_else(|_| DEFAULT_ADAPTER_RELEASE_INDEX_URL.to_owned());
+    load_release_index(&source)
+}
+
+pub fn load_release_index(source: &str) -> anyhow::Result<AdapterReleaseIndex> {
+    let text = if source.starts_with("https://") {
+        let output = Command::new("curl")
+            .args(["-fsSL", source])
+            .output()
+            .with_context(|| format!("failed to execute curl for adapter index {source}"))?;
+        if !output.status.success() {
+            bail!(
+                "failed to download adapter release index {source}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        String::from_utf8(output.stdout).context("adapter release index is not UTF-8")?
+    } else {
+        let path = source.strip_prefix("file://").unwrap_or(source);
+        fs::read_to_string(Path::new(path))
+            .with_context(|| format!("failed to read adapter release index {path}"))?
+    };
+    parse_release_index(&text)
+        .with_context(|| format!("invalid adapter release index from {source}"))
+}
+
+pub fn resolve_release<'a>(
+    index: &'a AdapterReleaseIndex,
+    domain: &str,
+    core_version: &Version,
+    platform: &str,
+    exact_version: Option<&Version>,
+    include_prerelease: bool,
+) -> anyhow::Result<ResolvedAdapterRelease<'a>> {
+    let adapter = index
+        .adapters
+        .iter()
+        .find(|adapter| {
+            adapter.domain == domain || adapter.aliases.iter().any(|alias| alias == domain)
+        })
+        .with_context(|| format!("adapter `{domain}` is not present in the release index"))?;
+    let mut candidates = adapter
+        .releases
+        .iter()
+        .filter_map(|release| {
+            let version = Version::parse(&release.version).ok()?;
+            let requirement = VersionReq::parse(&release.core_compatibility).ok()?;
+            let platform_release = release
+                .platforms
+                .iter()
+                .find(|item| item.platform == platform)?;
+            let channel_allowed = release.channel == ReleaseChannel::Stable || include_prerelease;
+            let exact_allowed = exact_version.is_none_or(|exact| exact == &version);
+            (channel_allowed && exact_allowed && requirement.matches(core_version)).then_some((
+                version,
+                release,
+                platform_release,
+            ))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| right.0.cmp(&left.0));
+    let Some((version, release, platform_release)) = candidates.into_iter().next() else {
+        bail!("no compatible release for adapter `{}` on platform `{platform}` with Core {core_version}", adapter.domain);
+    };
+    Ok(ResolvedAdapterRelease {
+        adapter,
+        release,
+        platform: platform_release,
+        version,
+    })
+}
+
+#[derive(Clone, Debug)]
+pub struct ResolvedAdapterRelease<'a> {
+    pub adapter: &'a AdapterReleaseProduct,
+    pub release: &'a AdapterRelease,
+    pub platform: &'a AdapterPlatformRelease,
+    pub version: Version,
+}
 
 pub fn parse_release_index(json: &str) -> anyhow::Result<AdapterReleaseIndex> {
     let index: AdapterReleaseIndex =
@@ -178,7 +267,12 @@ pub struct AdapterPlatformRelease {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_release_index, AdapterClassification, ReleaseChannel};
+    use semver::Version;
+
+    use super::{
+        load_release_index, parse_release_index, resolve_release, AdapterClassification,
+        ReleaseChannel,
+    };
 
     const OPEN_AND_COMMERCIAL: &str =
         include_str!("../tests/fixtures/release-index/open-and-commercial.json");
@@ -263,5 +357,72 @@ mod tests {
             1,
         );
         assert!(format!("{:#}", parse_release_index(&mismatch).unwrap_err()).contains("must equal"));
+    }
+
+    #[test]
+    fn loads_explicit_local_index_without_network() -> anyhow::Result<()> {
+        let index = load_release_index("tests/fixtures/release-index/open-and-commercial.json")?;
+        assert_eq!(index.adapters[0].domain, "example");
+        Ok(())
+    }
+
+    #[test]
+    fn resolves_latest_compatible_stable_platform_release() -> anyhow::Result<()> {
+        let mut index = parse_release_index(OPEN_AND_COMMERCIAL)?;
+        let mut newer = index.adapters[0].releases[0].clone();
+        newer.version = "0.1.5".to_owned();
+        index.adapters[0].releases.push(newer);
+        let resolved = resolve_release(
+            &index,
+            "reference",
+            &Version::parse("0.1.4")?,
+            "linux-aarch64",
+            None,
+            false,
+        )?;
+        assert_eq!(resolved.version, Version::parse("0.1.5")?);
+        Ok(())
+    }
+
+    #[test]
+    fn resolver_honors_exact_prerelease_platform_and_compatibility() -> anyhow::Result<()> {
+        let index = parse_release_index(OPEN_AND_COMMERCIAL)?;
+        let prerelease = resolve_release(
+            &index,
+            "evidence",
+            &Version::parse("0.1.4")?,
+            "linux-aarch64",
+            Some(&Version::parse("0.1.0")?),
+            true,
+        )?;
+        assert_eq!(prerelease.release.channel, ReleaseChannel::Prerelease);
+        assert!(resolve_release(
+            &index,
+            "evidence",
+            &Version::parse("0.1.4")?,
+            "linux-x86_64",
+            None,
+            true
+        )
+        .is_err());
+        assert!(resolve_release(
+            &index,
+            "example",
+            &Version::parse("0.2.0")?,
+            "linux-aarch64",
+            None,
+            false
+        )
+        .is_err());
+        assert!(resolve_release(
+            &index,
+            "evidence",
+            &Version::parse("0.1.4")?,
+            "linux-aarch64",
+            None,
+            false
+        )
+        .is_err());
+        Ok(())
     }
 }

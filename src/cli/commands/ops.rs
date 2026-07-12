@@ -456,6 +456,17 @@ const fn commercial_release(adapter: &'static str, binary: &'static str) -> Rele
 }
 
 pub(crate) fn print_available_adapter_catalog() {
+    if std::env::var_os(crate::release_index::ADAPTER_RELEASE_INDEX_ENV).is_some() {
+        match crate::release_index::load_configured_release_index() {
+            Ok(index) => {
+                print_release_index_catalog(&index);
+                return;
+            }
+            Err(error) => {
+                eprintln!("warning: {error:#}");
+            }
+        }
+    }
     println!("Available adapters:");
     for entry in available_adapter_catalog() {
         if entry.source.is_empty() {
@@ -465,6 +476,22 @@ pub(crate) fn print_available_adapter_catalog() {
         }
         println!("    install: {}", entry.install);
         println!("    after install: ldgr {} --help", entry.slug);
+    }
+    println!("  installed adapters: ldgr adapter list");
+    println!("  adapter details: ldgr adapter show <slug>");
+}
+
+fn print_release_index_catalog(index: &crate::release_index::AdapterReleaseIndex) {
+    println!("Available adapters:");
+    for adapter in &index.adapters {
+        let source = adapter
+            .source_url
+            .as_deref()
+            .map(|source| format!(" [{source}]"))
+            .unwrap_or_default();
+        println!("  {} — {}{}", adapter.domain, adapter.title, source);
+        println!("    install: ldgr adapter install {}", adapter.domain);
+        println!("    after install: ldgr {} --help", adapter.domain);
     }
     println!("  installed adapters: ldgr adapter list");
     println!("  adapter details: ldgr adapter show <slug>");
