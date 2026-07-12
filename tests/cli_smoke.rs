@@ -15,6 +15,74 @@ use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 #[test]
+fn init_status_and_context_share_installed_domain_help_projection() -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    let adapter = project.path().join("adapter");
+    write_adapter_namespace_fixture(&adapter, "fixture", "fixture", "[\"true\"]")?;
+    let instruction = "Run ldgr fixture --help for the extended command surface.";
+
+    let mut init = isolated_command(project.path())?;
+    init.env("LDGR_ADAPTER_PATH", &adapter).arg("init");
+    init.assert()
+        .success()
+        .stdout(predicate::str::contains(instruction));
+
+    let mut status = isolated_command(project.path())?;
+    status
+        .env("LDGR_ADAPTER_PATH", &adapter)
+        .args(["status", "--json"]);
+    status
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(instruction))
+        .stdout(predicate::str::contains(
+            "\"help_command\": \"ldgr fixture --help\"",
+        ));
+
+    let mut context = isolated_command(project.path())?;
+    context
+        .env("LDGR_ADAPTER_PATH", &adapter)
+        .args(["context", "--json"]);
+    context
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(instruction))
+        .stdout(predicate::str::contains(
+            "\"help_command\": \"ldgr fixture --help\"",
+        ));
+    Ok(())
+}
+
+#[test]
+fn adapter_namespace_aliases_are_explicit_and_typos_never_execute() -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    let adapter = project.path().join("adapter");
+    write_adapter_namespace_fixture(&adapter, "fixture", "fixture", "[\"true\"]")?;
+    let manifest = fs::read_to_string(adapter.join("adapter.toml"))?.replace(
+        "namespace = \"fixture\"",
+        "namespace = \"fixture\"\naliases = [\"fx\"]",
+    );
+    fs::write(adapter.join("adapter.toml"), manifest)?;
+
+    let mut alias = isolated_command(project.path())?;
+    alias
+        .env("LDGR_ADAPTER_PATH", &adapter)
+        .args(["fx", "--help"]);
+    alias.assert().success();
+
+    let mut typo = isolated_command(project.path())?;
+    typo.env("LDGR_ADAPTER_PATH", &adapter).arg("fxture");
+    typo.assert().failure();
+
+    let mut exact_help = isolated_command(project.path())?;
+    exact_help
+        .env("LDGR_ADAPTER_PATH", &adapter)
+        .args(["fixture", "--help"]);
+    exact_help.assert().success();
+    Ok(())
+}
+
+#[test]
 fn adapter_install_list_reads_explicit_release_index_without_recompile() -> anyhow::Result<()> {
     let project = TempDir::new()?;
     let index = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -70,6 +138,7 @@ fn adapter_install_resolves_and_installs_fixture_from_index() -> anyhow::Result<
         })
         .to_string(),
     )?;
+    let all_harness_config = fs::read_to_string(isolated_home.join(".ldgr/config.json"))?;
     let archive = project.path().join("fixture.tar.gz");
     let status = StdCommand::new("tar")
         .args(["-czf"])
@@ -185,6 +254,31 @@ fn adapter_install_resolves_and_installs_fixture_from_index() -> anyhow::Result<
     show.assert()
         .success()
         .stdout(predicate::str::contains("installation_receipt"));
+    fs::write(
+        isolated_home.join(".ldgr/config.json"),
+        serde_json::json!({
+            "schema_version": 1,
+            "selected_harnesses": ["codex"],
+            "installed": [{"harness":"codex","prompt_paths":[isolated_home.join("codex-prompts")],"skill_paths":[isolated_home.join("codex-skills")]}]
+        })
+        .to_string(),
+    )?;
+    let mut reconcile = isolated_command(project.path())?;
+    reconcile
+        .env("LDGR_ADAPTER_PATH", &install_root)
+        .args(["adapter", "reconcile", "fixture"]);
+    reconcile.assert().success();
+    assert!(!isolated_home.join("pi-prompts/fixture-loop.md").exists());
+    assert!(isolated_home
+        .join("codex-prompts/fixture-loop.md")
+        .is_file());
+    fs::write(isolated_home.join(".ldgr/config.json"), &all_harness_config)?;
+    let mut reconcile_all = isolated_command(project.path())?;
+    reconcile_all
+        .env("LDGR_ADAPTER_PATH", &install_root)
+        .args(["adapter", "reconcile", "fixture"]);
+    reconcile_all.assert().success();
+    assert!(isolated_home.join("pi-prompts/fixture-loop.md").is_file());
     let mut update_index: serde_json::Value = serde_json::from_str(&fs::read_to_string(&index)?)?;
     let mut newer = update_index["adapters"][0]["releases"][0].clone();
     newer["version"] = serde_json::Value::String("1.2.4".to_owned());

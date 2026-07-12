@@ -272,6 +272,7 @@ pub struct InstallationReceipt {
     pub signing_key_id: String,
     pub core_compatibility: String,
     pub platform: String,
+    pub resource_manifest: String,
     pub installed_at_unix_seconds: u64,
     pub bundle_sha256: String,
     pub binary_path: Option<String>,

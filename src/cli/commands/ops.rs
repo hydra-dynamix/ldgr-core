@@ -17,9 +17,9 @@ use crate::tool_runner::parse_argv_json;
 use crate::web::{generate_control_token, serve, WebOptions};
 
 use super::super::args::{
-    AdapterUninstallArgs, AdapterUpdateArgs, CliLoopAgent, ContextArgs, HarnessKind,
-    InstallAdapterArgs, InstallArgs, InstallCommand, LoopArgs, LoopCommand, LoopRunArgs,
-    StatusArgs, WebArgs,
+    AdapterReconcileArgs, AdapterUninstallArgs, AdapterUpdateArgs, CliLoopAgent, ContextArgs,
+    HarnessKind, InstallAdapterArgs, InstallArgs, InstallCommand, LoopArgs, LoopCommand,
+    LoopRunArgs, StatusArgs, WebArgs,
 };
 use super::super::render::brief_context::{
     brief_context, print_brief_context, BriefContextOptions,
@@ -45,6 +45,7 @@ pub fn handle_init(db: &Path, artifact_root: &Path) -> anyhow::Result<()> {
     install_core_harness_resources()?;
     print_init_project_setup_prompt();
     print_cli_hierarchy();
+    print_installed_adapter_summary();
     Ok(())
 }
 
@@ -106,6 +107,7 @@ pub fn handle_install(args: InstallArgs) -> anyhow::Result<()> {
         format!("{}\n", serde_json::to_string_pretty(&config)?),
     )?;
     println!("├─ Wrote config {}", config_path.display());
+    reconcile_installed_adapters(&home, None)?;
     println!("│");
     println!("√ LDGR install complete");
     println!("│");
@@ -321,6 +323,88 @@ pub(crate) fn handle_uninstall_adapter(args: &AdapterUninstallArgs) -> anyhow::R
     Ok(())
 }
 
+pub(crate) fn handle_reconcile_adapters(args: &AdapterReconcileArgs) -> anyhow::Result<()> {
+    reconcile_installed_adapters(&home_dir()?, args.name.as_deref())
+}
+
+fn reconcile_installed_adapters(home: &Path, requested: Option<&str>) -> anyhow::Result<()> {
+    let registry = AdapterRegistry::discover();
+    let adapters = registry
+        .adapters
+        .iter()
+        .filter(|adapter| {
+            requested.is_none_or(|name| {
+                adapter.slug == name || adapter.aliases.iter().any(|alias| alias == name)
+            })
+        })
+        .collect::<Vec<_>>();
+    if requested.is_some() && adapters.is_empty() {
+        bail!("requested adapter is not installed");
+    }
+    for adapter in adapters {
+        let Some(value) = adapter.installation_receipt.clone() else {
+            continue;
+        };
+        let mut receipt: crate::release_index::InstallationReceipt =
+            serde_json::from_value(value).context("installation receipt is invalid")?;
+        let desired_plan =
+            typed_harness_resource_plan(&adapter.root_path, home, &receipt.resource_manifest)?;
+        let desired_targets = desired_plan
+            .iter()
+            .map(|(_, target)| target.clone())
+            .collect::<Vec<_>>();
+        let temp = std::env::temp_dir().join(format!(
+            "ldgr-adapter-reconcile-{}-{}",
+            adapter.slug,
+            std::process::id()
+        ));
+        remove_path_if_exists(&temp)?;
+        let mut transaction = InstallTransaction::new(temp.join("rollback"))?;
+        transaction.snapshot(&adapter.root_path)?;
+        for resource in &receipt.owned_resources {
+            let path = PathBuf::from(&resource.path);
+            if path.exists() && digest_path(&path)? != resource.sha256 {
+                bail!(
+                    "refusing to reconcile modified adapter resource {}",
+                    path.display()
+                );
+            }
+            transaction.snapshot(&path)?;
+        }
+        for target in &desired_targets {
+            transaction.snapshot(target)?;
+        }
+        for resource in &receipt.owned_resources {
+            let path = PathBuf::from(&resource.path);
+            if !desired_targets.iter().any(|target| target == &path) {
+                remove_path_if_exists(&path)?;
+            }
+        }
+        install_typed_harness_resources(&desired_plan)?;
+        receipt.owned_resources = desired_targets
+            .iter()
+            .map(|path| {
+                Ok(crate::release_index::OwnedResource {
+                    path: path.display().to_string(),
+                    sha256: digest_path(path)?,
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        fs::write(
+            adapter.root_path.join("installation-receipt.json"),
+            format!("{}\n", serde_json::to_string_pretty(&receipt)?),
+        )?;
+        transaction.commit()?;
+        remove_path_if_exists(&temp)?;
+        println!(
+            "reconciled adapter={} resources={}",
+            adapter.slug,
+            receipt.owned_resources.len()
+        );
+    }
+    Ok(())
+}
+
 fn install_adapter_from_configured_index(args: &InstallAdapterArgs) -> anyhow::Result<()> {
     use semver::Version;
 
@@ -508,6 +592,7 @@ fn write_installation_receipt(
         signing_key_id: resolved.platform.signing_key_id.clone(),
         core_compatibility: resolved.release.core_compatibility.clone(),
         platform: resolved.platform.platform.clone(),
+        resource_manifest: resolved.platform.resource_manifest.clone(),
         installed_at_unix_seconds,
         bundle_sha256: digest_bundle(install_root)?,
         binary_path: binary_path.map(|path| path.display().to_string()),
@@ -2017,8 +2102,13 @@ pub fn handle_context(
         let brief = brief_context(&context, brief_options(args.recent, args.width));
         return emit(args.json, &brief, print_brief_context);
     }
-    emit(args.json, &context, print_context)?;
-    if !args.json {
+    if args.json {
+        let mut value = serde_json::to_value(&context)?;
+        value["installed_adapter_namespaces"] =
+            serde_json::to_value(AdapterRegistry::discover().installed_domains())?;
+        println!("{}", serde_json::to_string_pretty(&value)?);
+    } else {
+        print_context(&context);
         print_installed_adapter_summary();
     }
     Ok(())
@@ -2031,26 +2121,12 @@ fn print_installed_adapter_summary() {
     }
     println!();
     println!("installed_adapters:");
-    for adapter in registry.adapters {
-        let namespaces = adapter
-            .command_namespaces
-            .iter()
-            .map(|command| format!("ldgr {}", command.namespace))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let profiles = adapter
-            .target_profiles
-            .iter()
-            .map(|profile| profile.slug.clone())
-            .collect::<Vec<_>>()
-            .join(", ");
-        println!("- {} ({})", adapter.slug, adapter.title);
-        if !namespaces.is_empty() {
-            println!("  commands: {namespaces}");
-        }
-        if !profiles.is_empty() {
-            println!("  profiles: {profiles}");
-        }
+    for domain in registry.installed_domains() {
+        println!(
+            "- adapter={} namespace={} command={}",
+            domain.adapter, domain.namespace, domain.command
+        );
+        println!("  instruction: {}", domain.instruction);
     }
 }
 

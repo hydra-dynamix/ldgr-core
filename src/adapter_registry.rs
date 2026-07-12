@@ -114,6 +114,40 @@ impl AdapterRegistry {
             })
         })
     }
+
+    pub fn installed_domains(&self) -> Vec<InstalledAdapterDomain> {
+        self.adapters
+            .iter()
+            .flat_map(|adapter| {
+                adapter.command_namespaces.iter().map(|namespace| {
+                    let command = format!("ldgr {}", namespace.namespace);
+                    InstalledAdapterDomain {
+                        adapter: adapter.slug.clone(),
+                        namespace: namespace.namespace.clone(),
+                        command: command.clone(),
+                        help_command: format!("{command} --help"),
+                        instruction: format!(
+                            "Run {command} --help for the extended command surface."
+                        ),
+                        summary: namespace
+                            .summary
+                            .clone()
+                            .or_else(|| namespace.description.clone()),
+                    }
+                })
+            })
+            .collect()
+    }
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct InstalledAdapterDomain {
+    pub adapter: String,
+    pub namespace: String,
+    pub command: String,
+    pub help_command: String,
+    pub instruction: String,
+    pub summary: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]

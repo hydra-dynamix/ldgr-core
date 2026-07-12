@@ -32,6 +32,7 @@ pub fn handle_adapter(args: AdapterArgs) -> anyhow::Result<()> {
         },
         AdapterCommand::Update(args) => super::ops::handle_update_adapter(&args),
         AdapterCommand::Uninstall(args) => super::ops::handle_uninstall_adapter(&args),
+        AdapterCommand::Reconcile(args) => super::ops::handle_reconcile_adapters(&args),
         AdapterCommand::List(args) => {
             if args.json {
                 println!("{}", serde_json::to_string_pretty(&registry)?);

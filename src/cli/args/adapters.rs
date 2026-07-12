@@ -17,12 +17,20 @@ pub enum AdapterCommand {
     Update(AdapterUpdateArgs),
     /// Remove an installed adapter and its receipt-owned files.
     Uninstall(AdapterUninstallArgs),
+    /// Reconcile installed adapter resources with current harness selections.
+    Reconcile(AdapterReconcileArgs),
     /// List installed adapters.
     List(ListAdapterArgs),
     /// Show one installed adapter by slug or alias.
     Show(ShowAdapterArgs),
     /// Resolve advertised adapter command metadata without executing it.
     Dispatch(DispatchAdapterArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct AdapterReconcileArgs {
+    /// Reconcile one adapter; omit to reconcile every receipt-managed adapter.
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Args)]

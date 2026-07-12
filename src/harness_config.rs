@@ -21,6 +21,7 @@ pub fn parse_harness_config(text: &str) -> anyhow::Result<HarnessConfig> {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct HarnessConfig {
+    #[serde(default = "default_schema_version")]
     pub schema_version: u32,
     #[serde(default)]
     pub default_harness: Option<String>,
@@ -30,6 +31,10 @@ pub struct HarnessConfig {
     pub installed: Vec<InstalledHarness>,
     #[serde(flatten)]
     pub extensions: BTreeMap<String, serde_json::Value>,
+}
+
+fn default_schema_version() -> u32 {
+    HARNESS_CONFIG_SCHEMA_VERSION
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
