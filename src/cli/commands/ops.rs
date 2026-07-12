@@ -17,8 +17,9 @@ use crate::tool_runner::parse_argv_json;
 use crate::web::{generate_control_token, serve, WebOptions};
 
 use super::super::args::{
-    CliLoopAgent, ContextArgs, HarnessKind, InstallAdapterArgs, InstallArgs, InstallCommand,
-    LoopArgs, LoopCommand, LoopRunArgs, StatusArgs, WebArgs,
+    AdapterUninstallArgs, AdapterUpdateArgs, CliLoopAgent, ContextArgs, HarnessKind,
+    InstallAdapterArgs, InstallArgs, InstallCommand, LoopArgs, LoopCommand, LoopRunArgs,
+    StatusArgs, WebArgs,
 };
 use super::super::render::brief_context::{
     brief_context, print_brief_context, BriefContextOptions,
@@ -136,6 +137,7 @@ pub fn handle_install(args: InstallArgs) -> anyhow::Result<()> {
                 install_root: None,
                 version: None,
                 prerelease: false,
+                offline: false,
                 yes: args.yes,
             })?;
         }
@@ -169,6 +171,7 @@ pub(crate) fn handle_interactive_adapter_install(
             install_root: None,
             version: None,
             prerelease: false,
+            offline: false,
             yes,
         })?;
     }
@@ -215,10 +218,118 @@ pub(crate) fn handle_install_adapter(args: &InstallAdapterArgs) -> anyhow::Resul
     Ok(())
 }
 
+pub(crate) fn handle_update_adapter(args: &AdapterUpdateArgs) -> anyhow::Result<()> {
+    use semver::Version;
+
+    let registry = AdapterRegistry::discover();
+    let installed = registry
+        .find(&args.name)
+        .with_context(|| format!("adapter `{}` is not installed", args.name))?;
+    let receipt = installed
+        .installation_receipt
+        .as_ref()
+        .context("installed adapter has no verified installation receipt; reinstall it first")?;
+    let current_text = receipt
+        .get("version")
+        .and_then(serde_json::Value::as_str)
+        .context("installation receipt has no version")?;
+    let current = Version::parse(current_text).context("installed receipt version is invalid")?;
+    let index = crate::release_index::load_configured_release_index()?;
+    let core = Version::parse(env!("CARGO_PKG_VERSION"))?;
+    let platform = platform_tag()?;
+    let resolved = crate::release_index::resolve_release(
+        &index,
+        &installed.slug,
+        &core,
+        &platform,
+        None,
+        args.prerelease,
+    )?;
+    if resolved.version <= current {
+        println!(
+            "adapter={} installed={} latest_compatible={} update_available=false",
+            installed.slug, current, resolved.version
+        );
+        return Ok(());
+    }
+    println!(
+        "adapter={} installed={} latest_compatible={} update_available=true",
+        installed.slug, current, resolved.version
+    );
+    if args.check {
+        return Ok(());
+    }
+    install_adapter_from_configured_index(&InstallAdapterArgs {
+        name: installed.slug.clone(),
+        source_root: None,
+        install_root: Some(installed.root_path.clone()),
+        version: Some(resolved.version.to_string()),
+        prerelease: args.prerelease,
+        offline: false,
+        yes: true,
+    })
+}
+
+pub(crate) fn handle_uninstall_adapter(args: &AdapterUninstallArgs) -> anyhow::Result<()> {
+    let registry = AdapterRegistry::discover();
+    let installed = registry
+        .find(&args.name)
+        .with_context(|| format!("adapter `{}` is not installed", args.name))?;
+    let receipt_value = installed.installation_receipt.clone().context(
+        "installed adapter has no verified installation receipt; refusing untracked removal",
+    )?;
+    let receipt: crate::release_index::InstallationReceipt =
+        serde_json::from_value(receipt_value).context("installation receipt is invalid")?;
+    let mut modified = Vec::new();
+    if digest_bundle(&installed.root_path)? != receipt.bundle_sha256 {
+        modified.push(installed.root_path.clone());
+    }
+    for resource in &receipt.owned_resources {
+        let path = PathBuf::from(&resource.path);
+        if path.exists() && digest_path(&path)? != resource.sha256 {
+            modified.push(path);
+        }
+    }
+    if let (Some(path), Some(expected)) = (&receipt.binary_path, &receipt.binary_sha256) {
+        let path = PathBuf::from(path);
+        if path.exists() && digest_path(&path)? != *expected {
+            modified.push(path);
+        }
+    }
+    if !modified.is_empty() && !args.force {
+        bail!(
+            "refusing to remove modified adapter-owned files:\n{}\nRe-run with --force to remove them.",
+            modified
+                .iter()
+                .map(|path| format!("  {}", path.display()))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+    for resource in &receipt.owned_resources {
+        remove_path_if_exists(Path::new(&resource.path))?;
+    }
+    if let Some(binary) = &receipt.binary_path {
+        remove_path_if_exists(Path::new(binary))?;
+    }
+    remove_path_if_exists(&installed.root_path)?;
+    let marker = home_dir()?
+        .join(".ldgr/installed-adapters")
+        .join(&installed.slug);
+    remove_path_if_exists(&marker)?;
+    println!("uninstalled adapter={}", installed.slug);
+    Ok(())
+}
+
 fn install_adapter_from_configured_index(args: &InstallAdapterArgs) -> anyhow::Result<()> {
     use semver::Version;
 
-    let index = crate::release_index::load_configured_release_index()?;
+    let configured_source = std::env::var(crate::release_index::ADAPTER_RELEASE_INDEX_ENV)
+        .unwrap_or_else(|_| crate::release_index::DEFAULT_ADAPTER_RELEASE_INDEX_URL.to_owned());
+    if args.offline && configured_source.starts_with("http") {
+        bail!("--offline requires LDGR_ADAPTER_INDEX to reference a local file");
+    }
+    let index = crate::release_index::load_release_index(&configured_source)?;
     let requested = normalize_adapter_name(&args.name);
     let adapter = index
         .adapters
@@ -248,6 +359,12 @@ fn install_adapter_from_configured_index(args: &InstallAdapterArgs) -> anyhow::R
         exact.as_ref(),
         args.prerelease,
     )?;
+    if args.offline
+        && (!resolved.platform.asset_url.starts_with("file://")
+            || !resolved.platform.signature_url.starts_with("file://"))
+    {
+        bail!("--offline requires file:// archive and signature URLs in the release index");
+    }
     let home = home_dir()?;
     let install_root = args
         .install_root
@@ -329,7 +446,7 @@ fn install_resolved_index_release(
     )?;
     let resource_targets = harness_resource_targets(&extracted, home)?;
     for target in &resource_targets {
-        transaction.snapshot(&target)?;
+        transaction.snapshot(target)?;
     }
     activate_bundle_atomically(&extracted, install_root)?;
     let installed_binary = install_release_binary(
@@ -381,16 +498,87 @@ fn write_installation_receipt(
         core_compatibility: resolved.release.core_compatibility.clone(),
         platform: resolved.platform.platform.clone(),
         installed_at_unix_seconds,
+        bundle_sha256: digest_bundle(install_root)?,
         binary_path: binary_path.map(|path| path.display().to_string()),
+        binary_sha256: binary_path.map(digest_path).transpose()?,
         owned_resources: resources
             .iter()
-            .map(|path| path.display().to_string())
-            .collect(),
+            .map(|path| {
+                Ok(crate::release_index::OwnedResource {
+                    path: path.display().to_string(),
+                    sha256: digest_path(path)?,
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?,
     };
     fs::write(
         install_root.join("installation-receipt.json"),
         format!("{}\n", serde_json::to_string_pretty(&receipt)?),
     )?;
+    Ok(())
+}
+
+fn digest_path(path: &Path) -> anyhow::Result<String> {
+    use sha2::{Digest, Sha256};
+
+    if path.is_file() {
+        return Ok(format!("{:x}", Sha256::digest(fs::read(path)?)));
+    }
+    if !path.is_dir() {
+        bail!(
+            "cannot digest missing or unsupported path {}",
+            path.display()
+        );
+    }
+    let mut files = Vec::new();
+    collect_digest_files(path, path, &mut files)?;
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut hasher = Sha256::new();
+    for (relative, bytes) in files {
+        hasher.update(relative.as_bytes());
+        hasher.update([0]);
+        hasher.update(bytes);
+        hasher.update([0]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn digest_bundle(path: &Path) -> anyhow::Result<String> {
+    use sha2::{Digest, Sha256};
+
+    let mut files = Vec::new();
+    collect_digest_files(path, path, &mut files)?;
+    files.retain(|(relative, _)| relative != "installation-receipt.json");
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut hasher = Sha256::new();
+    for (relative, bytes) in files {
+        hasher.update(relative.as_bytes());
+        hasher.update([0]);
+        hasher.update(bytes);
+        hasher.update([0]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn collect_digest_files(
+    root: &Path,
+    current: &Path,
+    files: &mut Vec<(String, Vec<u8>)>,
+) -> anyhow::Result<()> {
+    for entry in fs::read_dir(current)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_digest_files(root, &path, files)?;
+        } else if path.is_file() {
+            files.push((
+                path.strip_prefix(root)?
+                    .to_string_lossy()
+                    .replace('\\', "/"),
+                fs::read(path)?,
+            ));
+        }
+    }
     Ok(())
 }
 

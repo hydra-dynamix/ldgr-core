@@ -60,6 +60,9 @@ pub struct InstallAdapterArgs {
     #[arg(long)]
     pub prerelease: bool,
 
+    #[arg(long)]
+    pub offline: bool,
+
     /// Accept defaults and do not prompt.
     #[arg(long)]
     pub yes: bool,

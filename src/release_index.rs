@@ -273,8 +273,17 @@ pub struct InstallationReceipt {
     pub core_compatibility: String,
     pub platform: String,
     pub installed_at_unix_seconds: u64,
+    pub bundle_sha256: String,
     pub binary_path: Option<String>,
-    pub owned_resources: Vec<String>,
+    pub binary_sha256: Option<String>,
+    pub owned_resources: Vec<OwnedResource>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OwnedResource {
+    pub path: String,
+    pub sha256: String,
 }
 
 #[derive(Clone, Debug)]

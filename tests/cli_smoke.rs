@@ -117,6 +117,7 @@ fn adapter_install_resolves_and_installs_fixture_from_index() -> anyhow::Result<
             "--version",
             "1.2.3",
             "--yes",
+            "--offline",
             "--install-root",
         ])
         .arg(&install_root);
@@ -136,6 +137,46 @@ fn adapter_install_resolves_and_installs_fixture_from_index() -> anyhow::Result<
     show.assert()
         .success()
         .stdout(predicate::str::contains("installation_receipt"));
+    let mut update_index: serde_json::Value = serde_json::from_str(&fs::read_to_string(&index)?)?;
+    let mut newer = update_index["adapters"][0]["releases"][0].clone();
+    newer["version"] = serde_json::Value::String("1.2.4".to_owned());
+    update_index["adapters"][0]["releases"]
+        .as_array_mut()
+        .expect("release fixture is an array")
+        .push(newer);
+    fs::write(&index, update_index.to_string())?;
+    let mut update_check = isolated_command(project.path())?;
+    update_check
+        .env("LDGR_ADAPTER_PATH", &install_root)
+        .env("LDGR_ADAPTER_INDEX", &index)
+        .env("LDGR_ADAPTER_RELEASE_KEYRING", &keyring)
+        .args(["adapter", "update", "fixture", "--check"]);
+    update_check
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "latest_compatible=1.2.4 update_available=true",
+        ));
+    let mut update = isolated_command(project.path())?;
+    update
+        .env("LDGR_ADAPTER_PATH", &install_root)
+        .env("LDGR_ADAPTER_INDEX", &index)
+        .env("LDGR_ADAPTER_RELEASE_KEYRING", &keyring)
+        .args(["adapter", "update", "fixture"]);
+    update.assert().success();
+    let updated_receipt: serde_json::Value = serde_json::from_str(&fs::read_to_string(
+        install_root.join("installation-receipt.json"),
+    )?)?;
+    assert_eq!(updated_receipt["version"], "1.2.4");
+    let mut no_op = isolated_command(project.path())?;
+    no_op
+        .env("LDGR_ADAPTER_PATH", &install_root)
+        .env("LDGR_ADAPTER_INDEX", &index)
+        .args(["adapter", "update", "fixture", "--check"]);
+    no_op
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("update_available=false"));
     let mut mutated = fs::OpenOptions::new().append(true).open(&archive)?;
     mutated.write_all(b"x")?;
     let mut retry = isolated_command(project.path())?;
@@ -206,6 +247,32 @@ fn adapter_install_resolves_and_installs_fixture_from_index() -> anyhow::Result<
         fs::read(install_root.join("adapter.toml"))?,
         original_manifest
     );
+    assert_eq!(
+        fs::read_to_string(harness_parent.join("skills"))?,
+        "collision"
+    );
+    fs::OpenOptions::new()
+        .append(true)
+        .open(install_root.join("adapter.toml"))?
+        .write_all(b"\n# user modification\n")?;
+    let mut uninstall = isolated_command(project.path())?;
+    uninstall
+        .env("LDGR_ADAPTER_PATH", &install_root)
+        .args(["adapter", "uninstall", "fixture"]);
+    uninstall
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("modified adapter-owned files"));
+    assert!(install_root.exists());
+    let mut forced = isolated_command(project.path())?;
+    forced.env("LDGR_ADAPTER_PATH", &install_root).args([
+        "adapter",
+        "uninstall",
+        "fixture",
+        "--force",
+    ]);
+    forced.assert().success();
+    assert!(!install_root.exists());
     assert_eq!(
         fs::read_to_string(harness_parent.join("skills"))?,
         "collision"

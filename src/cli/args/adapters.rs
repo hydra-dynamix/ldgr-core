@@ -13,12 +13,38 @@ pub struct AdapterArgs {
 pub enum AdapterCommand {
     /// Install an adapter or list adapters available to install.
     Install(AdapterInstallArgs),
+    /// Check for or install the latest compatible adapter release.
+    Update(AdapterUpdateArgs),
+    /// Remove an installed adapter and its receipt-owned files.
+    Uninstall(AdapterUninstallArgs),
     /// List installed adapters.
     List(ListAdapterArgs),
     /// Show one installed adapter by slug or alias.
     Show(ShowAdapterArgs),
     /// Resolve advertised adapter command metadata without executing it.
     Dispatch(DispatchAdapterArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct AdapterUninstallArgs {
+    pub name: String,
+
+    /// Remove receipt-owned files even when their contents were modified.
+    #[arg(long)]
+    pub force: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct AdapterUpdateArgs {
+    pub name: String,
+
+    /// Report update availability without changing the installation.
+    #[arg(long)]
+    pub check: bool,
+
+    /// Allow prerelease versions during resolution.
+    #[arg(long)]
+    pub prerelease: bool,
 }
 
 #[derive(Debug, Args)]
@@ -41,6 +67,10 @@ pub struct AdapterInstallArgs {
     /// Allow prerelease adapter versions during resolution.
     #[arg(long)]
     pub prerelease: bool,
+
+    /// Require index, archive, signature, and keyring to be local files; never use network.
+    #[arg(long)]
+    pub offline: bool,
 
     /// Accept defaults and do not prompt.
     #[arg(long)]
