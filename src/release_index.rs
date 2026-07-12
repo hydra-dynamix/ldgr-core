@@ -4,12 +4,16 @@ use std::path::Path;
 use std::process::Command;
 
 use anyhow::{bail, Context};
+use base64::{engine::general_purpose::STANDARD, Engine as _};
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tar::EntryType;
 
 pub const ADAPTER_RELEASE_INDEX_SCHEMA_VERSION: u32 = 1;
 pub const ADAPTER_RELEASE_INDEX_ENV: &str = "LDGR_ADAPTER_INDEX";
+pub const ADAPTER_RELEASE_KEYRING_ENV: &str = "LDGR_ADAPTER_RELEASE_KEYRING";
 pub const DEFAULT_ADAPTER_RELEASE_INDEX_URL: &str =
     "https://raw.githubusercontent.com/hydra-dynamix/ldgr-releases/main/index.json";
 
@@ -98,6 +102,163 @@ pub fn verify_file_sha256(path: &Path, expected: &str) -> anyhow::Result<()> {
         bail!("adapter archive SHA-256 mismatch: expected {expected}, got {actual}");
     }
     Ok(())
+}
+
+pub fn verify_detached_release_signature(
+    archive_path: &Path,
+    signature_path: &Path,
+    keyring_path: &Path,
+    expected_key_id: &str,
+) -> anyhow::Result<()> {
+    let keyring: ReleaseKeyring =
+        serde_json::from_str(&fs::read_to_string(keyring_path).with_context(|| {
+            format!("failed to read release keyring {}", keyring_path.display())
+        })?)
+        .context("release keyring is not valid JSON")?;
+    let envelope: DetachedSignature =
+        serde_json::from_str(&fs::read_to_string(signature_path).with_context(|| {
+            format!(
+                "failed to read detached signature {}",
+                signature_path.display()
+            )
+        })?)
+        .context("detached release signature is not valid JSON")?;
+    if envelope.algorithm != "Ed25519" {
+        bail!(
+            "unsupported detached signature algorithm `{}`",
+            envelope.algorithm
+        );
+    }
+    if envelope.key_id != expected_key_id {
+        bail!(
+            "detached signature key id `{}` does not match indexed key id `{expected_key_id}`",
+            envelope.key_id
+        );
+    }
+    let trusted = keyring
+        .keys
+        .iter()
+        .find(|key| key.key_id == expected_key_id)
+        .with_context(|| format!("unknown release signing key id `{expected_key_id}`"))?;
+    let public_key: [u8; 32] = STANDARD
+        .decode(&trusted.public_key)
+        .context("release public key is not valid base64")?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("release public key must be 32 bytes"))?;
+    let signature: [u8; 64] = STANDARD
+        .decode(&envelope.signature)
+        .context("detached signature is not valid base64")?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("detached signature must be 64 bytes"))?;
+    let verifier = VerifyingKey::from_bytes(&public_key)
+        .context("release public key is not a valid Ed25519 key")?;
+    let archive = fs::read(archive_path)
+        .with_context(|| format!("failed to read signed archive {}", archive_path.display()))?;
+    verifier
+        .verify(&archive, &Signature::from_bytes(&signature))
+        .context("detached adapter release signature did not verify")
+}
+
+pub fn extract_safe_tar_gz(
+    archive_path: &Path,
+    destination: &Path,
+    expected_root: &str,
+) -> anyhow::Result<()> {
+    validate_identifier_like_archive_root(expected_root)?;
+    fs::create_dir_all(destination)?;
+    let file = fs::File::open(archive_path)
+        .with_context(|| format!("failed to open archive {}", archive_path.display()))?;
+    let decoder = flate2::read::GzDecoder::new(file);
+    let mut archive = tar::Archive::new(decoder);
+    for entry in archive
+        .entries()
+        .context("failed to enumerate adapter archive")?
+    {
+        let mut entry = entry.context("failed to read adapter archive entry")?;
+        let path = entry
+            .path()
+            .context("archive entry path is invalid")?
+            .into_owned();
+        if path.is_absolute()
+            || path.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::ParentDir
+                        | std::path::Component::RootDir
+                        | std::path::Component::Prefix(_)
+                )
+            })
+        {
+            bail!("unsafe adapter archive path `{}`", path.display());
+        }
+        if path
+            .components()
+            .next()
+            .and_then(|part| part.as_os_str().to_str())
+            != Some(expected_root)
+        {
+            bail!(
+                "adapter archive entry `{}` is outside expected root `{expected_root}`",
+                path.display()
+            );
+        }
+        let kind = entry.header().entry_type();
+        if matches!(kind, EntryType::Symlink | EntryType::Link) {
+            bail!(
+                "adapter archive links are not supported: `{}`",
+                path.display()
+            );
+        }
+        if !(kind.is_file() || kind.is_dir()) {
+            bail!(
+                "unsupported adapter archive entry type for `{}`",
+                path.display()
+            );
+        }
+        let target = destination.join(&path);
+        if kind.is_dir() {
+            fs::create_dir_all(&target)?;
+        } else {
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            entry
+                .unpack(&target)
+                .with_context(|| format!("failed to extract `{}`", path.display()))?;
+        }
+    }
+    if !destination.join(expected_root).is_dir() {
+        bail!("adapter archive did not contain expected root `{expected_root}`");
+    }
+    Ok(())
+}
+
+fn validate_identifier_like_archive_root(root: &str) -> anyhow::Result<()> {
+    if root.is_empty() || root == "." || root == ".." || Path::new(root).components().count() != 1 {
+        bail!("archive_root must be one relative path component");
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReleaseKeyring {
+    pub keys: Vec<ReleasePublicKey>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReleasePublicKey {
+    pub key_id: String,
+    pub public_key: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DetachedSignature {
+    pub algorithm: String,
+    pub key_id: String,
+    pub signature: String,
 }
 
 #[derive(Clone, Debug)]
@@ -281,11 +442,16 @@ pub struct AdapterPlatformRelease {
 
 #[cfg(test)]
 mod tests {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use ed25519_dalek::{Signer, SigningKey};
     use semver::Version;
+    use std::io::Write as _;
+    use tar::EntryType;
 
     use super::{
-        load_release_index, parse_release_index, resolve_release, verify_file_sha256,
-        AdapterClassification, ReleaseChannel,
+        extract_safe_tar_gz, load_release_index, parse_release_index, resolve_release,
+        verify_detached_release_signature, verify_file_sha256, AdapterClassification,
+        DetachedSignature, ReleaseChannel, ReleaseKeyring, ReleasePublicKey,
     };
 
     const OPEN_AND_COMMERCIAL: &str =
@@ -456,6 +622,102 @@ mod tests {
         )
         .expect_err("mutation must fail");
         assert!(error.to_string().contains("SHA-256 mismatch"));
+        Ok(())
+    }
+
+    #[test]
+    fn detached_signature_verification_fails_closed() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let archive = directory.path().join("adapter.tar.gz");
+        let signature = directory.path().join("adapter.sig");
+        let keyring = directory.path().join("keys.json");
+        let signing_key = SigningKey::from_bytes(&[42; 32]);
+        std::fs::write(&archive, b"signed archive")?;
+        let write_signature = |bytes: &[u8], key_id: &str| -> anyhow::Result<()> {
+            std::fs::write(
+                &signature,
+                serde_json::to_vec(&DetachedSignature {
+                    algorithm: "Ed25519".to_owned(),
+                    key_id: key_id.to_owned(),
+                    signature: STANDARD.encode(signing_key.sign(bytes).to_bytes()),
+                })?,
+            )?;
+            Ok(())
+        };
+        std::fs::write(
+            &keyring,
+            serde_json::to_vec(&ReleaseKeyring {
+                keys: vec![ReleasePublicKey {
+                    key_id: "release-2026".to_owned(),
+                    public_key: STANDARD.encode(signing_key.verifying_key().to_bytes()),
+                }],
+            })?,
+        )?;
+        write_signature(b"signed archive", "release-2026")?;
+        verify_detached_release_signature(&archive, &signature, &keyring, "release-2026")?;
+
+        assert!(
+            verify_detached_release_signature(&archive, &signature, &keyring, "unknown").is_err()
+        );
+        std::fs::write(&archive, b"changed archive")?;
+        assert!(
+            verify_detached_release_signature(&archive, &signature, &keyring, "release-2026")
+                .is_err()
+        );
+        std::fs::write(&archive, b"signed archive")?;
+        write_signature(b"different bytes", "release-2026")?;
+        assert!(
+            verify_detached_release_signature(&archive, &signature, &keyring, "release-2026")
+                .is_err()
+        );
+        write_signature(b"signed archive", "wrong-key")?;
+        assert!(
+            verify_detached_release_signature(&archive, &signature, &keyring, "release-2026")
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn safe_extractor_rejects_traversal_and_links() -> anyhow::Result<()> {
+        fn archive_with(path: &str, kind: tar::EntryType) -> anyhow::Result<Vec<u8>> {
+            let mut encoded = Vec::new();
+            {
+                let encoder =
+                    flate2::write::GzEncoder::new(&mut encoded, flate2::Compression::default());
+                let mut builder = tar::Builder::new(encoder);
+                let mut header = tar::Header::new_gnu();
+                header.set_entry_type(kind);
+                header.set_mode(0o644);
+                header.set_size(if kind.is_file() { 1 } else { 0 });
+                if kind.is_file() {
+                    if path.contains("..") {
+                        let bytes = header.as_mut_bytes();
+                        bytes[..100].fill(0);
+                        bytes[..path.len()].copy_from_slice(path.as_bytes());
+                        header.set_cksum();
+                        builder.append(&header, &b"x"[..])?;
+                    } else {
+                        header.set_cksum();
+                        builder.append_data(&mut header, path, &b"x"[..])?;
+                    }
+                } else {
+                    header.set_link_name("target")?;
+                    header.set_cksum();
+                    builder.append_data(&mut header, path, std::io::empty())?;
+                }
+                builder.into_inner()?.finish()?;
+            }
+            Ok(encoded)
+        }
+        let directory = tempfile::tempdir()?;
+        let archive = directory.path().join("bad.tar.gz");
+        std::fs::File::create(&archive)?
+            .write_all(&archive_with("../escape", EntryType::Regular)?)?;
+        assert!(extract_safe_tar_gz(&archive, &directory.path().join("out"), "fixture").is_err());
+        std::fs::File::create(&archive)?
+            .write_all(&archive_with("fixture/link", EntryType::Symlink)?)?;
+        assert!(extract_safe_tar_gz(&archive, &directory.path().join("out2"), "fixture").is_err());
         Ok(())
     }
 }

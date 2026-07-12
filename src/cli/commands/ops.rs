@@ -287,14 +287,27 @@ fn install_resolved_index_release(
         "download indexed adapter release",
     )?;
     crate::release_index::verify_file_sha256(&archive, &resolved.platform.sha256)?;
+    let signature = temp.join("adapter.sig");
     run_checked(
-        Command::new("tar")
-            .arg("-xzf")
-            .arg(&archive)
-            .arg("-C")
-            .arg(&temp),
-        "extract indexed adapter release",
+        Command::new("curl")
+            .arg("-fsSL")
+            .arg(&resolved.platform.signature_url)
+            .arg("-o")
+            .arg(&signature),
+        "download indexed adapter signature",
     )?;
+    let keyring = std::env::var_os(crate::release_index::ADAPTER_RELEASE_KEYRING_ENV)
+        .map(PathBuf::from)
+        .context(
+            "LDGR_ADAPTER_RELEASE_KEYRING must point to the trusted offline release keyring",
+        )?;
+    crate::release_index::verify_detached_release_signature(
+        &archive,
+        &signature,
+        &keyring,
+        &resolved.platform.signing_key_id,
+    )?;
+    crate::release_index::extract_safe_tar_gz(&archive, &temp, &resolved.platform.archive_root)?;
     let extracted = temp.join(&resolved.platform.archive_root);
     if !extracted.is_dir() {
         bail!(

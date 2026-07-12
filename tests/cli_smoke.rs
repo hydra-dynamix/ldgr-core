@@ -8,6 +8,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use assert_cmd::Command;
+use base64::{engine::general_purpose::STANDARD, Engine as _};
+use ed25519_dalek::{Signer, SigningKey};
 use predicates::prelude::*;
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
@@ -43,6 +45,28 @@ fn adapter_install_resolves_and_installs_fixture_from_index() -> anyhow::Result<
         .status()?;
     assert!(status.success());
     let archive_sha256 = format!("{:x}", Sha256::digest(fs::read(&archive)?));
+    let signing_key = SigningKey::from_bytes(&[42; 32]);
+    let signature = project.path().join("fixture.sig");
+    fs::write(
+        &signature,
+        serde_json::json!({
+            "algorithm": "Ed25519",
+            "key_id": "test",
+            "signature": STANDARD.encode(signing_key.sign(&fs::read(&archive)?).to_bytes())
+        })
+        .to_string(),
+    )?;
+    let keyring = project.path().join("keys.json");
+    fs::write(
+        &keyring,
+        serde_json::json!({
+            "keys": [{
+                "key_id": "test",
+                "public_key": STANDARD.encode(signing_key.verifying_key().to_bytes())
+            }]
+        })
+        .to_string(),
+    )?;
     let platform = format!(
         "{}-{}",
         std::env::consts::OS,
@@ -72,7 +96,7 @@ fn adapter_install_resolves_and_installs_fixture_from_index() -> anyhow::Result<
                         "archive_root": "fixture-1.2.3",
                         "binary": "ldgr-fixture",
                         "sha256": archive_sha256,
-                        "signature_url": "file:///unused.sig",
+                        "signature_url": format!("file://{}", signature.display()),
                         "signing_key_id": "test",
                         "resource_manifest": "adapter-resources.json"
                     }]
@@ -85,6 +109,7 @@ fn adapter_install_resolves_and_installs_fixture_from_index() -> anyhow::Result<
     let mut command = isolated_command(project.path())?;
     command
         .env("LDGR_ADAPTER_INDEX", &index)
+        .env("LDGR_ADAPTER_RELEASE_KEYRING", &keyring)
         .args([
             "adapter",
             "install",
@@ -105,6 +130,7 @@ fn adapter_install_resolves_and_installs_fixture_from_index() -> anyhow::Result<
     let mut retry = isolated_command(project.path())?;
     retry
         .env("LDGR_ADAPTER_INDEX", &index)
+        .env("LDGR_ADAPTER_RELEASE_KEYRING", &keyring)
         .args([
             "adapter",
             "install",
