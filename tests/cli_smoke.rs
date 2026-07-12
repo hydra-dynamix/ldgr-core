@@ -820,10 +820,7 @@ fn status_and_next_commands_include_conduct_adapter_suggestions() -> anyhow::Res
             "adapter=conduct namespace=conduct command=ldgr conduct",
         ))
         .stdout(predicate::str::contains("next_commands:"))
-        .stdout(predicate::str::contains("ldgr conduct status"))
-        .stdout(predicate::str::contains(
-            "ldgr conduct batch status --batch-id batch-042 --json",
-        ))
+        .stdout(predicate::str::contains("ldgr conduct --help"))
         .stdout(predicate::str::contains(
             "ldgr run start conduct-next --command <what-ran>",
         ));
@@ -841,9 +838,7 @@ fn status_and_next_commands_include_conduct_adapter_suggestions() -> anyhow::Res
         r#""installed_adapter_namespaces""#,
     ))
     .stdout(predicate::str::contains(r#""namespace": "conduct""#))
-    .stdout(predicate::str::contains(
-        r#""ldgr conduct batch launch --graph <graph.md> --batch-id batch-042"#,
-    ));
+    .stdout(predicate::str::contains("batch launch").not());
 
     command(
         project.path(),
@@ -854,13 +849,7 @@ fn status_and_next_commands_include_conduct_adapter_suggestions() -> anyhow::Res
     .env("LDGR_ADAPTER_PATH", &adapter_root)
     .assert()
     .success()
-    .stdout(predicate::str::contains("ldgr conduct status"))
-    .stdout(predicate::str::contains(
-        "ldgr conduct batch refresh --batch-id batch-042",
-    ))
-    .stdout(predicate::str::contains(
-        "ldgr conduct batch launch --graph <graph.md> --batch-id batch-042",
-    ))
+    .stdout(predicate::str::contains("ldgr conduct --help"))
     .stdout(predicate::str::contains(
         "ldgr run start conduct-next --command <what-ran>",
     ));
@@ -876,6 +865,7 @@ fn status_and_next_commands_include_conduct_adapter_suggestions() -> anyhow::Res
 }
 
 #[test]
+#[ignore = "obsolete Core-owned Conduct lifecycle projection removed by ADP-020"]
 fn status_surfaces_referenced_conduct_batch_lifecycle() -> anyhow::Result<()> {
     let project = TempDir::new()?;
     let db_path = project.path().join(".ldgr/ldgr.db");
