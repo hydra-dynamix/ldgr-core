@@ -1058,8 +1058,8 @@ static AVAILABLE_ADAPTERS: &[AvailableAdapter] = &[
     },
     AvailableAdapter {
         slug: "programbench",
-        title: "Clean-room ProgramBench adapter",
-        source: "https://github.com/hydra-dynamix/ldgr-programbench git",
+        title: "ProgramBench historical reproduction adapter",
+        source: "hydra-dynamix/ldgr-releases release bundle / public git fallback",
         install: "ldgr adapter install programbench",
         workspace_package: None,
         git: Some(GitAdapterSource {
@@ -1067,7 +1067,13 @@ static AVAILABLE_ADAPTERS: &[AvailableAdapter] = &[
             package: "ldgr-programbench",
             binary: "ldgr-programbench",
         }),
-        release: None,
+        release: Some(ReleaseAdapterSource {
+            repo: "hydra-dynamix/ldgr-releases",
+            tag_prefix: "programbench-v",
+            asset_prefix: "ldgr-programbench",
+            root_prefix: "ldgr-programbench",
+            binary: "ldgr-programbench",
+        }),
     },
     AvailableAdapter {
         slug: "code",
