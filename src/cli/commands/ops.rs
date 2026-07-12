@@ -257,7 +257,6 @@ fn install_adapter_from_configured_index(args: &InstallAdapterArgs) -> anyhow::R
     println!("├─ Resolved version {} for {platform}", resolved.version);
     println!("├─ Install root {}", install_root.display());
     install_resolved_index_release(&resolved, &install_root, &home)?;
-    install_adapter_harness_assets(&adapter.domain, &install_root, &home)?;
     println!(
         "└─ Installed adapter `{}`. Try `ldgr {} --help` or `ldgr adapter show {}`.",
         adapter.domain, adapter.domain, adapter.domain
@@ -315,8 +314,24 @@ fn install_resolved_index_release(
             extracted.display()
         );
     }
-    let _ = fs::remove_dir_all(install_root);
-    copy_dir_recursive(&extracted, install_root)?;
+    let mut transaction = InstallTransaction::new(temp.join("rollback"))?;
+    transaction.snapshot(install_root)?;
+    let binary_source = extracted
+        .join(&resolved.platform.platform)
+        .join(&resolved.platform.binary);
+    if binary_source.is_file() {
+        transaction.snapshot(&home.join(".local/bin").join(&resolved.platform.binary))?;
+    }
+    transaction.snapshot(
+        &home
+            .join(".ldgr/installed-adapters")
+            .join(&resolved.adapter.domain),
+    )?;
+    let resource_targets = harness_resource_targets(&extracted, home)?;
+    for target in &resource_targets {
+        transaction.snapshot(&target)?;
+    }
+    activate_bundle_atomically(&extracted, install_root)?;
     let installed_binary = install_release_binary(
         install_root,
         home,
@@ -331,8 +346,203 @@ fn install_resolved_index_release(
         )?;
     }
     patch_adapter_argv_to_installed_binary(install_root, &resolved.platform.binary, home)?;
+    install_adapter_harness_assets(&resolved.adapter.domain, install_root, home)?;
+    let binary_path = binary_source
+        .is_file()
+        .then(|| home.join(".local/bin").join(&resolved.platform.binary));
+    write_installation_receipt(
+        install_root,
+        resolved,
+        binary_path.as_deref(),
+        &resource_targets,
+    )?;
+    transaction.commit()?;
     let _ = fs::remove_dir_all(&temp);
     Ok(())
+}
+
+fn write_installation_receipt(
+    install_root: &Path,
+    resolved: &crate::release_index::ResolvedAdapterRelease<'_>,
+    binary_path: Option<&Path>,
+    resources: &[PathBuf],
+) -> anyhow::Result<()> {
+    let installed_at_unix_seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("system clock is before Unix epoch")?
+        .as_secs();
+    let receipt = crate::release_index::InstallationReceipt {
+        schema_version: 1,
+        domain: resolved.adapter.domain.clone(),
+        version: resolved.version.to_string(),
+        source_url: resolved.platform.asset_url.clone(),
+        sha256: resolved.platform.sha256.clone(),
+        signing_key_id: resolved.platform.signing_key_id.clone(),
+        core_compatibility: resolved.release.core_compatibility.clone(),
+        platform: resolved.platform.platform.clone(),
+        installed_at_unix_seconds,
+        binary_path: binary_path.map(|path| path.display().to_string()),
+        owned_resources: resources
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect(),
+    };
+    fs::write(
+        install_root.join("installation-receipt.json"),
+        format!("{}\n", serde_json::to_string_pretty(&receipt)?),
+    )?;
+    Ok(())
+}
+
+#[derive(Debug)]
+struct InstallSnapshot {
+    target: PathBuf,
+    backup: PathBuf,
+    existed: bool,
+    was_dir: bool,
+}
+
+struct InstallTransaction {
+    backup_root: PathBuf,
+    snapshots: Vec<InstallSnapshot>,
+    committed: bool,
+}
+
+impl InstallTransaction {
+    fn new(backup_root: PathBuf) -> anyhow::Result<Self> {
+        fs::create_dir_all(&backup_root)?;
+        Ok(Self {
+            backup_root,
+            snapshots: Vec::new(),
+            committed: false,
+        })
+    }
+
+    fn snapshot(&mut self, target: &Path) -> anyhow::Result<()> {
+        if self
+            .snapshots
+            .iter()
+            .any(|snapshot| snapshot.target == target)
+        {
+            return Ok(());
+        }
+        let backup = self.backup_root.join(self.snapshots.len().to_string());
+        let existed = target.exists();
+        let was_dir = target.is_dir();
+        if existed {
+            if was_dir {
+                copy_dir_recursive(target, &backup)?;
+            } else {
+                if let Some(parent) = backup.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::copy(target, &backup)?;
+            }
+        }
+        self.snapshots.push(InstallSnapshot {
+            target: target.to_path_buf(),
+            backup,
+            existed,
+            was_dir,
+        });
+        Ok(())
+    }
+
+    fn commit(mut self) -> anyhow::Result<()> {
+        self.committed = true;
+        fs::remove_dir_all(&self.backup_root).or_else(|error| {
+            (error.kind() == io::ErrorKind::NotFound)
+                .then_some(())
+                .ok_or(error)
+        })?;
+        Ok(())
+    }
+
+    fn rollback(&self) -> anyhow::Result<()> {
+        for snapshot in self.snapshots.iter().rev() {
+            remove_path_if_exists(&snapshot.target)?;
+            if snapshot.existed {
+                if snapshot.was_dir {
+                    copy_dir_recursive(&snapshot.backup, &snapshot.target)?;
+                } else {
+                    if let Some(parent) = snapshot.target.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    fs::copy(&snapshot.backup, &snapshot.target)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for InstallTransaction {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = self.rollback();
+        }
+    }
+}
+
+fn remove_path_if_exists(path: &Path) -> anyhow::Result<()> {
+    if path.is_dir() {
+        fs::remove_dir_all(path)?;
+    } else if path.exists() {
+        fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+fn activate_bundle_atomically(extracted: &Path, install_root: &Path) -> anyhow::Result<()> {
+    let parent = install_root
+        .parent()
+        .context("install root has no parent")?;
+    fs::create_dir_all(parent)?;
+    let staging = parent.join(format!(
+        ".{}.staging-{}",
+        install_root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("adapter"),
+        std::process::id()
+    ));
+    remove_path_if_exists(&staging)?;
+    copy_dir_recursive(extracted, &staging)?;
+    remove_path_if_exists(install_root)?;
+    fs::rename(&staging, install_root).with_context(|| {
+        format!(
+            "failed to atomically activate adapter at {}",
+            install_root.display()
+        )
+    })
+}
+
+fn harness_resource_targets(bundle: &Path, home: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let config = read_ldgr_harness_config(home);
+    let groups = [
+        (
+            bundle.join("prompts"),
+            configured_prompt_dirs(home, &config),
+        ),
+        (bundle.join("skills"), configured_skill_dirs(home, &config)),
+        (
+            bundle.join("extensions"),
+            configured_extension_dirs(home, &config),
+        ),
+    ];
+    let mut targets = Vec::new();
+    for (source, roots) in groups {
+        if !source.is_dir() {
+            continue;
+        }
+        for entry in fs::read_dir(&source)? {
+            let name = entry?.file_name();
+            for root in &roots {
+                targets.push(root.join(&name));
+            }
+        }
+    }
+    Ok(targets)
 }
 
 fn resolve_adapter_install_name(name: &str, assume_yes: bool) -> anyhow::Result<String> {

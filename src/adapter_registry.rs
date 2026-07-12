@@ -129,6 +129,8 @@ pub struct DiscoveredAdapter {
     pub command_namespaces: Vec<AdapterCommandNamespace>,
     pub target_profiles: Vec<AdapterTargetProfile>,
     pub verified_manifest_digest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub installation_receipt: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -414,6 +416,9 @@ fn load_adapter_manifest(manifest_path: &Path) -> anyhow::Result<DiscoveredAdapt
         });
     }
 
+    let installation_receipt = fs::read_to_string(manifest_dir.join("installation-receipt.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok());
     Ok(DiscoveredAdapter {
         slug: adapter_slug,
         title: nonempty("adapter.title", manifest.adapter.title)?,
@@ -430,6 +435,7 @@ fn load_adapter_manifest(manifest_path: &Path) -> anyhow::Result<DiscoveredAdapt
         command_namespaces,
         target_profiles: manifest.target_profiles,
         verified_manifest_digest,
+        installation_receipt,
     })
 }
 

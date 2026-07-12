@@ -125,6 +125,17 @@ fn adapter_install_resolves_and_installs_fixture_from_index() -> anyhow::Result<
         .success()
         .stdout(predicate::str::contains("Resolved version 1.2.3"));
     assert!(install_root.join("adapter.toml").is_file());
+    let receipt: serde_json::Value = serde_json::from_str(&fs::read_to_string(
+        install_root.join("installation-receipt.json"),
+    )?)?;
+    assert_eq!(receipt["version"], "1.2.3");
+    assert_eq!(receipt["signing_key_id"], "test");
+    let mut show = isolated_command(project.path())?;
+    show.env("LDGR_ADAPTER_PATH", &install_root)
+        .args(["adapter", "show", "fixture", "--json"]);
+    show.assert()
+        .success()
+        .stdout(predicate::str::contains("installation_receipt"));
     let mut mutated = fs::OpenOptions::new().append(true).open(&archive)?;
     mutated.write_all(b"x")?;
     let mut retry = isolated_command(project.path())?;
@@ -146,6 +157,59 @@ fn adapter_install_resolves_and_installs_fixture_from_index() -> anyhow::Result<
         .failure()
         .stderr(predicate::str::contains("SHA-256 mismatch"));
     assert!(install_root.join("adapter.toml").is_file());
+
+    let original_manifest = fs::read(install_root.join("adapter.toml"))?;
+    fs::create_dir_all(bundle.join("skills/broken"))?;
+    fs::write(bundle.join("skills/broken/SKILL.md"), [0xff, 0xfe])?;
+    fs::remove_file(&archive)?;
+    let status = StdCommand::new("tar")
+        .args(["-czf"])
+        .arg(&archive)
+        .arg("-C")
+        .arg(project.path())
+        .arg("fixture-1.2.3")
+        .status()?;
+    assert!(status.success());
+    let updated_archive = fs::read(&archive)?;
+    fs::write(
+        &signature,
+        serde_json::json!({
+            "algorithm": "Ed25519",
+            "key_id": "test",
+            "signature": STANDARD.encode(signing_key.sign(&updated_archive).to_bytes())
+        })
+        .to_string(),
+    )?;
+    let mut updated_index: serde_json::Value = serde_json::from_str(&fs::read_to_string(&index)?)?;
+    updated_index["adapters"][0]["releases"][0]["platforms"][0]["sha256"] =
+        serde_json::Value::String(format!("{:x}", Sha256::digest(&updated_archive)));
+    fs::write(&index, updated_index.to_string())?;
+    let harness_parent = project.path().join(".ldgr/test-empty-home/.pi/agent");
+    fs::create_dir_all(&harness_parent)?;
+    fs::write(harness_parent.join("skills"), "collision")?;
+    let mut rollback = isolated_command(project.path())?;
+    rollback
+        .env("LDGR_ADAPTER_INDEX", &index)
+        .env("LDGR_ADAPTER_RELEASE_KEYRING", &keyring)
+        .args([
+            "adapter",
+            "install",
+            "fixture",
+            "--version",
+            "1.2.3",
+            "--yes",
+            "--install-root",
+        ])
+        .arg(&install_root);
+    rollback.assert().failure();
+    assert_eq!(
+        fs::read(install_root.join("adapter.toml"))?,
+        original_manifest
+    );
+    assert_eq!(
+        fs::read_to_string(harness_parent.join("skills"))?,
+        "collision"
+    );
     Ok(())
 }
 

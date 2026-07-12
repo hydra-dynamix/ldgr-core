@@ -261,6 +261,22 @@ pub struct DetachedSignature {
     pub signature: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstallationReceipt {
+    pub schema_version: u32,
+    pub domain: String,
+    pub version: String,
+    pub source_url: String,
+    pub sha256: String,
+    pub signing_key_id: String,
+    pub core_compatibility: String,
+    pub platform: String,
+    pub installed_at_unix_seconds: u64,
+    pub binary_path: Option<String>,
+    pub owned_resources: Vec<String>,
+}
+
 #[derive(Clone, Debug)]
 pub struct ResolvedAdapterRelease<'a> {
     pub adapter: &'a AdapterReleaseProduct,
