@@ -286,6 +286,100 @@ pub struct OwnedResource {
     pub sha256: String,
 }
 
+pub fn parse_resource_manifest(text: &str) -> anyhow::Result<AdapterResourceManifest> {
+    let manifest: AdapterResourceManifest =
+        serde_json::from_str(text).context("failed to parse adapter resource manifest JSON")?;
+    if manifest.schema_version != 1 {
+        bail!(
+            "unsupported adapter resource manifest schema_version {}",
+            manifest.schema_version
+        );
+    }
+    if manifest.resources.is_empty() {
+        bail!("adapter resource manifest must contain at least one resource");
+    }
+    for (index, resource) in manifest.resources.iter().enumerate() {
+        validate_relative_resource_path(&resource.source, &format!("resources[{index}].source"))?;
+        validate_relative_resource_path(
+            &resource.destination,
+            &format!("resources[{index}].destination"),
+        )?;
+        if resource.harnesses.is_empty() {
+            bail!("resources[{index}].harnesses must not be empty");
+        }
+        for harness in &resource.harnesses {
+            let supported = matches!(
+                (harness.as_str(), resource.kind),
+                (
+                    "pi",
+                    AdapterResourceKind::Prompt
+                        | AdapterResourceKind::Skill
+                        | AdapterResourceKind::Extension
+                ) | (
+                    "codex",
+                    AdapterResourceKind::Prompt | AdapterResourceKind::Skill
+                ) | (
+                    "claude",
+                    AdapterResourceKind::Skill | AdapterResourceKind::Command
+                ) | (
+                    "openclaw",
+                    AdapterResourceKind::Skill | AdapterResourceKind::Command
+                )
+            );
+            if !supported {
+                bail!(
+                    "resources[{index}] kind {:?} is not supported by harness `{harness}`",
+                    resource.kind
+                );
+            }
+        }
+    }
+    Ok(manifest)
+}
+
+fn validate_relative_resource_path(value: &str, field: &str) -> anyhow::Result<()> {
+    let path = Path::new(value);
+    if value.trim().is_empty()
+        || path.is_absolute()
+        || path.components().any(|part| {
+            matches!(
+                part,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        bail!("{field} must be a non-empty destination-relative path without traversal");
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdapterResourceManifest {
+    pub schema_version: u32,
+    pub resources: Vec<AdapterResource>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdapterResource {
+    pub kind: AdapterResourceKind,
+    pub harnesses: Vec<String>,
+    pub source: String,
+    pub destination: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AdapterResourceKind {
+    Prompt,
+    Skill,
+    Extension,
+    Command,
+}
+
 #[derive(Clone, Debug)]
 pub struct ResolvedAdapterRelease<'a> {
     pub adapter: &'a AdapterReleaseProduct,
@@ -371,6 +465,10 @@ pub fn validate_release_index(index: &AdapterReleaseIndex) -> anyhow::Result<()>
                     &format!("{platform_path}.signing_key_id"),
                 )?;
                 require_text(
+                    &platform.resource_manifest,
+                    &format!("{platform_path}.resource_manifest"),
+                )?;
+                validate_relative_resource_path(
                     &platform.resource_manifest,
                     &format!("{platform_path}.resource_manifest"),
                 )?;
@@ -474,9 +572,9 @@ mod tests {
     use tar::EntryType;
 
     use super::{
-        extract_safe_tar_gz, load_release_index, parse_release_index, resolve_release,
-        verify_detached_release_signature, verify_file_sha256, AdapterClassification,
-        DetachedSignature, ReleaseChannel, ReleaseKeyring, ReleasePublicKey,
+        extract_safe_tar_gz, load_release_index, parse_release_index, parse_resource_manifest,
+        resolve_release, verify_detached_release_signature, verify_file_sha256,
+        AdapterClassification, DetachedSignature, ReleaseChannel, ReleaseKeyring, ReleasePublicKey,
     };
 
     const OPEN_AND_COMMERCIAL: &str =
@@ -743,6 +841,28 @@ mod tests {
         std::fs::File::create(&archive)?
             .write_all(&archive_with("fixture/link", EntryType::Symlink)?)?;
         assert!(extract_safe_tar_gz(&archive, &directory.path().join("out2"), "fixture").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn typed_resource_manifest_validates_paths_harnesses_and_kinds() -> anyhow::Result<()> {
+        let valid = r#"{
+          "schema_version":1,
+          "resources":[
+            {"kind":"skill","harnesses":["codex","claude"],"source":"skills/research","destination":"research"},
+            {"kind":"extension","harnesses":["pi"],"source":"extensions/research.ts","destination":"research.ts"}
+          ]
+        }"#;
+        assert_eq!(parse_resource_manifest(valid)?.resources.len(), 2);
+        for invalid in [
+            valid.replace("research.ts", "../escape"),
+            valid.replace("skills/research", "/absolute"),
+            valid.replace("[\"codex\",\"claude\"]", "[]"),
+            valid.replace("\"skill\"", "\"unknown\""),
+            valid.replace("[\"pi\"]", "[\"codex\"]"),
+        ] {
+            assert!(parse_resource_manifest(&invalid).is_err());
+        }
         Ok(())
     }
 }

@@ -35,6 +35,41 @@ fn adapter_install_resolves_and_installs_fixture_from_index() -> anyhow::Result<
     let project = TempDir::new()?;
     let bundle = project.path().join("fixture-1.2.3");
     write_adapter_namespace_fixture(&bundle, "fixture", "fixture", "[\"true\"]")?;
+    fs::create_dir_all(bundle.join("skills/fixture"))?;
+    fs::write(bundle.join("skills/fixture/SKILL.md"), "fixture skill")?;
+    fs::create_dir_all(bundle.join("extensions"))?;
+    fs::write(bundle.join("extensions/fixture.ts"), "export {}")?;
+    fs::create_dir_all(bundle.join("commands"))?;
+    fs::write(bundle.join("commands/fixture.md"), "fixture command")?;
+    fs::write(
+        bundle.join("adapter-resources.json"),
+        serde_json::json!({
+            "schema_version": 1,
+            "resources": [
+                {"kind":"prompt","harnesses":["pi","codex"],"source":"prompts/loop.md","destination":"fixture-loop.md"},
+                {"kind":"skill","harnesses":["pi","codex","claude","openclaw"],"source":"skills/fixture","destination":"fixture"},
+                {"kind":"extension","harnesses":["pi"],"source":"extensions/fixture.ts","destination":"fixture.ts"},
+                {"kind":"command","harnesses":["claude","openclaw"],"source":"commands/fixture.md","destination":"fixture.md"}
+            ]
+        })
+        .to_string(),
+    )?;
+    let isolated_home = project.path().join(".ldgr/test-empty-home");
+    fs::create_dir_all(isolated_home.join(".ldgr"))?;
+    fs::write(
+        isolated_home.join(".ldgr/config.json"),
+        serde_json::json!({
+            "schema_version": 1,
+            "selected_harnesses": ["pi","codex","claude","openclaw"],
+            "installed": [
+                {"harness":"pi","prompt_paths":[isolated_home.join("pi-prompts")],"skill_paths":[isolated_home.join("pi-skills")],"extension_paths":[isolated_home.join("pi-extensions")]},
+                {"harness":"codex","prompt_paths":[isolated_home.join("codex-prompts")],"skill_paths":[isolated_home.join("codex-skills")]},
+                {"harness":"claude","skill_paths":[isolated_home.join("claude-skills")],"command_paths":[isolated_home.join("claude-commands")]},
+                {"harness":"openclaw","skill_paths":[isolated_home.join("openclaw-skills")],"command_paths":[isolated_home.join("openclaw-commands")]}
+            ]
+        })
+        .to_string(),
+    )?;
     let archive = project.path().join("fixture.tar.gz");
     let status = StdCommand::new("tar")
         .args(["-czf"])
@@ -131,6 +166,19 @@ fn adapter_install_resolves_and_installs_fixture_from_index() -> anyhow::Result<
     )?)?;
     assert_eq!(receipt["version"], "1.2.3");
     assert_eq!(receipt["signing_key_id"], "test");
+    for expected in [
+        "pi-prompts/fixture-loop.md",
+        "codex-prompts/fixture-loop.md",
+        "pi-skills/fixture/SKILL.md",
+        "codex-skills/fixture/SKILL.md",
+        "claude-skills/fixture/SKILL.md",
+        "openclaw-skills/fixture/SKILL.md",
+        "pi-extensions/fixture.ts",
+        "claude-commands/fixture.md",
+        "openclaw-commands/fixture.md",
+    ] {
+        assert!(isolated_home.join(expected).is_file(), "missing {expected}");
+    }
     let mut show = isolated_command(project.path())?;
     show.env("LDGR_ADAPTER_PATH", &install_root)
         .args(["adapter", "show", "fixture", "--json"]);
@@ -202,6 +250,21 @@ fn adapter_install_resolves_and_installs_fixture_from_index() -> anyhow::Result<
     let original_manifest = fs::read(install_root.join("adapter.toml"))?;
     fs::create_dir_all(bundle.join("skills/broken"))?;
     fs::write(bundle.join("skills/broken/SKILL.md"), [0xff, 0xfe])?;
+    let mut resource_manifest: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(bundle.join("adapter-resources.json"))?)?;
+    resource_manifest["resources"]
+        .as_array_mut()
+        .expect("resource fixture is an array")
+        .push(serde_json::json!({
+            "kind":"skill",
+            "harnesses":["pi"],
+            "source":"skills/broken",
+            "destination":"collision/child"
+        }));
+    fs::write(
+        bundle.join("adapter-resources.json"),
+        resource_manifest.to_string(),
+    )?;
     fs::remove_file(&archive)?;
     let status = StdCommand::new("tar")
         .args(["-czf"])
@@ -225,9 +288,7 @@ fn adapter_install_resolves_and_installs_fixture_from_index() -> anyhow::Result<
     updated_index["adapters"][0]["releases"][0]["platforms"][0]["sha256"] =
         serde_json::Value::String(format!("{:x}", Sha256::digest(&updated_archive)));
     fs::write(&index, updated_index.to_string())?;
-    let harness_parent = project.path().join(".ldgr/test-empty-home/.pi/agent");
-    fs::create_dir_all(&harness_parent)?;
-    fs::write(harness_parent.join("skills"), "collision")?;
+    fs::write(isolated_home.join("pi-skills/collision"), "collision")?;
     let mut rollback = isolated_command(project.path())?;
     rollback
         .env("LDGR_ADAPTER_INDEX", &index)
@@ -248,7 +309,7 @@ fn adapter_install_resolves_and_installs_fixture_from_index() -> anyhow::Result<
         original_manifest
     );
     assert_eq!(
-        fs::read_to_string(harness_parent.join("skills"))?,
+        fs::read_to_string(isolated_home.join("pi-skills/collision"))?,
         "collision"
     );
     fs::OpenOptions::new()
@@ -274,7 +335,7 @@ fn adapter_install_resolves_and_installs_fixture_from_index() -> anyhow::Result<
     forced.assert().success();
     assert!(!install_root.exists());
     assert_eq!(
-        fs::read_to_string(harness_parent.join("skills"))?,
+        fs::read_to_string(isolated_home.join("pi-skills/collision"))?,
         "collision"
     );
     Ok(())

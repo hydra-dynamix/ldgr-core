@@ -444,7 +444,12 @@ fn install_resolved_index_release(
             .join(".ldgr/installed-adapters")
             .join(&resolved.adapter.domain),
     )?;
-    let resource_targets = harness_resource_targets(&extracted, home)?;
+    let resource_plan =
+        typed_harness_resource_plan(&extracted, home, &resolved.platform.resource_manifest)?;
+    let resource_targets = resource_plan
+        .iter()
+        .map(|(_, target)| target.clone())
+        .collect::<Vec<_>>();
     for target in &resource_targets {
         transaction.snapshot(target)?;
     }
@@ -463,7 +468,13 @@ fn install_resolved_index_release(
         )?;
     }
     patch_adapter_argv_to_installed_binary(install_root, &resolved.platform.binary, home)?;
-    install_adapter_harness_assets(&resolved.adapter.domain, install_root, home)?;
+    install_typed_harness_resources(&resource_plan)?;
+    write_file(
+        &home
+            .join(".ldgr/installed-adapters")
+            .join(&resolved.adapter.domain),
+        &format!("install_root={}\n", install_root.display()),
+    )?;
     let binary_path = binary_source
         .is_file()
         .then(|| home.join(".local/bin").join(&resolved.platform.binary));
@@ -705,32 +716,75 @@ fn activate_bundle_atomically(extracted: &Path, install_root: &Path) -> anyhow::
     })
 }
 
-fn harness_resource_targets(bundle: &Path, home: &Path) -> anyhow::Result<Vec<PathBuf>> {
-    let config = read_ldgr_harness_config(home);
-    let groups = [
-        (
-            bundle.join("prompts"),
-            configured_prompt_dirs(home, &config),
-        ),
-        (bundle.join("skills"), configured_skill_dirs(home, &config)),
-        (
-            bundle.join("extensions"),
-            configured_extension_dirs(home, &config),
-        ),
-    ];
-    let mut targets = Vec::new();
-    for (source, roots) in groups {
-        if !source.is_dir() {
-            continue;
+fn typed_harness_resource_plan(
+    bundle: &Path,
+    home: &Path,
+    manifest_path: &str,
+) -> anyhow::Result<Vec<(PathBuf, PathBuf)>> {
+    use crate::harness_config::HarnessResourceKind;
+    use crate::release_index::AdapterResourceKind;
+
+    let config = read_ldgr_harness_config(home).context(
+        "typed adapter resources require a valid ~/.ldgr/config.json; run `ldgr install` first",
+    )?;
+    let manifest = crate::release_index::parse_resource_manifest(
+        &fs::read_to_string(bundle.join(manifest_path)).with_context(|| {
+            format!("adapter bundle is missing resource manifest `{manifest_path}`")
+        })?,
+    )?;
+    let mut plan = Vec::<(PathBuf, PathBuf)>::new();
+    for resource in manifest.resources {
+        let source = bundle.join(&resource.source);
+        if !source.exists() {
+            bail!(
+                "adapter resource source does not exist: {}",
+                source.display()
+            );
         }
-        for entry in fs::read_dir(&source)? {
-            let name = entry?.file_name();
-            for root in &roots {
-                targets.push(root.join(&name));
+        let kind = match resource.kind {
+            AdapterResourceKind::Prompt => HarnessResourceKind::Prompt,
+            AdapterResourceKind::Skill => HarnessResourceKind::Skill,
+            AdapterResourceKind::Extension => HarnessResourceKind::Extension,
+            AdapterResourceKind::Command => HarnessResourceKind::Command,
+        };
+        for harness in resource.harnesses {
+            for root in config.harness_resource_paths(&harness, kind) {
+                let root = expand_home_path(home, root.to_string_lossy().as_ref());
+                let target = if matches!(
+                    kind,
+                    HarnessResourceKind::Extension | HarnessResourceKind::Command
+                ) && root.extension().is_some()
+                {
+                    root.parent().unwrap_or(&root).join(&resource.destination)
+                } else {
+                    root.join(&resource.destination)
+                };
+                if plan.iter().any(|(_, existing)| existing == &target) {
+                    bail!(
+                        "adapter resource destination collision: {}",
+                        target.display()
+                    );
+                }
+                plan.push((source.clone(), target));
             }
         }
     }
-    Ok(targets)
+    Ok(plan)
+}
+
+fn install_typed_harness_resources(plan: &[(PathBuf, PathBuf)]) -> anyhow::Result<()> {
+    for (source, target) in plan {
+        if source.is_dir() {
+            copy_dir_recursive(source, target)?;
+        } else {
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::copy(source, target)?;
+        }
+        println!("├─ Harness resource {}", target.display());
+    }
+    Ok(())
 }
 
 fn resolve_adapter_install_name(name: &str, assume_yes: bool) -> anyhow::Result<String> {
@@ -1363,38 +1417,59 @@ fn install_adapter_harness_assets(
     Ok(())
 }
 
-fn read_ldgr_harness_config(home: &Path) -> Option<serde_json::Value> {
+fn read_ldgr_harness_config(home: &Path) -> Option<crate::harness_config::HarnessConfig> {
     let text = fs::read_to_string(home.join(".ldgr/config.json")).ok()?;
-    serde_json::from_str(&text).ok()
+    crate::harness_config::parse_harness_config(&text).ok()
 }
 
-fn configured_prompt_dirs(home: &Path, config: &Option<serde_json::Value>) -> Vec<PathBuf> {
-    let mut dirs = configured_path_dirs(home, config, "prompt_paths");
+fn configured_prompt_dirs(
+    home: &Path,
+    config: &Option<crate::harness_config::HarnessConfig>,
+) -> Vec<PathBuf> {
+    let mut dirs = configured_path_dirs(
+        home,
+        config,
+        crate::harness_config::HarnessResourceKind::Prompt,
+    );
     if dirs.is_empty() {
         dirs.push(home.join(".ldgr/prompts"));
     }
     dedup_paths(dirs)
 }
 
-fn configured_skill_dirs(home: &Path, config: &Option<serde_json::Value>) -> Vec<PathBuf> {
-    let mut dirs = configured_path_dirs(home, config, "skill_paths");
+fn configured_skill_dirs(
+    home: &Path,
+    config: &Option<crate::harness_config::HarnessConfig>,
+) -> Vec<PathBuf> {
+    let mut dirs = configured_path_dirs(
+        home,
+        config,
+        crate::harness_config::HarnessResourceKind::Skill,
+    );
     if dirs.is_empty() {
         dirs.push(home.join(".pi/agent/skills"));
     }
     dedup_paths(dirs)
 }
 
-fn configured_extension_dirs(home: &Path, config: &Option<serde_json::Value>) -> Vec<PathBuf> {
-    let mut dirs = configured_path_dirs(home, config, "extension_paths")
-        .into_iter()
-        .map(|path| {
-            if path.extension().is_some() {
-                path.parent().map(Path::to_path_buf).unwrap_or(path)
-            } else {
-                path
-            }
-        })
-        .collect::<Vec<_>>();
+fn configured_extension_dirs(
+    home: &Path,
+    config: &Option<crate::harness_config::HarnessConfig>,
+) -> Vec<PathBuf> {
+    let mut dirs = configured_path_dirs(
+        home,
+        config,
+        crate::harness_config::HarnessResourceKind::Extension,
+    )
+    .into_iter()
+    .map(|path| {
+        if path.extension().is_some() {
+            path.parent().map(Path::to_path_buf).unwrap_or(path)
+        } else {
+            path
+        }
+    })
+    .collect::<Vec<_>>();
     if dirs.is_empty() {
         dirs.push(home.join(".pi/agent/extensions"));
     }
@@ -1403,29 +1478,19 @@ fn configured_extension_dirs(home: &Path, config: &Option<serde_json::Value>) ->
 
 fn configured_path_dirs(
     home: &Path,
-    config: &Option<serde_json::Value>,
-    key: &str,
+    config: &Option<crate::harness_config::HarnessConfig>,
+    kind: crate::harness_config::HarnessResourceKind,
 ) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     if let Some(config) = config {
-        if let Some(installed) = config.get("installed").and_then(|value| value.as_array()) {
-            for harness in installed {
-                if let Some(paths) = harness.get(key).and_then(|value| value.as_array()) {
-                    dirs.extend(
-                        paths
-                            .iter()
-                            .filter_map(json_path)
-                            .map(|path| expand_home_path(home, path)),
-                    );
-                }
-            }
-        }
+        dirs.extend(
+            config
+                .resource_paths(kind)
+                .iter()
+                .map(|path| expand_home_path(home, path.to_string_lossy().as_ref())),
+        );
     }
     dirs
-}
-
-fn json_path(value: &serde_json::Value) -> Option<&str> {
-    value.as_str().filter(|value| !value.trim().is_empty())
 }
 
 fn expand_home_path(home: &Path, value: &str) -> PathBuf {
