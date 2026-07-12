@@ -6,6 +6,7 @@ use std::process::Command;
 use anyhow::{bail, Context};
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 pub const ADAPTER_RELEASE_INDEX_SCHEMA_VERSION: u32 = 1;
 pub const ADAPTER_RELEASE_INDEX_ENV: &str = "LDGR_ADAPTER_INDEX";
@@ -84,6 +85,19 @@ pub fn resolve_release<'a>(
         platform: platform_release,
         version,
     })
+}
+
+pub fn verify_file_sha256(path: &Path, expected: &str) -> anyhow::Result<()> {
+    if expected.len() != 64 || !expected.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("indexed SHA-256 must contain exactly 64 hexadecimal characters");
+    }
+    let bytes = fs::read(path)
+        .with_context(|| format!("failed to read {} for SHA-256 verification", path.display()))?;
+    let actual = format!("{:x}", Sha256::digest(bytes));
+    if !actual.eq_ignore_ascii_case(expected) {
+        bail!("adapter archive SHA-256 mismatch: expected {expected}, got {actual}");
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -270,8 +284,8 @@ mod tests {
     use semver::Version;
 
     use super::{
-        load_release_index, parse_release_index, resolve_release, AdapterClassification,
-        ReleaseChannel,
+        load_release_index, parse_release_index, resolve_release, verify_file_sha256,
+        AdapterClassification, ReleaseChannel,
     };
 
     const OPEN_AND_COMMERCIAL: &str =
@@ -423,6 +437,25 @@ mod tests {
             false
         )
         .is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn verifies_sha256_and_rejects_one_byte_mutation() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let archive = directory.path().join("adapter.tar.gz");
+        std::fs::write(&archive, b"original")?;
+        verify_file_sha256(
+            &archive,
+            "0682c5f2076f099c34cfdd15a9e063849ed437a49677e6fcc5b4198c76575be5",
+        )?;
+        std::fs::write(&archive, b"originaL")?;
+        let error = verify_file_sha256(
+            &archive,
+            "0682c5f2076f099c34cfdd15a9e063849ed437a49677e6fcc5b4198c76575be5",
+        )
+        .expect_err("mutation must fail");
+        assert!(error.to_string().contains("SHA-256 mismatch"));
         Ok(())
     }
 }

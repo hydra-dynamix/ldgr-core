@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use assert_cmd::Command;
 use predicates::prelude::*;
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 #[test]
@@ -24,6 +25,101 @@ fn adapter_install_list_reads_explicit_release_index_without_recompile() -> anyh
         .assert()
         .success()
         .stdout(predicate::str::contains("evidence — LDGR Evidence adapter"));
+    Ok(())
+}
+
+#[test]
+fn adapter_install_resolves_and_installs_fixture_from_index() -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    let bundle = project.path().join("fixture-1.2.3");
+    write_adapter_namespace_fixture(&bundle, "fixture", "fixture", "[\"true\"]")?;
+    let archive = project.path().join("fixture.tar.gz");
+    let status = StdCommand::new("tar")
+        .args(["-czf"])
+        .arg(&archive)
+        .arg("-C")
+        .arg(project.path())
+        .arg("fixture-1.2.3")
+        .status()?;
+    assert!(status.success());
+    let archive_sha256 = format!("{:x}", Sha256::digest(fs::read(&archive)?));
+    let platform = format!(
+        "{}-{}",
+        std::env::consts::OS,
+        match std::env::consts::ARCH {
+            "aarch64" => "aarch64",
+            "x86_64" => "x86_64",
+            other => other,
+        }
+    );
+    let index = project.path().join("index.json");
+    fs::write(
+        &index,
+        serde_json::json!({
+            "schema_version": 1,
+            "adapters": [{
+                "domain": "fixture",
+                "primary_namespace": "fixture",
+                "title": "Fixture adapter",
+                "classification": "open_source",
+                "releases": [{
+                    "version": "1.2.3",
+                    "channel": "stable",
+                    "core_compatibility": ">=0.1.0, <0.2.0",
+                    "platforms": [{
+                        "platform": platform,
+                        "asset_url": format!("file://{}", archive.display()),
+                        "archive_root": "fixture-1.2.3",
+                        "binary": "ldgr-fixture",
+                        "sha256": archive_sha256,
+                        "signature_url": "file:///unused.sig",
+                        "signing_key_id": "test",
+                        "resource_manifest": "adapter-resources.json"
+                    }]
+                }]
+            }]
+        })
+        .to_string(),
+    )?;
+    let install_root = project.path().join("installed-fixture");
+    let mut command = isolated_command(project.path())?;
+    command
+        .env("LDGR_ADAPTER_INDEX", &index)
+        .args([
+            "adapter",
+            "install",
+            "fixture",
+            "--version",
+            "1.2.3",
+            "--yes",
+            "--install-root",
+        ])
+        .arg(&install_root);
+    command
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Resolved version 1.2.3"));
+    assert!(install_root.join("adapter.toml").is_file());
+    let mut mutated = fs::OpenOptions::new().append(true).open(&archive)?;
+    mutated.write_all(b"x")?;
+    let mut retry = isolated_command(project.path())?;
+    retry
+        .env("LDGR_ADAPTER_INDEX", &index)
+        .args([
+            "adapter",
+            "install",
+            "fixture",
+            "--version",
+            "1.2.3",
+            "--yes",
+            "--install-root",
+        ])
+        .arg(&install_root);
+    retry
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("SHA-256 mismatch"));
+    assert!(install_root.join("adapter.toml").is_file());
     Ok(())
 }
 

@@ -19,6 +19,8 @@ pub fn handle_adapter(args: AdapterArgs) -> anyhow::Result<()> {
                 name,
                 source_root: args.source_root,
                 install_root: args.install_root,
+                version: args.version,
+                prerelease: args.prerelease,
                 yes: args.yes,
             }),
             None => super::ops::handle_interactive_adapter_install(

@@ -34,6 +34,14 @@ pub struct AdapterInstallArgs {
     #[arg(long)]
     pub install_root: Option<std::path::PathBuf>,
 
+    /// Install this exact adapter version instead of the latest compatible stable release.
+    #[arg(long)]
+    pub version: Option<String>,
+
+    /// Allow prerelease adapter versions during resolution.
+    #[arg(long)]
+    pub prerelease: bool,
+
     /// Accept defaults and do not prompt.
     #[arg(long)]
     pub yes: bool,

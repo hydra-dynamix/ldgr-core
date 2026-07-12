@@ -134,6 +134,8 @@ pub fn handle_install(args: InstallArgs) -> anyhow::Result<()> {
                 name: adapter,
                 source_root: None,
                 install_root: None,
+                version: None,
+                prerelease: false,
                 yes: args.yes,
             })?;
         }
@@ -165,6 +167,8 @@ pub(crate) fn handle_interactive_adapter_install(
             name: adapter,
             source_root: source_root.clone(),
             install_root: None,
+            version: None,
+            prerelease: false,
             yes,
         })?;
     }
@@ -172,6 +176,11 @@ pub(crate) fn handle_interactive_adapter_install(
 }
 
 pub(crate) fn handle_install_adapter(args: &InstallAdapterArgs) -> anyhow::Result<()> {
+    if args.source_root.is_none()
+        && std::env::var_os(crate::release_index::ADAPTER_RELEASE_INDEX_ENV).is_some()
+    {
+        return install_adapter_from_configured_index(args);
+    }
     let adapter = resolve_adapter_install_name(&args.name, args.yes)?;
     let Some(entry) = available_adapter_catalog()
         .iter()
@@ -203,6 +212,113 @@ pub(crate) fn handle_install_adapter(args: &InstallAdapterArgs) -> anyhow::Resul
     }
     install_adapter_harness_assets(&adapter, &install_root, &home)?;
     println!("└─ Installed adapter `{adapter}`. Try `ldgr {adapter} --help` or `ldgr adapter show {adapter}`.");
+    Ok(())
+}
+
+fn install_adapter_from_configured_index(args: &InstallAdapterArgs) -> anyhow::Result<()> {
+    use semver::Version;
+
+    let index = crate::release_index::load_configured_release_index()?;
+    let requested = normalize_adapter_name(&args.name);
+    let adapter = index
+        .adapters
+        .iter()
+        .find(|entry| {
+            entry.domain == requested || entry.aliases.iter().any(|alias| alias == &requested)
+        })
+        .with_context(|| {
+            format!(
+                "unknown adapter `{}` in configured release index",
+                args.name
+            )
+        })?;
+    let exact = args
+        .version
+        .as_deref()
+        .map(Version::parse)
+        .transpose()
+        .context("--version must be a semantic version")?;
+    let core = Version::parse(env!("CARGO_PKG_VERSION"))?;
+    let platform = platform_tag()?;
+    let resolved = crate::release_index::resolve_release(
+        &index,
+        &adapter.domain,
+        &core,
+        &platform,
+        exact.as_ref(),
+        args.prerelease,
+    )?;
+    let home = home_dir()?;
+    let install_root = args
+        .install_root
+        .clone()
+        .unwrap_or_else(|| home.join(".ldgr/adapters").join(&adapter.domain));
+    println!("◇ Installing LDGR adapter `{}`", adapter.domain);
+    println!("├─ Resolved version {} for {platform}", resolved.version);
+    println!("├─ Install root {}", install_root.display());
+    install_resolved_index_release(&resolved, &install_root, &home)?;
+    install_adapter_harness_assets(&adapter.domain, &install_root, &home)?;
+    println!(
+        "└─ Installed adapter `{}`. Try `ldgr {} --help` or `ldgr adapter show {}`.",
+        adapter.domain, adapter.domain, adapter.domain
+    );
+    Ok(())
+}
+
+fn install_resolved_index_release(
+    resolved: &crate::release_index::ResolvedAdapterRelease<'_>,
+    install_root: &Path,
+    home: &Path,
+) -> anyhow::Result<()> {
+    let temp = std::env::temp_dir().join(format!(
+        "ldgr-adapter-index-install-{}-{}",
+        resolved.adapter.domain,
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&temp);
+    fs::create_dir_all(&temp)?;
+    let archive = temp.join("adapter.tar.gz");
+    run_checked(
+        Command::new("curl")
+            .arg("-fsSL")
+            .arg(&resolved.platform.asset_url)
+            .arg("-o")
+            .arg(&archive),
+        "download indexed adapter release",
+    )?;
+    crate::release_index::verify_file_sha256(&archive, &resolved.platform.sha256)?;
+    run_checked(
+        Command::new("tar")
+            .arg("-xzf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(&temp),
+        "extract indexed adapter release",
+    )?;
+    let extracted = temp.join(&resolved.platform.archive_root);
+    if !extracted.is_dir() {
+        bail!(
+            "release archive did not contain expected root {}",
+            extracted.display()
+        );
+    }
+    let _ = fs::remove_dir_all(install_root);
+    copy_dir_recursive(&extracted, install_root)?;
+    let installed_binary = install_release_binary(
+        install_root,
+        home,
+        &resolved.platform.binary,
+        &resolved.platform.platform,
+    )?;
+    if let Some(binary_path) = installed_binary {
+        run_adapter_binary_installer(
+            binary_path.as_os_str(),
+            &resolved.adapter.domain,
+            install_root,
+        )?;
+    }
+    patch_adapter_argv_to_installed_binary(install_root, &resolved.platform.binary, home)?;
+    let _ = fs::remove_dir_all(&temp);
     Ok(())
 }
 
