@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Write};
 use std::net::{IpAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -8,7 +8,6 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
-use std::time::SystemTime;
 
 use anyhow::{bail, Context};
 use serde_json::json;
@@ -16,7 +15,7 @@ use serde_json::json;
 use crate::store::{
     add_global_observation, clear_loop_intervention, get_artifact, get_run, get_work_item_by_slug,
     list_artifacts, list_decisions, list_event_logs, list_observations, list_runs, open_store,
-    read_context_with_conduct_lifecycle, read_mission_log, request_loop_intervention, resume_loop,
+    read_context, read_mission_log, request_loop_intervention, resume_loop,
     ArtifactKind, GlobalObservationKind, LoopInterventionAction,
 };
 

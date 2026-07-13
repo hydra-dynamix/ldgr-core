@@ -4,8 +4,6 @@ const text = value => value == null ? 'none' : String(value);
 let lastSnapshotJson = '';
 let lastContext = null;
 let lastMissionLog = null;
-let lastConduct = null;
-let conductLoadInFlight = false;
 let currentView = initialViewFromHash();
 let currentDetailRoute = '';
 let selectedArtifactId = null;
@@ -96,23 +94,6 @@ async function load() {
   render();
   await renderRoute();
   $('last-refresh').textContent = 'Updated ' + new Date().toLocaleTimeString();
-  if (currentView === 'waves') loadConduct();
-}
-
-async function loadConduct() {
-  if (conductLoadInFlight) return;
-  conductLoadInFlight = true;
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort('conduct wave request timeout'), 15000);
-  try {
-    lastConduct = await apiJson('/api/conduct/waves', {signal: controller.signal});
-  } catch (error) {
-    lastConduct = {available: false, error: String(error), batches: [], feeds: []};
-  } finally {
-    clearTimeout(timeout);
-    conductLoadInFlight = false;
-  }
-  if (currentView === 'waves') renderWaveManagement(lastConduct);
 }
 
 function isEditingControl() {
@@ -141,3 +122,71 @@ function controlDraft() {
   };
 }
 
+function renderOperatorControls(draft) {
+  const dryRunChecked = draft.dryRun ? ' checked' : '';
+  const projectCompleteChecked = draft.projectComplete ? ' checked' : '';
+  return `<div class="control-grid">
+    <button type="button" class="control-button" data-action="request-intervention" data-intervention="pause">Pause next cycle</button>
+    <button type="button" class="control-button" data-action="request-intervention" data-intervention="resume">Resume paused loop</button>
+    <button type="button" class="control-button danger" data-action="request-intervention" data-intervention="stop">Stop next cycle</button>
+    <button type="button" class="control-button" data-action="request-intervention" data-intervention="steer">Add steering</button>
+  </div>
+  <label for="control-reason">Reason</label><input id="control-reason" value="${esc(draft.reason)}">
+  <label for="control-instruction">Instruction for the next loop prompt</label><textarea id="control-instruction">${esc(draft.instruction)}</textarea>
+  <details class="inline-details"><summary>Loop start options</summary>${renderLoopStart(draft, dryRunChecked, projectCompleteChecked)}</details>
+  <p id="control-status" class="muted">${esc(draft.status)}</p>`;
+}
+
+function renderLoopStart(draft, dryRunChecked, projectCompleteChecked) {
+  const streamAgentOutputChecked = draft.streamAgentOutput ? ' checked' : '';
+  return `<label for="loop-prompt">Prompt path</label><input id="loop-prompt" value="${esc(draft.prompt)}">
+  <label for="loop-prompt-slug">Prompt slug</label><input id="loop-prompt-slug" value="${esc(draft.promptSlug)}">
+  <label for="loop-bundle">Bundle slug</label><input id="loop-bundle" value="${esc(draft.bundle)}">
+  <label for="loop-prompt-role">Bundle prompt role</label><input id="loop-prompt-role" value="${esc(draft.promptRole)}">
+  <label for="loop-agent">Agent</label><select id="loop-agent"><option value="agentctl"${draft.agent === 'agentctl' ? ' selected' : ''}>agentctl</option></select>
+  <label for="loop-agent-argv">Agent argv JSON</label><textarea id="loop-agent-argv">${esc(draft.agentArgv)}</textarea>
+  <label for="loop-agent-timeout-seconds">Agent timeout seconds</label><input id="loop-agent-timeout-seconds" type="number" min="1" value="${esc(draft.agentTimeoutSeconds)}">
+  <label for="loop-audit-argv">Audit argv JSON</label><textarea id="loop-audit-argv">${esc(draft.auditArgv)}</textarea>
+  <label for="loop-max-iterations">Max iterations</label><input id="loop-max-iterations" type="number" min="1" value="${esc(draft.maxIterations)}">
+  <label><input id="loop-dry-run" type="checkbox"${dryRunChecked}> Dry run</label>
+  <label><input id="loop-stream-agent-output" type="checkbox"${streamAgentOutputChecked}> Stream agent output</label>
+  <label><input id="loop-project-complete" type="checkbox"${projectCompleteChecked}> Request project completion audit</label>
+  <button type="button" class="control-button" data-action="start-loop">Start loop cycle</button>
+  <p id="loop-start-status" class="muted">${esc(draft.startStatus)}</p>`;
+}
+
+async function startLoop() {
+  const statusNode = $('loop-start-status');
+  statusNode.textContent = 'Starting loop cycle...';
+  const agentArgv = $('loop-agent-argv').value.trim();
+  const body = new URLSearchParams({prompt:$('loop-prompt').value.trim(),prompt_slug:$('loop-prompt-slug').value.trim(),bundle:$('loop-bundle').value.trim(),prompt_role:$('loop-prompt-role').value.trim(),agent:agentArgv?'':$('loop-agent').value,agent_argv:agentArgv,agent_timeout_seconds:$('loop-agent-timeout-seconds').value.trim(),audit_argv:$('loop-audit-argv').value.trim(),dry_run:$('loop-dry-run').checked?'true':'false',stream_agent_output:$('loop-stream-agent-output').checked?'true':'false',max_iterations:$('loop-max-iterations').value.trim(),project_complete_requested:$('loop-project-complete').checked?'true':'false'});
+  const response = await fetch('/api/loop/start', {method:'POST',headers:controlHeaders(),body});
+  if (!response.ok) { statusNode.textContent = await apiErrorMessage(response); return; }
+  const result = await response.json();
+  statusNode.textContent = `${result.message || 'Loop process started.'} pid ${result.pid}.`;
+  if (document.activeElement) document.activeElement.blur();
+  lastSnapshotJson = '';
+  await load();
+}
+
+async function requestIntervention(action) {
+  const body = new URLSearchParams({reason:$('control-reason').value.trim()});
+  if (action === 'steer') body.set('instruction', $('control-instruction').value.trim());
+  await postControl(`/api/loop/interventions/${action}`, body);
+}
+
+async function clearIntervention(id) {
+  const reason = $('control-reason').value.trim() || 'Operator cleared from cockpit';
+  await postControl(`/api/loop/interventions/clear/${id}`, new URLSearchParams({reason}));
+}
+
+async function postControl(url, body) {
+  const statusNode = $('control-status');
+  statusNode.textContent = 'Writing control event...';
+  const response = await fetch(url, {method:'POST',headers:controlHeaders(),body});
+  if (!response.ok) { statusNode.textContent = await apiErrorMessage(response); return; }
+  statusNode.textContent = 'Control event recorded.';
+  if (document.activeElement) document.activeElement.blur();
+  lastSnapshotJson = '';
+  await load();
+}

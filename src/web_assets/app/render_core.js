@@ -6,8 +6,7 @@ function render() {
   renderCurrent(context, missionLog);
   renderDecisionTrail(missionLog);
   renderArtifactView(missionLog);
-  renderWaveManagement(lastConduct);
-  renderSidebar(context, missionLog, lastConduct);
+  renderSidebar(context, missionLog);
   $('operator-controls').innerHTML = renderOperatorControls(controlDraft());
   $('controls-status').textContent = `${pendingInterventions(context).length} pending`;
 }
@@ -53,11 +52,10 @@ function renderCurrent(context, missionLog) {
   renderCurrentInspector(context, missionLog);
 }
 
-function renderSidebar(context, missionLog, conduct) {
+function renderSidebar(context, missionLog) {
   renderSidebarCurrent(context);
   renderSidebarDecisions(missionLog);
   renderSidebarArtifacts(missionLog);
-  renderSidebarWaves(conduct);
   renderSidebarRuns(missionLog);
 }
 
@@ -88,17 +86,6 @@ function renderSidebarArtifacts(missionLog) {
   $('nav-artifacts').innerHTML = artifacts.length
     ? artifacts.map(item => navButton(artifactName(item.artifact.path), `${item.artifact.kind} · run ${item.run.run_id}`, 'select-artifact', {'artifact-id': item.artifact.artifact_id})).join('')
     : '<p class="muted nav-empty">No artifacts.</p>';
-}
-
-function renderSidebarWaves(conduct) {
-  if (!conduct || !conduct.available) {
-    $('nav-waves').innerHTML = navButton('Wave management', 'loading', 'set-view', {'view': 'waves'});
-    return;
-  }
-  const batches = (conduct.batches || []).slice(0, 8);
-  $('nav-waves').innerHTML = batches.length
-    ? batches.map(batch => navButton(batch.batch_id, `${batch.worker_count || (batch.workers || []).length} workers`, 'set-view', {'view': 'waves'})).join('')
-    : '<p class="muted nav-empty">No waves.</p>';
 }
 
 function renderSidebarRuns(missionLog) {
@@ -416,4 +403,3 @@ function renderMarkdown(markdown) {
   if (inList) html.push('</ul>');
   return html.join('');
 }
-

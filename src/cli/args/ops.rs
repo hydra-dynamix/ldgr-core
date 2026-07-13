@@ -54,6 +54,15 @@ pub struct InstallAdapterArgs {
     #[arg(long)]
     pub install_root: Option<PathBuf>,
 
+    #[arg(long)]
+    pub version: Option<String>,
+
+    #[arg(long)]
+    pub prerelease: bool,
+
+    #[arg(long)]
+    pub offline: bool,
+
     /// Accept defaults and do not prompt.
     #[arg(long)]
     pub yes: bool,

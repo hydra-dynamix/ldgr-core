@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "adapters": [{
+    "domain": "example",
+    "primary_namespace": "example",
+    "title": "LDGR Example adapter",
+    "classification": "open_source",
+    "releases": [{
+      "version": "0.1.4",
+      "channel": "stable",
+      "core_compatibility": ">=0.1.0, <0.2.0",
+      "platforms": [{
+        "platform": "linux-aarch64",
+        "asset_url": "https://example.invalid/example.tar.gz",
+        "archive_root": "example-0.1.4",
+        "binary": "ldgr-example-adapter",
+        "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "signing_key_id": "ldgr-release-2026",
+        "resource_manifest": "adapter-resources.json"
+      }]
+    }]
+  }]
+}

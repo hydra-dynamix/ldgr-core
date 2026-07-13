@@ -19,6 +19,9 @@ pub fn handle_adapter(args: AdapterArgs) -> anyhow::Result<()> {
                 name,
                 source_root: args.source_root,
                 install_root: args.install_root,
+                version: args.version,
+                prerelease: args.prerelease,
+                offline: args.offline,
                 yes: args.yes,
             }),
             None => super::ops::handle_interactive_adapter_install(
@@ -27,6 +30,9 @@ pub fn handle_adapter(args: AdapterArgs) -> anyhow::Result<()> {
                 args.yes,
             ),
         },
+        AdapterCommand::Update(args) => super::ops::handle_update_adapter(&args),
+        AdapterCommand::Uninstall(args) => super::ops::handle_uninstall_adapter(&args),
+        AdapterCommand::Reconcile(args) => super::ops::handle_reconcile_adapters(&args),
         AdapterCommand::List(args) => {
             if args.json {
                 println!("{}", serde_json::to_string_pretty(&registry)?);

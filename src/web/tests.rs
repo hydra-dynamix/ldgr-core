@@ -45,18 +45,9 @@ mod tests {
     }
 
     #[test]
-    fn cockpit_asset_exposes_conduct_wave_management() {
-        for expected in [
-            "data-view=\"waves\"",
-            "wave-management",
-            "/api/conduct/waves",
-            "Conduct feed tail",
-            "worker DB",
-        ] {
-            assert!(
-                INDEX_HTML.contains(expected) || APP_JS.contains(expected),
-                "{expected}"
-            );
+    fn cockpit_asset_omits_adapter_specific_wave_management() {
+        for excluded in ["data-view=\"waves\"", "/api/conduct/waves", "Conduct feed tail"] {
+            assert!(!INDEX_HTML.contains(excluded) && !APP_JS.contains(excluded));
         }
     }
 

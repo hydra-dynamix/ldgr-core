@@ -114,6 +114,44 @@ impl AdapterRegistry {
             })
         })
     }
+
+    pub fn installed_domains(&self) -> Vec<InstalledAdapterDomain> {
+        self.adapters
+            .iter()
+            .flat_map(|adapter| {
+                adapter.command_namespaces.iter().map(|namespace| {
+                    let command = format!("ldgr {}", namespace.namespace);
+                    InstalledAdapterDomain {
+                        adapter: adapter.slug.clone(),
+                        namespace: namespace.namespace.clone(),
+                        command: command.clone(),
+                        help_command: format!("{command} --help"),
+                        instruction: format!(
+                            "Run {command} --help for the extended command surface."
+                        ),
+                        status_command: (!namespace.status_args.is_empty())
+                            .then(|| format!("{command} {}", namespace.status_args.join(" "))),
+                        summary: namespace
+                            .summary
+                            .clone()
+                            .or_else(|| namespace.description.clone()),
+                    }
+                })
+            })
+            .collect()
+    }
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct InstalledAdapterDomain {
+    pub adapter: String,
+    pub namespace: String,
+    pub command: String,
+    pub help_command: String,
+    pub instruction: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status_command: Option<String>,
+    pub summary: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -129,6 +167,8 @@ pub struct DiscoveredAdapter {
     pub command_namespaces: Vec<AdapterCommandNamespace>,
     pub target_profiles: Vec<AdapterTargetProfile>,
     pub verified_manifest_digest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub installation_receipt: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -150,6 +190,7 @@ pub struct AdapterCommandNamespace {
     pub usage: Option<String>,
     pub summary: Option<String>,
     pub details: Option<String>,
+    pub status_args: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -244,6 +285,8 @@ struct ManifestCommand {
     #[serde(default)]
     capabilities: Vec<String>,
     help: Option<ManifestCommandHelp>,
+    #[serde(default)]
+    status_args: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -398,6 +441,7 @@ fn load_adapter_manifest(manifest_path: &Path) -> anyhow::Result<DiscoveredAdapt
             usage: help.as_ref().and_then(|help| help.usage.clone()),
             summary: help.as_ref().and_then(|help| help.summary.clone()),
             details: help.and_then(|help| help.details),
+            status_args: command.status_args,
         });
     }
     if command_namespaces.is_empty() {
@@ -411,9 +455,13 @@ fn load_adapter_manifest(manifest_path: &Path) -> anyhow::Result<DiscoveredAdapt
             usage: Some(format!("ldgr {adapter_slug} <command> [options]")),
             summary: Some(format!("Run {adapter_slug} adapter commands.")),
             details: None,
+            status_args: Vec::new(),
         });
     }
 
+    let installation_receipt = fs::read_to_string(manifest_dir.join("installation-receipt.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok());
     Ok(DiscoveredAdapter {
         slug: adapter_slug,
         title: nonempty("adapter.title", manifest.adapter.title)?,
@@ -430,6 +478,7 @@ fn load_adapter_manifest(manifest_path: &Path) -> anyhow::Result<DiscoveredAdapt
         command_namespaces,
         target_profiles: manifest.target_profiles,
         verified_manifest_digest,
+        installation_receipt,
     })
 }
 

@@ -12,13 +12,14 @@ use crate::loop_runtime::{
     run_loop_once, LoopAgent, LoopPromptSource, LoopRuntimeOptions, LoopRuntimeOutcome,
     LoopRuntimeResult,
 };
-use crate::store::{init_store, read_context_with_conduct_lifecycle};
+use crate::store::{init_store, read_context};
 use crate::tool_runner::parse_argv_json;
 use crate::web::{generate_control_token, serve, WebOptions};
 
 use super::super::args::{
-    CliLoopAgent, ContextArgs, HarnessKind, InstallAdapterArgs, InstallArgs, InstallCommand,
-    LoopArgs, LoopCommand, LoopRunArgs, StatusArgs, WebArgs,
+    AdapterReconcileArgs, AdapterUninstallArgs, AdapterUpdateArgs, CliLoopAgent, ContextArgs,
+    HarnessKind, InstallAdapterArgs, InstallArgs, InstallCommand, LoopArgs, LoopCommand,
+    LoopRunArgs, StatusArgs, WebArgs,
 };
 use super::super::render::brief_context::{
     brief_context, print_brief_context, BriefContextOptions,
@@ -44,6 +45,7 @@ pub fn handle_init(db: &Path, artifact_root: &Path) -> anyhow::Result<()> {
     install_core_harness_resources()?;
     print_init_project_setup_prompt();
     print_cli_hierarchy();
+    print_installed_adapter_summary();
     Ok(())
 }
 
@@ -105,6 +107,7 @@ pub fn handle_install(args: InstallArgs) -> anyhow::Result<()> {
         format!("{}\n", serde_json::to_string_pretty(&config)?),
     )?;
     println!("├─ Wrote config {}", config_path.display());
+    reconcile_installed_adapters(&home, None)?;
     println!("│");
     println!("√ LDGR install complete");
     println!("│");
@@ -134,6 +137,9 @@ pub fn handle_install(args: InstallArgs) -> anyhow::Result<()> {
                 name: adapter,
                 source_root: None,
                 install_root: None,
+                version: None,
+                prerelease: false,
+                offline: false,
                 yes: args.yes,
             })?;
         }
@@ -165,6 +171,9 @@ pub(crate) fn handle_interactive_adapter_install(
             name: adapter,
             source_root: source_root.clone(),
             install_root: None,
+            version: None,
+            prerelease: false,
+            offline: false,
             yes,
         })?;
     }
@@ -172,6 +181,11 @@ pub(crate) fn handle_interactive_adapter_install(
 }
 
 pub(crate) fn handle_install_adapter(args: &InstallAdapterArgs) -> anyhow::Result<()> {
+    if args.source_root.is_none()
+        && std::env::var_os(crate::release_index::ADAPTER_RELEASE_INDEX_ENV).is_some()
+    {
+        return install_adapter_from_configured_index(args);
+    }
     let adapter = resolve_adapter_install_name(&args.name, args.yes)?;
     let Some(entry) = available_adapter_catalog()
         .iter()
@@ -203,6 +217,658 @@ pub(crate) fn handle_install_adapter(args: &InstallAdapterArgs) -> anyhow::Resul
     }
     install_adapter_harness_assets(&adapter, &install_root, &home)?;
     println!("└─ Installed adapter `{adapter}`. Try `ldgr {adapter} --help` or `ldgr adapter show {adapter}`.");
+    Ok(())
+}
+
+pub(crate) fn handle_update_adapter(args: &AdapterUpdateArgs) -> anyhow::Result<()> {
+    use semver::Version;
+
+    let registry = AdapterRegistry::discover();
+    let installed = registry
+        .find(&args.name)
+        .with_context(|| format!("adapter `{}` is not installed", args.name))?;
+    let receipt = installed
+        .installation_receipt
+        .as_ref()
+        .context("installed adapter has no verified installation receipt; reinstall it first")?;
+    let current_text = receipt
+        .get("version")
+        .and_then(serde_json::Value::as_str)
+        .context("installation receipt has no version")?;
+    let current = Version::parse(current_text).context("installed receipt version is invalid")?;
+    let index = crate::release_index::load_configured_release_index()?;
+    let core = Version::parse(env!("CARGO_PKG_VERSION"))?;
+    let platform = platform_tag()?;
+    let resolved = crate::release_index::resolve_release(
+        &index,
+        &installed.slug,
+        &core,
+        &platform,
+        None,
+        args.prerelease,
+    )?;
+    if resolved.version <= current {
+        println!(
+            "adapter={} installed={} latest_compatible={} update_available=false",
+            installed.slug, current, resolved.version
+        );
+        return Ok(());
+    }
+    println!(
+        "adapter={} installed={} latest_compatible={} update_available=true",
+        installed.slug, current, resolved.version
+    );
+    if args.check {
+        return Ok(());
+    }
+    install_adapter_from_configured_index(&InstallAdapterArgs {
+        name: installed.slug.clone(),
+        source_root: None,
+        install_root: Some(installed.root_path.clone()),
+        version: Some(resolved.version.to_string()),
+        prerelease: args.prerelease,
+        offline: false,
+        yes: true,
+    })
+}
+
+pub(crate) fn handle_uninstall_adapter(args: &AdapterUninstallArgs) -> anyhow::Result<()> {
+    let registry = AdapterRegistry::discover();
+    let installed = registry
+        .find(&args.name)
+        .with_context(|| format!("adapter `{}` is not installed", args.name))?;
+    let receipt_value = installed.installation_receipt.clone().context(
+        "installed adapter has no verified installation receipt; refusing untracked removal",
+    )?;
+    let receipt: crate::release_index::InstallationReceipt =
+        serde_json::from_value(receipt_value).context("installation receipt is invalid")?;
+    let mut modified = Vec::new();
+    if digest_bundle(&installed.root_path)? != receipt.bundle_sha256 {
+        modified.push(installed.root_path.clone());
+    }
+    for resource in &receipt.owned_resources {
+        let path = PathBuf::from(&resource.path);
+        if path.exists() && digest_path(&path)? != resource.sha256 {
+            modified.push(path);
+        }
+    }
+    if let (Some(path), Some(expected)) = (&receipt.binary_path, &receipt.binary_sha256) {
+        let path = PathBuf::from(path);
+        if path.exists() && digest_path(&path)? != *expected {
+            modified.push(path);
+        }
+    }
+    if !modified.is_empty() && !args.force {
+        bail!(
+            "refusing to remove modified adapter-owned files:\n{}\nRe-run with --force to remove them.",
+            modified
+                .iter()
+                .map(|path| format!("  {}", path.display()))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+    for resource in &receipt.owned_resources {
+        remove_path_if_exists(Path::new(&resource.path))?;
+    }
+    if let Some(binary) = &receipt.binary_path {
+        remove_path_if_exists(Path::new(binary))?;
+    }
+    remove_path_if_exists(&installed.root_path)?;
+    let marker = home_dir()?
+        .join(".ldgr/installed-adapters")
+        .join(&installed.slug);
+    remove_path_if_exists(&marker)?;
+    println!("uninstalled adapter={}", installed.slug);
+    Ok(())
+}
+
+pub(crate) fn handle_reconcile_adapters(args: &AdapterReconcileArgs) -> anyhow::Result<()> {
+    reconcile_installed_adapters(&home_dir()?, args.name.as_deref())
+}
+
+fn reconcile_installed_adapters(home: &Path, requested: Option<&str>) -> anyhow::Result<()> {
+    let registry = AdapterRegistry::discover();
+    let adapters = registry
+        .adapters
+        .iter()
+        .filter(|adapter| {
+            requested.is_none_or(|name| {
+                adapter.slug == name || adapter.aliases.iter().any(|alias| alias == name)
+            })
+        })
+        .collect::<Vec<_>>();
+    if requested.is_some() && adapters.is_empty() {
+        bail!("requested adapter is not installed");
+    }
+    for adapter in adapters {
+        let Some(value) = adapter.installation_receipt.clone() else {
+            continue;
+        };
+        let mut receipt: crate::release_index::InstallationReceipt =
+            serde_json::from_value(value).context("installation receipt is invalid")?;
+        let desired_plan =
+            typed_harness_resource_plan(&adapter.root_path, home, &receipt.resource_manifest)?;
+        let desired_targets = desired_plan
+            .iter()
+            .map(|(_, target)| target.clone())
+            .collect::<Vec<_>>();
+        let temp = std::env::temp_dir().join(format!(
+            "ldgr-adapter-reconcile-{}-{}",
+            adapter.slug,
+            std::process::id()
+        ));
+        remove_path_if_exists(&temp)?;
+        let mut transaction = InstallTransaction::new(temp.join("rollback"))?;
+        transaction.snapshot(&adapter.root_path)?;
+        for resource in &receipt.owned_resources {
+            let path = PathBuf::from(&resource.path);
+            if path.exists() && digest_path(&path)? != resource.sha256 {
+                bail!(
+                    "refusing to reconcile modified adapter resource {}",
+                    path.display()
+                );
+            }
+            transaction.snapshot(&path)?;
+        }
+        for target in &desired_targets {
+            transaction.snapshot(target)?;
+        }
+        for resource in &receipt.owned_resources {
+            let path = PathBuf::from(&resource.path);
+            if !desired_targets.iter().any(|target| target == &path) {
+                remove_path_if_exists(&path)?;
+            }
+        }
+        install_typed_harness_resources(&desired_plan)?;
+        receipt.owned_resources = desired_targets
+            .iter()
+            .map(|path| {
+                Ok(crate::release_index::OwnedResource {
+                    path: path.display().to_string(),
+                    sha256: digest_path(path)?,
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        fs::write(
+            adapter.root_path.join("installation-receipt.json"),
+            format!("{}\n", serde_json::to_string_pretty(&receipt)?),
+        )?;
+        transaction.commit()?;
+        remove_path_if_exists(&temp)?;
+        println!(
+            "reconciled adapter={} resources={}",
+            adapter.slug,
+            receipt.owned_resources.len()
+        );
+    }
+    Ok(())
+}
+
+fn install_adapter_from_configured_index(args: &InstallAdapterArgs) -> anyhow::Result<()> {
+    use semver::Version;
+
+    let configured_source = std::env::var(crate::release_index::ADAPTER_RELEASE_INDEX_ENV)
+        .unwrap_or_else(|_| crate::release_index::DEFAULT_ADAPTER_RELEASE_INDEX_URL.to_owned());
+    if args.offline && configured_source.starts_with("http") {
+        bail!("--offline requires LDGR_ADAPTER_INDEX to reference a local file");
+    }
+    let index = crate::release_index::load_release_index(&configured_source)?;
+    let requested = normalize_adapter_name(&args.name);
+    let adapter = index
+        .adapters
+        .iter()
+        .find(|entry| {
+            entry.domain == requested || entry.aliases.iter().any(|alias| alias == &requested)
+        })
+        .with_context(|| {
+            format!(
+                "unknown adapter `{}` in configured release index",
+                args.name
+            )
+        })?;
+    let exact = args
+        .version
+        .as_deref()
+        .map(Version::parse)
+        .transpose()
+        .context("--version must be a semantic version")?;
+    let core = Version::parse(env!("CARGO_PKG_VERSION"))?;
+    let platform = platform_tag()?;
+    let resolved = crate::release_index::resolve_release(
+        &index,
+        &adapter.domain,
+        &core,
+        &platform,
+        exact.as_ref(),
+        args.prerelease,
+    )?;
+    if args.offline
+        && (!resolved.platform.asset_url.starts_with("file://")
+            || !resolved.platform.signature_url.starts_with("file://"))
+    {
+        bail!("--offline requires file:// archive and signature URLs in the release index");
+    }
+    let home = home_dir()?;
+    let install_root = args
+        .install_root
+        .clone()
+        .unwrap_or_else(|| home.join(".ldgr/adapters").join(&adapter.domain));
+    println!("◇ Installing LDGR adapter `{}`", adapter.domain);
+    println!("├─ Resolved version {} for {platform}", resolved.version);
+    println!("├─ Install root {}", install_root.display());
+    install_resolved_index_release(&resolved, &install_root, &home)?;
+    println!(
+        "└─ Installed adapter `{}`. Try `ldgr {} --help` or `ldgr adapter show {}`.",
+        adapter.domain, adapter.domain, adapter.domain
+    );
+    Ok(())
+}
+
+fn install_resolved_index_release(
+    resolved: &crate::release_index::ResolvedAdapterRelease<'_>,
+    install_root: &Path,
+    home: &Path,
+) -> anyhow::Result<()> {
+    let temp = std::env::temp_dir().join(format!(
+        "ldgr-adapter-index-install-{}-{}",
+        resolved.adapter.domain,
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&temp);
+    fs::create_dir_all(&temp)?;
+    let archive = temp.join("adapter.tar.gz");
+    run_checked(
+        Command::new("curl")
+            .arg("-fsSL")
+            .arg(&resolved.platform.asset_url)
+            .arg("-o")
+            .arg(&archive),
+        "download indexed adapter release",
+    )?;
+    crate::release_index::verify_file_sha256(&archive, &resolved.platform.sha256)?;
+    let signature = temp.join("adapter.sig");
+    run_checked(
+        Command::new("curl")
+            .arg("-fsSL")
+            .arg(&resolved.platform.signature_url)
+            .arg("-o")
+            .arg(&signature),
+        "download indexed adapter signature",
+    )?;
+    let keyring = std::env::var_os(crate::release_index::ADAPTER_RELEASE_KEYRING_ENV)
+        .map(PathBuf::from)
+        .context(
+            "LDGR_ADAPTER_RELEASE_KEYRING must point to the trusted offline release keyring",
+        )?;
+    crate::release_index::verify_detached_release_signature(
+        &archive,
+        &signature,
+        &keyring,
+        &resolved.platform.signing_key_id,
+    )?;
+    crate::release_index::extract_safe_tar_gz(&archive, &temp, &resolved.platform.archive_root)?;
+    let extracted = temp.join(&resolved.platform.archive_root);
+    if !extracted.is_dir() {
+        bail!(
+            "release archive did not contain expected root {}",
+            extracted.display()
+        );
+    }
+    let mut transaction = InstallTransaction::new(temp.join("rollback"))?;
+    transaction.snapshot(install_root)?;
+    let binary_source = extracted
+        .join(&resolved.platform.platform)
+        .join(&resolved.platform.binary);
+    if binary_source.is_file() {
+        transaction.snapshot(&home.join(".local/bin").join(&resolved.platform.binary))?;
+    }
+    transaction.snapshot(
+        &home
+            .join(".ldgr/installed-adapters")
+            .join(&resolved.adapter.domain),
+    )?;
+    let resource_plan =
+        typed_harness_resource_plan(&extracted, home, &resolved.platform.resource_manifest)?;
+    let resource_targets = resource_plan
+        .iter()
+        .map(|(_, target)| target.clone())
+        .collect::<Vec<_>>();
+    for target in &resource_targets {
+        transaction.snapshot(target)?;
+    }
+    activate_bundle_atomically(&extracted, install_root)?;
+    let installed_binary = install_release_binary(
+        install_root,
+        home,
+        &resolved.platform.binary,
+        &resolved.platform.platform,
+    )?;
+    if let Some(binary_path) = installed_binary {
+        run_adapter_binary_installer(
+            binary_path.as_os_str(),
+            &resolved.adapter.domain,
+            install_root,
+        )?;
+    }
+    patch_adapter_argv_to_installed_binary(install_root, &resolved.platform.binary, home)?;
+    install_typed_harness_resources(&resource_plan)?;
+    write_file(
+        &home
+            .join(".ldgr/installed-adapters")
+            .join(&resolved.adapter.domain),
+        &format!("install_root={}\n", install_root.display()),
+    )?;
+    let binary_path = binary_source
+        .is_file()
+        .then(|| home.join(".local/bin").join(&resolved.platform.binary));
+    write_installation_receipt(
+        install_root,
+        resolved,
+        binary_path.as_deref(),
+        &resource_targets,
+    )?;
+    transaction.commit()?;
+    let _ = fs::remove_dir_all(&temp);
+    Ok(())
+}
+
+fn write_installation_receipt(
+    install_root: &Path,
+    resolved: &crate::release_index::ResolvedAdapterRelease<'_>,
+    binary_path: Option<&Path>,
+    resources: &[PathBuf],
+) -> anyhow::Result<()> {
+    let installed_at_unix_seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("system clock is before Unix epoch")?
+        .as_secs();
+    let receipt = crate::release_index::InstallationReceipt {
+        schema_version: 1,
+        domain: resolved.adapter.domain.clone(),
+        version: resolved.version.to_string(),
+        source_url: resolved.platform.asset_url.clone(),
+        sha256: resolved.platform.sha256.clone(),
+        signing_key_id: resolved.platform.signing_key_id.clone(),
+        core_compatibility: resolved.release.core_compatibility.clone(),
+        platform: resolved.platform.platform.clone(),
+        resource_manifest: resolved.platform.resource_manifest.clone(),
+        installed_at_unix_seconds,
+        bundle_sha256: digest_bundle(install_root)?,
+        binary_path: binary_path.map(|path| path.display().to_string()),
+        binary_sha256: binary_path.map(digest_path).transpose()?,
+        owned_resources: resources
+            .iter()
+            .map(|path| {
+                Ok(crate::release_index::OwnedResource {
+                    path: path.display().to_string(),
+                    sha256: digest_path(path)?,
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?,
+    };
+    fs::write(
+        install_root.join("installation-receipt.json"),
+        format!("{}\n", serde_json::to_string_pretty(&receipt)?),
+    )?;
+    Ok(())
+}
+
+fn digest_path(path: &Path) -> anyhow::Result<String> {
+    use sha2::{Digest, Sha256};
+
+    if path.is_file() {
+        return Ok(format!("{:x}", Sha256::digest(fs::read(path)?)));
+    }
+    if !path.is_dir() {
+        bail!(
+            "cannot digest missing or unsupported path {}",
+            path.display()
+        );
+    }
+    let mut files = Vec::new();
+    collect_digest_files(path, path, &mut files)?;
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut hasher = Sha256::new();
+    for (relative, bytes) in files {
+        hasher.update(relative.as_bytes());
+        hasher.update([0]);
+        hasher.update(bytes);
+        hasher.update([0]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn digest_bundle(path: &Path) -> anyhow::Result<String> {
+    use sha2::{Digest, Sha256};
+
+    let mut files = Vec::new();
+    collect_digest_files(path, path, &mut files)?;
+    files.retain(|(relative, _)| relative != "installation-receipt.json");
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut hasher = Sha256::new();
+    for (relative, bytes) in files {
+        hasher.update(relative.as_bytes());
+        hasher.update([0]);
+        hasher.update(bytes);
+        hasher.update([0]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn collect_digest_files(
+    root: &Path,
+    current: &Path,
+    files: &mut Vec<(String, Vec<u8>)>,
+) -> anyhow::Result<()> {
+    for entry in fs::read_dir(current)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_digest_files(root, &path, files)?;
+        } else if path.is_file() {
+            files.push((
+                path.strip_prefix(root)?
+                    .to_string_lossy()
+                    .replace('\\', "/"),
+                fs::read(path)?,
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct InstallSnapshot {
+    target: PathBuf,
+    backup: PathBuf,
+    existed: bool,
+    was_dir: bool,
+}
+
+struct InstallTransaction {
+    backup_root: PathBuf,
+    snapshots: Vec<InstallSnapshot>,
+    committed: bool,
+}
+
+impl InstallTransaction {
+    fn new(backup_root: PathBuf) -> anyhow::Result<Self> {
+        fs::create_dir_all(&backup_root)?;
+        Ok(Self {
+            backup_root,
+            snapshots: Vec::new(),
+            committed: false,
+        })
+    }
+
+    fn snapshot(&mut self, target: &Path) -> anyhow::Result<()> {
+        if self
+            .snapshots
+            .iter()
+            .any(|snapshot| snapshot.target == target)
+        {
+            return Ok(());
+        }
+        let backup = self.backup_root.join(self.snapshots.len().to_string());
+        let existed = target.exists();
+        let was_dir = target.is_dir();
+        if existed {
+            if was_dir {
+                copy_dir_recursive(target, &backup)?;
+            } else {
+                if let Some(parent) = backup.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::copy(target, &backup)?;
+            }
+        }
+        self.snapshots.push(InstallSnapshot {
+            target: target.to_path_buf(),
+            backup,
+            existed,
+            was_dir,
+        });
+        Ok(())
+    }
+
+    fn commit(mut self) -> anyhow::Result<()> {
+        self.committed = true;
+        fs::remove_dir_all(&self.backup_root).or_else(|error| {
+            (error.kind() == io::ErrorKind::NotFound)
+                .then_some(())
+                .ok_or(error)
+        })?;
+        Ok(())
+    }
+
+    fn rollback(&self) -> anyhow::Result<()> {
+        for snapshot in self.snapshots.iter().rev() {
+            remove_path_if_exists(&snapshot.target)?;
+            if snapshot.existed {
+                if snapshot.was_dir {
+                    copy_dir_recursive(&snapshot.backup, &snapshot.target)?;
+                } else {
+                    if let Some(parent) = snapshot.target.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    fs::copy(&snapshot.backup, &snapshot.target)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for InstallTransaction {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = self.rollback();
+        }
+    }
+}
+
+fn remove_path_if_exists(path: &Path) -> anyhow::Result<()> {
+    if path.is_dir() {
+        fs::remove_dir_all(path)?;
+    } else if path.exists() {
+        fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+fn activate_bundle_atomically(extracted: &Path, install_root: &Path) -> anyhow::Result<()> {
+    let parent = install_root
+        .parent()
+        .context("install root has no parent")?;
+    fs::create_dir_all(parent)?;
+    let staging = parent.join(format!(
+        ".{}.staging-{}",
+        install_root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("adapter"),
+        std::process::id()
+    ));
+    remove_path_if_exists(&staging)?;
+    copy_dir_recursive(extracted, &staging)?;
+    remove_path_if_exists(install_root)?;
+    fs::rename(&staging, install_root).with_context(|| {
+        format!(
+            "failed to atomically activate adapter at {}",
+            install_root.display()
+        )
+    })
+}
+
+fn typed_harness_resource_plan(
+    bundle: &Path,
+    home: &Path,
+    manifest_path: &str,
+) -> anyhow::Result<Vec<(PathBuf, PathBuf)>> {
+    use crate::harness_config::HarnessResourceKind;
+    use crate::release_index::AdapterResourceKind;
+
+    let config = read_ldgr_harness_config(home).context(
+        "typed adapter resources require a valid ~/.ldgr/config.json; run `ldgr install` first",
+    )?;
+    let manifest = crate::release_index::parse_resource_manifest(
+        &fs::read_to_string(bundle.join(manifest_path)).with_context(|| {
+            format!("adapter bundle is missing resource manifest `{manifest_path}`")
+        })?,
+    )?;
+    let mut plan = Vec::<(PathBuf, PathBuf)>::new();
+    for resource in manifest.resources {
+        let source = bundle.join(&resource.source);
+        if !source.exists() {
+            bail!(
+                "adapter resource source does not exist: {}",
+                source.display()
+            );
+        }
+        let kind = match resource.kind {
+            AdapterResourceKind::Prompt => HarnessResourceKind::Prompt,
+            AdapterResourceKind::Skill => HarnessResourceKind::Skill,
+            AdapterResourceKind::Extension => HarnessResourceKind::Extension,
+            AdapterResourceKind::Command => HarnessResourceKind::Command,
+        };
+        for harness in resource.harnesses {
+            for root in config.harness_resource_paths(&harness, kind) {
+                let root = expand_home_path(home, root.to_string_lossy().as_ref());
+                let target = if matches!(
+                    kind,
+                    HarnessResourceKind::Extension | HarnessResourceKind::Command
+                ) && root.extension().is_some()
+                {
+                    root.parent().unwrap_or(&root).join(&resource.destination)
+                } else {
+                    root.join(&resource.destination)
+                };
+                if plan.iter().any(|(_, existing)| existing == &target) {
+                    bail!(
+                        "adapter resource destination collision: {}",
+                        target.display()
+                    );
+                }
+                plan.push((source.clone(), target));
+            }
+        }
+    }
+    Ok(plan)
+}
+
+fn install_typed_harness_resources(plan: &[(PathBuf, PathBuf)]) -> anyhow::Result<()> {
+    for (source, target) in plan {
+        if source.is_dir() {
+            copy_dir_recursive(source, target)?;
+        } else {
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::copy(source, target)?;
+        }
+        println!("├─ Harness resource {}", target.display());
+    }
     Ok(())
 }
 
@@ -392,8 +1058,8 @@ static AVAILABLE_ADAPTERS: &[AvailableAdapter] = &[
     },
     AvailableAdapter {
         slug: "programbench",
-        title: "Clean-room ProgramBench adapter",
-        source: "https://github.com/hydra-dynamix/ldgr-programbench git",
+        title: "ProgramBench historical reproduction adapter",
+        source: "hydra-dynamix/ldgr-releases release bundle / public git fallback",
         install: "ldgr adapter install programbench",
         workspace_package: None,
         git: Some(GitAdapterSource {
@@ -401,7 +1067,13 @@ static AVAILABLE_ADAPTERS: &[AvailableAdapter] = &[
             package: "ldgr-programbench",
             binary: "ldgr-programbench",
         }),
-        release: None,
+        release: Some(ReleaseAdapterSource {
+            repo: "hydra-dynamix/ldgr-releases",
+            tag_prefix: "programbench-v",
+            asset_prefix: "ldgr-programbench",
+            root_prefix: "ldgr-programbench",
+            binary: "ldgr-programbench",
+        }),
     },
     AvailableAdapter {
         slug: "code",
@@ -456,6 +1128,17 @@ const fn commercial_release(adapter: &'static str, binary: &'static str) -> Rele
 }
 
 pub(crate) fn print_available_adapter_catalog() {
+    if std::env::var_os(crate::release_index::ADAPTER_RELEASE_INDEX_ENV).is_some() {
+        match crate::release_index::load_configured_release_index() {
+            Ok(index) => {
+                print_release_index_catalog(&index);
+                return;
+            }
+            Err(error) => {
+                eprintln!("warning: {error:#}");
+            }
+        }
+    }
     println!("Available adapters:");
     for entry in available_adapter_catalog() {
         if entry.source.is_empty() {
@@ -465,6 +1148,22 @@ pub(crate) fn print_available_adapter_catalog() {
         }
         println!("    install: {}", entry.install);
         println!("    after install: ldgr {} --help", entry.slug);
+    }
+    println!("  installed adapters: ldgr adapter list");
+    println!("  adapter details: ldgr adapter show <slug>");
+}
+
+fn print_release_index_catalog(index: &crate::release_index::AdapterReleaseIndex) {
+    println!("Available adapters:");
+    for adapter in &index.adapters {
+        let source = adapter
+            .source_url
+            .as_deref()
+            .map(|source| format!(" [{source}]"))
+            .unwrap_or_default();
+        println!("  {} — {}{}", adapter.domain, adapter.title, source);
+        println!("    install: ldgr adapter install {}", adapter.domain);
+        println!("    after install: ldgr {} --help", adapter.domain);
     }
     println!("  installed adapters: ldgr adapter list");
     println!("  adapter details: ldgr adapter show <slug>");
@@ -809,38 +1508,59 @@ fn install_adapter_harness_assets(
     Ok(())
 }
 
-fn read_ldgr_harness_config(home: &Path) -> Option<serde_json::Value> {
+fn read_ldgr_harness_config(home: &Path) -> Option<crate::harness_config::HarnessConfig> {
     let text = fs::read_to_string(home.join(".ldgr/config.json")).ok()?;
-    serde_json::from_str(&text).ok()
+    crate::harness_config::parse_harness_config(&text).ok()
 }
 
-fn configured_prompt_dirs(home: &Path, config: &Option<serde_json::Value>) -> Vec<PathBuf> {
-    let mut dirs = configured_path_dirs(home, config, "prompt_paths");
+fn configured_prompt_dirs(
+    home: &Path,
+    config: &Option<crate::harness_config::HarnessConfig>,
+) -> Vec<PathBuf> {
+    let mut dirs = configured_path_dirs(
+        home,
+        config,
+        crate::harness_config::HarnessResourceKind::Prompt,
+    );
     if dirs.is_empty() {
         dirs.push(home.join(".ldgr/prompts"));
     }
     dedup_paths(dirs)
 }
 
-fn configured_skill_dirs(home: &Path, config: &Option<serde_json::Value>) -> Vec<PathBuf> {
-    let mut dirs = configured_path_dirs(home, config, "skill_paths");
+fn configured_skill_dirs(
+    home: &Path,
+    config: &Option<crate::harness_config::HarnessConfig>,
+) -> Vec<PathBuf> {
+    let mut dirs = configured_path_dirs(
+        home,
+        config,
+        crate::harness_config::HarnessResourceKind::Skill,
+    );
     if dirs.is_empty() {
         dirs.push(home.join(".pi/agent/skills"));
     }
     dedup_paths(dirs)
 }
 
-fn configured_extension_dirs(home: &Path, config: &Option<serde_json::Value>) -> Vec<PathBuf> {
-    let mut dirs = configured_path_dirs(home, config, "extension_paths")
-        .into_iter()
-        .map(|path| {
-            if path.extension().is_some() {
-                path.parent().map(Path::to_path_buf).unwrap_or(path)
-            } else {
-                path
-            }
-        })
-        .collect::<Vec<_>>();
+fn configured_extension_dirs(
+    home: &Path,
+    config: &Option<crate::harness_config::HarnessConfig>,
+) -> Vec<PathBuf> {
+    let mut dirs = configured_path_dirs(
+        home,
+        config,
+        crate::harness_config::HarnessResourceKind::Extension,
+    )
+    .into_iter()
+    .map(|path| {
+        if path.extension().is_some() {
+            path.parent().map(Path::to_path_buf).unwrap_or(path)
+        } else {
+            path
+        }
+    })
+    .collect::<Vec<_>>();
     if dirs.is_empty() {
         dirs.push(home.join(".pi/agent/extensions"));
     }
@@ -849,29 +1569,19 @@ fn configured_extension_dirs(home: &Path, config: &Option<serde_json::Value>) ->
 
 fn configured_path_dirs(
     home: &Path,
-    config: &Option<serde_json::Value>,
-    key: &str,
+    config: &Option<crate::harness_config::HarnessConfig>,
+    kind: crate::harness_config::HarnessResourceKind,
 ) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     if let Some(config) = config {
-        if let Some(installed) = config.get("installed").and_then(|value| value.as_array()) {
-            for harness in installed {
-                if let Some(paths) = harness.get(key).and_then(|value| value.as_array()) {
-                    dirs.extend(
-                        paths
-                            .iter()
-                            .filter_map(json_path)
-                            .map(|path| expand_home_path(home, path)),
-                    );
-                }
-            }
-        }
+        dirs.extend(
+            config
+                .resource_paths(kind)
+                .iter()
+                .map(|path| expand_home_path(home, path.to_string_lossy().as_ref())),
+        );
     }
     dirs
-}
-
-fn json_path(value: &serde_json::Value) -> Option<&str> {
-    value.as_str().filter(|value| !value.trim().is_empty())
 }
 
 fn expand_home_path(home: &Path, value: &str) -> PathBuf {
@@ -1376,10 +2086,10 @@ const CLAW_LDGR_COMMAND: &str = r#"Run `ldgr $ARGUMENTS` in the current project 
 
 pub fn handle_status(
     connection: &rusqlite::Connection,
-    artifact_root: &Path,
+    _artifact_root: &Path,
     args: StatusArgs,
 ) -> anyhow::Result<()> {
-    let context = read_context_with_conduct_lifecycle(connection, artifact_root)?;
+    let context = read_context(connection)?;
     let brief = brief_context(&context, brief_options(args.recent, args.width));
     emit(args.json, &brief, print_brief_context)?;
     if !args.json {
@@ -1390,16 +2100,21 @@ pub fn handle_status(
 
 pub fn handle_context(
     connection: &rusqlite::Connection,
-    artifact_root: &Path,
+    _artifact_root: &Path,
     args: ContextArgs,
 ) -> anyhow::Result<()> {
-    let context = read_context_with_conduct_lifecycle(connection, artifact_root)?;
+    let context = read_context(connection)?;
     if args.brief {
         let brief = brief_context(&context, brief_options(args.recent, args.width));
         return emit(args.json, &brief, print_brief_context);
     }
-    emit(args.json, &context, print_context)?;
-    if !args.json {
+    if args.json {
+        let mut value = serde_json::to_value(&context)?;
+        value["installed_adapter_namespaces"] =
+            serde_json::to_value(AdapterRegistry::discover().installed_domains())?;
+        println!("{}", serde_json::to_string_pretty(&value)?);
+    } else {
+        print_context(&context);
         print_installed_adapter_summary();
     }
     Ok(())
@@ -1412,25 +2127,14 @@ fn print_installed_adapter_summary() {
     }
     println!();
     println!("installed_adapters:");
-    for adapter in registry.adapters {
-        let namespaces = adapter
-            .command_namespaces
-            .iter()
-            .map(|command| format!("ldgr {}", command.namespace))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let profiles = adapter
-            .target_profiles
-            .iter()
-            .map(|profile| profile.slug.clone())
-            .collect::<Vec<_>>()
-            .join(", ");
-        println!("- {} ({})", adapter.slug, adapter.title);
-        if !namespaces.is_empty() {
-            println!("  commands: {namespaces}");
-        }
-        if !profiles.is_empty() {
-            println!("  profiles: {profiles}");
+    for domain in registry.installed_domains() {
+        println!(
+            "- adapter={} namespace={} command={}",
+            domain.adapter, domain.namespace, domain.command
+        );
+        println!("  instruction: {}", domain.instruction);
+        if let Some(status_command) = &domain.status_command {
+            println!("  status_command: {status_command}");
         }
     }
 }
