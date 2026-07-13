@@ -32,6 +32,8 @@ use super::super::{CLI_DEFAULT_HELP_SECTIONS, INIT_PROJECT_SETUP_PROMPT};
 const LDGR_CONTEXT_EXTENSION: &str = include_str!("../../../extensions/ldgr-context.ts");
 const LDGR_CORE_LOOP_PROMPT: &str = include_str!("../../../prompts/loop-prompt.md");
 const LDGR_CORE_LOOP_PROMPT_FILE: &str = "ldgr-core-loop.md";
+const LDGR_RELEASE_KEYRING: &str = include_str!("../../../release-keyring.json");
+const LDGR_RELEASE_KEYRING_FILE: &str = "release-keyring.json";
 const AGENTCTL_REPO: &str = "https://github.com/hydra-dynamix/agentctl";
 
 pub fn handle_init(db: &Path, artifact_root: &Path) -> anyhow::Result<()> {
@@ -73,6 +75,8 @@ pub fn handle_install(args: InstallArgs) -> anyhow::Result<()> {
     let home = home_dir()?;
     let ldgr_home = home.join(".ldgr");
     fs::create_dir_all(&ldgr_home)?;
+    let release_keyring = ldgr_home.join(LDGR_RELEASE_KEYRING_FILE);
+    fs::write(&release_keyring, LDGR_RELEASE_KEYRING)?;
 
     println!("◇ Installing LDGR harness files...");
     let prompt_root = ldgr_home.join("prompts");
@@ -95,6 +99,7 @@ pub fn handle_install(args: InstallArgs) -> anyhow::Result<()> {
         "agentctl": agentctl,
         "agentctl_config": agentctl_config,
         "core_loop_prompt": core_loop_prompt,
+        "adapter_release_keyring": release_keyring,
         "adapter_files": {
             "default_global_path": "~/.ldgr/adapters/<adapter>",
             "note": "Adapter bundle files install globally under ~/.ldgr/adapters/<adapter>; adapter-owned prompts, skills, commands, and extensions install into paths declared by the configured harness entries."
@@ -181,9 +186,7 @@ pub(crate) fn handle_interactive_adapter_install(
 }
 
 pub(crate) fn handle_install_adapter(args: &InstallAdapterArgs) -> anyhow::Result<()> {
-    if args.source_root.is_none()
-        && std::env::var_os(crate::release_index::ADAPTER_RELEASE_INDEX_ENV).is_some()
-    {
+    if args.source_root.is_none() {
         return install_adapter_from_configured_index(args);
     }
     let adapter = resolve_adapter_install_name(&args.name, args.yes)?;
@@ -496,11 +499,7 @@ fn install_resolved_index_release(
             .arg(&signature),
         "download indexed adapter signature",
     )?;
-    let keyring = std::env::var_os(crate::release_index::ADAPTER_RELEASE_KEYRING_ENV)
-        .map(PathBuf::from)
-        .context(
-            "LDGR_ADAPTER_RELEASE_KEYRING must point to the trusted offline release keyring",
-        )?;
+    let keyring = configured_release_keyring(home)?;
     crate::release_index::verify_detached_release_signature(
         &archive,
         &signature,
@@ -571,6 +570,20 @@ fn install_resolved_index_release(
     transaction.commit()?;
     let _ = fs::remove_dir_all(&temp);
     Ok(())
+}
+
+fn configured_release_keyring(home: &Path) -> anyhow::Result<PathBuf> {
+    let keyring = std::env::var_os(crate::release_index::ADAPTER_RELEASE_KEYRING_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".ldgr").join(LDGR_RELEASE_KEYRING_FILE));
+    if !keyring.is_file() {
+        bail!(
+            "trusted adapter release keyring not found at {}; run `ldgr install` first or set {}",
+            keyring.display(),
+            crate::release_index::ADAPTER_RELEASE_KEYRING_ENV
+        );
+    }
+    Ok(keyring)
 }
 
 fn write_installation_receipt(
