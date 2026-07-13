@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-07-13
+
+### Changed
+
+- Report work with no structured dependency edges as `dependencies: none declared` instead of implying that prose dependencies were satisfied.
+- Keep `ldgr status --full` focused on global history without repeating adapter, handoff, and next-command sections, and report idle loop state as idle rather than running.
+
+### Fixed
+
+- Fall back to the built-in release/Git installer for ordinary online adapter installs when the default release index is unavailable, while keeping explicit, offline, version-pinned, and prerelease index requests fail-closed.
+- Allow Code, Security, Explore, and Bench adapters to recover from a local workspace with `ldgr adapter install <adapter> --source-root <workspace>`.
+
 ## [0.1.5] - 2026-07-13
 
 ### Added

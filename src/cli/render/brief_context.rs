@@ -109,6 +109,17 @@ pub(crate) fn brief_context(context: &StoreContext, options: BriefContextOptions
     let handoff = brief_handoff(context);
     let registry = AdapterRegistry::discover();
     let installed_adapter_namespaces = installed_adapter_namespaces(&registry);
+    let loop_status = context
+        .loop_state
+        .terminal_status
+        .map(|status| status.as_str().to_owned())
+        .unwrap_or_else(|| {
+            if context.loop_state.current_phase == "idle" {
+                "idle".to_owned()
+            } else {
+                "running".to_owned()
+            }
+        });
     BriefContext {
         work_items: BriefWorkCounts {
             pending: context.pending_work_items,
@@ -133,11 +144,7 @@ pub(crate) fn brief_context(context: &StoreContext, options: BriefContextOptions
                 .work_slug
                 .clone()
                 .unwrap_or_else(|| "none".to_owned()),
-            status: context
-                .loop_state
-                .terminal_status
-                .map(|status| status.as_str().to_owned())
-                .unwrap_or_else(|| "running".to_owned()),
+            status: loop_status,
             progress: compact_text(&context.loop_state.progress_report, options.width),
         },
         active_runs: context

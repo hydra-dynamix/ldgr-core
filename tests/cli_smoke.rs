@@ -4024,6 +4024,18 @@ fn structured_dependencies_gate_readiness_and_reject_cycles() -> anyhow::Result<
     let db_path = project.path().join(".ldgr/ldgr.db");
     let artifact_root = project.path().join(".ldgr/artifacts");
     run(project.path(), &db_path, &artifact_root, ["init"])?;
+    command(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        ["status", "--full"],
+    )?
+    .assert()
+    .success()
+    .stdout(predicate::str::contains(
+        "loop: phase=idle run=none work=none status=idle",
+    ))
+    .stdout(predicate::str::contains("loop: phase=idle run=none work=none status=running").not());
     run(
         project.path(),
         &db_path,
@@ -4074,6 +4086,7 @@ fn structured_dependencies_gate_readiness_and_reject_cycles() -> anyhow::Result<
     .assert()
     .success()
     .stdout(predicate::str::contains("next: registry [P1]"))
+    .stdout(predicate::str::contains("dependencies: none declared"))
     .stdout(predicate::str::contains("queue: P0=1 P1=1"))
     .stdout(predicate::str::contains("unblocks: atomicity"));
     command(
@@ -4248,16 +4261,26 @@ fn status_scopes_history_and_hides_stale_terminal_loop_when_new_work_exists() ->
         .stdout(predicate::str::contains("next: new-audit [P0]"))
         .stdout(predicate::str::contains("phase=completed").not())
         .stdout(predicate::str::contains("stale packaging observation").not());
-    command(
+    let full_output = command(
         project.path(),
         &db_path,
         &artifact_root,
         ["status", "--full"],
     )?
-    .assert()
-    .success()
-    .stdout(predicate::str::contains("global_history:"))
-    .stdout(predicate::str::contains("stale packaging observation"));
+    .output()?;
+    assert!(full_output.status.success());
+    let full_stdout = String::from_utf8(full_output.stdout)?;
+    assert!(full_stdout.contains("global_history:"), "{full_stdout}");
+    assert!(
+        full_stdout.contains("stale packaging observation"),
+        "{full_stdout}"
+    );
+    assert_eq!(full_stdout.matches("handoff:").count(), 1, "{full_stdout}");
+    assert_eq!(
+        full_stdout.matches("next_commands:").count(),
+        1,
+        "{full_stdout}"
+    );
     Ok(())
 }
 

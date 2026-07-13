@@ -187,9 +187,39 @@ pub(crate) fn handle_interactive_adapter_install(
 }
 
 pub(crate) fn handle_install_adapter(args: &InstallAdapterArgs) -> anyhow::Result<()> {
-    if args.source_root.is_none() {
-        return install_adapter_from_configured_index(args);
+    if args.source_root.is_some() {
+        return install_adapter_from_catalog(args);
     }
+
+    let configured_source = std::env::var(crate::release_index::ADAPTER_RELEASE_INDEX_ENV).ok();
+    let source = configured_source
+        .as_deref()
+        .unwrap_or(crate::release_index::DEFAULT_ADAPTER_RELEASE_INDEX_URL);
+    if args.offline && source.starts_with("http") {
+        bail!("--offline requires LDGR_ADAPTER_INDEX to reference a local file");
+    }
+    match crate::release_index::load_release_index(source) {
+        Ok(index) => install_adapter_from_index(args, &index),
+        Err(index_error) if default_catalog_fallback_allowed(args, configured_source.is_some()) => {
+            eprintln!(
+                "warning: {index_error:#}; falling back to the built-in release/git installer for `{}`",
+                args.name
+            );
+            install_adapter_from_catalog(args).with_context(|| {
+                format!(
+                    "built-in adapter fallback also failed after release index {source} was unavailable"
+                )
+            })
+        }
+        Err(index_error) => Err(index_error),
+    }
+}
+
+fn default_catalog_fallback_allowed(args: &InstallAdapterArgs, index_is_explicit: bool) -> bool {
+    !index_is_explicit && !args.offline && args.version.is_none() && !args.prerelease
+}
+
+fn install_adapter_from_catalog(args: &InstallAdapterArgs) -> anyhow::Result<()> {
     let adapter = resolve_adapter_install_name(&args.name, args.yes)?;
     let Some(entry) = available_adapter_catalog()
         .iter()
@@ -410,14 +440,21 @@ fn reconcile_installed_adapters(home: &Path, requested: Option<&str>) -> anyhow:
 }
 
 fn install_adapter_from_configured_index(args: &InstallAdapterArgs) -> anyhow::Result<()> {
-    use semver::Version;
-
     let configured_source = std::env::var(crate::release_index::ADAPTER_RELEASE_INDEX_ENV)
         .unwrap_or_else(|_| crate::release_index::DEFAULT_ADAPTER_RELEASE_INDEX_URL.to_owned());
     if args.offline && configured_source.starts_with("http") {
         bail!("--offline requires LDGR_ADAPTER_INDEX to reference a local file");
     }
     let index = crate::release_index::load_release_index(&configured_source)?;
+    install_adapter_from_index(args, &index)
+}
+
+fn install_adapter_from_index(
+    args: &InstallAdapterArgs,
+    index: &crate::release_index::AdapterReleaseIndex,
+) -> anyhow::Result<()> {
+    use semver::Version;
+
     let requested = normalize_adapter_name(&args.name);
     let adapter = index
         .adapters
@@ -440,7 +477,7 @@ fn install_adapter_from_configured_index(args: &InstallAdapterArgs) -> anyhow::R
     let core = Version::parse(env!("CARGO_PKG_VERSION"))?;
     let platform = platform_tag()?;
     let resolved = crate::release_index::resolve_release(
-        &index,
+        index,
         &adapter.domain,
         &core,
         &platform,
@@ -1104,7 +1141,7 @@ static AVAILABLE_ADAPTERS: &[AvailableAdapter] = &[
         title: "Coding adapter",
         source: "",
         install: "ldgr adapter install code",
-        workspace_package: None,
+        workspace_package: Some("ldgr-code"),
         git: None,
         release: Some(commercial_release("code", "ldgr-code")),
     },
@@ -1113,7 +1150,7 @@ static AVAILABLE_ADAPTERS: &[AvailableAdapter] = &[
         title: "Security adapter",
         source: "",
         install: "ldgr adapter install security",
-        workspace_package: None,
+        workspace_package: Some("ldgr-security"),
         git: None,
         release: Some(commercial_release("security", "ldgr-security")),
     },
@@ -1122,7 +1159,7 @@ static AVAILABLE_ADAPTERS: &[AvailableAdapter] = &[
         title: "Explore adapter",
         source: "",
         install: "ldgr adapter install explore",
-        workspace_package: None,
+        workspace_package: Some("ldgr-explore"),
         git: None,
         release: Some(commercial_release("explore", "ldgr-explore")),
     },
@@ -1131,7 +1168,7 @@ static AVAILABLE_ADAPTERS: &[AvailableAdapter] = &[
         title: "Bench adapter",
         source: "",
         install: "ldgr adapter install bench",
-        workspace_package: None,
+        workspace_package: Some("ldgr-bench"),
         git: None,
         release: Some(commercial_release("bench", "ldgr-bench")),
     },
@@ -2156,9 +2193,6 @@ pub fn handle_status(
         args.full,
     )?;
     emit(args.json, &status, print_status_summary)?;
-    if !args.json && args.full {
-        print_installed_adapter_summary();
-    }
     Ok(())
 }
 
@@ -2525,6 +2559,50 @@ mod tests {
             ]
         );
         assert!(!args.iter().any(|arg| arg == "--package"));
+    }
+
+    #[test]
+    fn default_index_failure_falls_back_only_for_unconstrained_online_installs() {
+        let make_args = || InstallAdapterArgs {
+            name: "research".to_string(),
+            source_root: None,
+            install_root: None,
+            version: None,
+            prerelease: false,
+            offline: false,
+            yes: true,
+        };
+        let base = make_args();
+        assert!(default_catalog_fallback_allowed(&base, false));
+        assert!(!default_catalog_fallback_allowed(&base, true));
+
+        let mut offline = make_args();
+        offline.offline = true;
+        assert!(!default_catalog_fallback_allowed(&offline, false));
+
+        let mut exact = make_args();
+        exact.version = Some("0.1.4".to_string());
+        assert!(!default_catalog_fallback_allowed(&exact, false));
+
+        let mut prerelease = make_args();
+        prerelease.prerelease = true;
+        assert!(!default_catalog_fallback_allowed(&prerelease, false));
+    }
+
+    #[test]
+    fn workspace_adapters_expose_source_root_recovery_packages() {
+        for (slug, package) in [
+            ("code", "ldgr-code"),
+            ("security", "ldgr-security"),
+            ("explore", "ldgr-explore"),
+            ("bench", "ldgr-bench"),
+        ] {
+            let adapter = available_adapter_catalog()
+                .iter()
+                .find(|adapter| adapter.slug == slug)
+                .expect("adapter is catalogued");
+            assert_eq!(adapter.workspace_package, Some(package));
+        }
     }
 
     #[test]

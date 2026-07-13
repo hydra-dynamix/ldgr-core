@@ -11,8 +11,8 @@ use crate::store::{
 };
 
 use super::brief_context::{
-    brief_context, print_brief_context, BriefActiveRun, BriefAdapterNamespace, BriefContext,
-    BriefContextOptions, BriefHandoff, BriefLoopState,
+    brief_context, BriefActiveRun, BriefAdapterNamespace, BriefContext, BriefContextOptions,
+    BriefDecision, BriefHandoff, BriefLoopState, BriefObservation, BriefValidation,
 };
 
 #[derive(Debug, Clone, Serialize)]
@@ -37,7 +37,16 @@ pub(crate) struct StatusSummary {
     pub brief_context_command: String,
     pub full_context_command: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub global_history: Option<BriefContext>,
+    pub global_history: Option<StatusGlobalHistory>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct StatusGlobalHistory {
+    pub loop_state: BriefLoopState,
+    pub active_runs: Vec<BriefActiveRun>,
+    pub latest_decision: Option<BriefDecision>,
+    pub latest_observations: Vec<BriefObservation>,
+    pub latest_validations: Vec<BriefValidation>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -128,7 +137,13 @@ pub(crate) fn build_status_summary(
             width: width.clamp(40, 2000),
         },
     );
-    let global_history = full.then(|| brief.clone());
+    let global_history = full.then(|| StatusGlobalHistory {
+        loop_state: brief.loop_state.clone(),
+        active_runs: brief.active_runs.clone(),
+        latest_decision: brief.latest_decision.clone(),
+        latest_observations: brief.latest_observations.clone(),
+        latest_validations: brief.latest_validations.clone(),
+    });
     let filtered = program.is_some() || priority.is_some();
     let handoff = if filtered {
         BriefHandoff {
@@ -213,7 +228,7 @@ fn filtered_loop_state(
         phase: "idle".to_owned(),
         run: "none".to_owned(),
         work: "none".to_owned(),
-        status: "running".to_owned(),
+        status: "idle".to_owned(),
         progress,
     }
 }
@@ -362,7 +377,9 @@ pub(crate) fn print_status_summary(summary: &StatusSummary) {
         println!("ready: {}", if next.ready { "yes" } else { "no" });
         println!(
             "dependencies: {}",
-            if next.ready {
+            if next.dependencies.is_empty() {
+                "none declared".to_owned()
+            } else if next.blocked_by.is_empty() {
                 "satisfied".to_owned()
             } else {
                 "unsatisfied".to_owned()
@@ -415,11 +432,64 @@ pub(crate) fn print_status_summary(summary: &StatusSummary) {
     if let Some(global_history) = &summary.global_history {
         println!();
         println!("global_history:");
-        print_brief_context(global_history);
+        print_global_history(global_history);
     } else {
         println!("full_status: ldgr status --full");
     }
     print_operational_handoff(summary);
+}
+
+fn print_global_history(history: &StatusGlobalHistory) {
+    println!(
+        "loop: phase={} run={} work={} status={}",
+        history.loop_state.phase,
+        history.loop_state.run,
+        history.loop_state.work,
+        history.loop_state.status
+    );
+    println!("progress: {}", history.loop_state.progress);
+    if !history.active_runs.is_empty() {
+        println!("active_runs:");
+        for run in &history.active_runs {
+            println!("- run={} work={} title={}", run.run, run.work, run.title);
+            if let Some(command) = &run.command {
+                println!("  command: {command}");
+            }
+        }
+    }
+    if let Some(decision) = &history.latest_decision {
+        println!(
+            "latest_decision: work={} outcome={} rationale={}",
+            decision.work, decision.outcome, decision.rationale
+        );
+        if let Some(next_work) = &decision.next_work {
+            println!("  next_work: {next_work}");
+        }
+    }
+    if !history.latest_observations.is_empty() {
+        println!("latest_observations:");
+        for observation in &history.latest_observations {
+            println!(
+                "- run={} work={} body={}",
+                observation.run, observation.work, observation.body
+            );
+        }
+    }
+    if !history.latest_validations.is_empty() {
+        println!("latest_validations:");
+        for validation in &history.latest_validations {
+            println!(
+                "- run={} work={} outcome={}",
+                validation.run, validation.work, validation.outcome
+            );
+            if let Some(command) = &validation.command {
+                println!("  command: {command}");
+            }
+            if let Some(rationale) = &validation.rationale {
+                println!("  rationale: {rationale}");
+            }
+        }
+    }
 }
 
 fn print_scoped_history(summary: &StatusSummary, scope: &str) {
