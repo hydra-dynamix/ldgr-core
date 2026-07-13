@@ -4086,7 +4086,7 @@ fn structured_dependencies_gate_readiness_and_reject_cycles() -> anyhow::Result<
     .assert()
     .success()
     .stdout(predicate::str::contains("next: registry [P1]"))
-    .stdout(predicate::str::contains("dependencies: none declared"))
+    .stdout(predicate::str::contains("next_dependencies: none declared"))
     .stdout(predicate::str::contains("queue: P0=1 P1=1"))
     .stdout(predicate::str::contains("unblocks: atomicity"));
     command(
