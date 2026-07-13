@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-07-13
+
+### Added
+
+- Add structured work-item priority, program, group, acceptance criteria, hold classification, and dependency fields.
+- Enforce an acyclic dependency graph and prevent manual or autonomous runs from claiming work with unfinished prerequisites.
+- Add transactional JSON schedule import and portable schedule export for bulk queue creation and backup.
+- Add actionable status filters, priority/program queue summaries, held-reason grouping, readiness, blockers, and downstream-unblock context.
+
+### Changed
+
+- Migrate released schema-v1 ledgers transactionally to schema v2 while preserving existing ledger data.
+- Scope default status observations, validations, and decisions to the running or next item; move global history and stale terminal loop detail behind `ldgr status --full`.
+
+### Fixed
+
+- Reject and roll back adapter releases whose manifest requires an executable that is absent from the archive, preventing a successful-looking `code` install with no `ldgr-code` command.
+
 ## [0.1.4] - 2026-07-06
 
 ### Changed

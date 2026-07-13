@@ -32,6 +32,24 @@ pub(crate) fn print_work_item(work_item: &WorkItem) {
     }
     println!("title: {}", work_item.title);
     println!("description: {}", work_item.description);
+    if let Some(priority) = &work_item.priority {
+        println!("priority: {priority}");
+    }
+    if let Some(program) = &work_item.program {
+        println!("program: {program}");
+    }
+    if let Some(group) = &work_item.group {
+        println!("group: {group}");
+    }
+    if let Some(criteria) = &work_item.acceptance_criteria {
+        println!("acceptance_criteria: {criteria}");
+    }
+    if let Some(kind) = work_item.hold_kind {
+        println!("hold_kind: {}", kind.as_str());
+    }
+    if let Some(reason) = &work_item.hold_reason {
+        println!("hold_reason: {reason}");
+    }
     println!("created_at: {}", work_item.created_at);
     println!("updated_at: {}", work_item.updated_at);
 }

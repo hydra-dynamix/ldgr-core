@@ -32,7 +32,7 @@ verifies its SHA-256 checksum when checksum tooling is available, and installs
 `ldgr` to `~/.local/bin` by default. Override with:
 
 ```sh
-LDGR_VERSION=0.1.4 LDGR_INSTALL_DIR="$HOME/bin" sh -c "$(curl -fsSL https://raw.githubusercontent.com/hydra-dynamix/ldgr-core/main/scripts/install.sh)"
+LDGR_VERSION=0.1.5 LDGR_INSTALL_DIR="$HOME/bin" sh -c "$(curl -fsSL https://raw.githubusercontent.com/hydra-dynamix/ldgr-core/main/scripts/install.sh)"
 ```
 
 Source install remains available:
@@ -77,6 +77,36 @@ recommended closure path for active runs because it records the terminal run
 status and work decision together.
 
 Use `ldgr --help` or `ldgr <command> --help` to explore the command surface.
+
+## Structured queues and portable schedules
+
+Work items can carry priority, program, group, acceptance criteria, and enforced
+dependencies. Dependencies form an acyclic graph: an item is not ready and
+cannot be started until every prerequisite is done.
+
+```sh
+ldgr work create registry --title "Registry" --description "Build it." \
+  --priority P0 --program audit --group accounts
+ldgr work create atomicity --title "Atomicity audit" --description "Audit updates." \
+  --priority P0 --program audit --group accounts \
+  --acceptance-criteria "Concurrent update test passes." \
+  --depends-on registry
+ldgr status --program audit --priority P0
+```
+
+Use a JSON schedule to create or back up a large queue in one command. Imports
+are transactional, and `--upsert` updates matching slugs.
+
+```sh
+ldgr work export --output .ldgr/schedule-backup.json
+ldgr work import schedule.json
+ldgr work import schedule.json --upsert
+```
+
+The portable format is `ldgr.schedule.v1`; exported records include lifecycle
+status, structured metadata, hold classification, and dependency slugs. The
+SQLite ledger remains the source of truth for run history and evidence, while
+the schedule export is suitable for versioned queue backup.
 
 ## The autonomous loop
 
@@ -202,7 +232,8 @@ State lives in `.ldgr/` inside the project where you run `ldgr`:
 
 The ledger is local-first and survives restarts, crashes, and context resets.
 You can inspect the current handoff at any time with `ldgr status` or
-`ldgr context`.
+`ldgr context`. Released schema-v1 ledgers migrate transactionally to schema v2
+when first opened; existing work, runs, evidence, and decisions are preserved.
 
 ## License
 

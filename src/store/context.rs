@@ -540,6 +540,30 @@ fn read_loop_state(connection: &Connection) -> anyhow::Result<LoopStateSummary> 
         });
     };
 
+    if run.status != RunStatus::Running
+        && run.work_status != WorkItemStatus::Running
+        && next_work_item
+            .as_ref()
+            .is_some_and(|next| next.slug != run.work_slug)
+    {
+        let next_slug = next_work_item
+            .as_ref()
+            .map(|item| item.slug.as_str())
+            .unwrap_or("unknown");
+        return Ok(LoopStateSummary {
+            run_id: None,
+            work_slug: None,
+            work_title: None,
+            current_phase: "idle".to_owned(),
+            progress_report: format!("Work is available; next ready item is {next_slug}."),
+            command: None,
+            started_at: None,
+            finished_at: None,
+            terminal_status: None,
+            recent_cycle_narrative: Vec::new(),
+        });
+    }
+
     let latest_event = latest_run_lifecycle_event(connection, run.run_id)?;
     let (current_phase, progress_report) = if run.status != RunStatus::Running
         && run.work_status == WorkItemStatus::Running

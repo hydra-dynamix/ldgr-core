@@ -60,6 +60,8 @@ pub(crate) const CLI_FULL_HELP_SECTIONS: &str = r#"Core command tree:
     show
     create
     edit
+    import
+    export
     status
       set
     delete

@@ -91,11 +91,23 @@ pub struct ContextArgs {
 
 #[derive(Debug, Args)]
 #[command(
-    after_help = "Examples:\n  ldgr status\n  ldgr status --json\n\nStatus is read-only. To change work state, use `ldgr work status set <work> <status>`."
+    after_help = "Examples:\n  ldgr status\n  ldgr status --program audit --priority P0\n  ldgr status --full\n  ldgr status --json\n\nStatus is read-only. Default output is scoped to actionable work; --full includes global history. To change work state, use `ldgr work status set <work> <status>`."
 )]
 pub struct StatusArgs {
     #[arg(long)]
     pub json: bool,
+
+    /// Include global history, the last loop terminal state, and full next-item text.
+    #[arg(long)]
+    pub full: bool,
+
+    /// Limit queue and next-item selection to one program.
+    #[arg(long)]
+    pub program: Option<String>,
+
+    /// Limit queue and next-item selection to one priority (for example P0).
+    #[arg(long)]
+    pub priority: Option<String>,
 
     /// Number of recent records to include in the status summary.
     #[arg(long, default_value_t = 3)]

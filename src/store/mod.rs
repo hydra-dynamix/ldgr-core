@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context};
 use rusqlite::{params, Connection, OptionalExtension, Row};
-use serde::{Serialize, Serializer};
+use serde::{Deserialize, Serialize, Serializer};
 use thiserror::Error;
 
 mod context;

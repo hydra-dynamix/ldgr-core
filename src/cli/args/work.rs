@@ -1,6 +1,8 @@
+use std::path::PathBuf;
+
 use clap::{Args, Subcommand, ValueEnum};
 
-use crate::store::{GlobalObservationKind, GlobalObservationStatus, WorkItemStatus};
+use crate::store::{GlobalObservationKind, GlobalObservationStatus, HoldKind, WorkItemStatus};
 
 const WORK_HELP: &str = "Examples:\n  ldgr work create fix-login --title \"Fix login\" --description \"Repair token refresh.\"\n  ldgr work edit fix-login --description \"Repair refresh and add regression coverage.\"\n  ldgr work status set fix-login held --reason \"Waiting for dependency.\"\n\nUse work status set for lifecycle changes; use work edit only for title/description corrections.";
 
@@ -37,12 +39,22 @@ pub enum WorkCommand {
     Status(WorkStatusArgs),
     /// Remove a work item and its dependent records.
     Delete(DeleteWorkArgs),
+    /// Import many work items and dependencies from a JSON schedule.
+    Import(ImportWorkArgs),
+    /// Export the durable schedule as portable JSON.
+    Export(ExportWorkArgs),
 }
 
 #[derive(Debug, Args)]
 pub struct ListWorkArgs {
     #[arg(long, value_enum)]
     pub status: Option<CliWorkItemStatus>,
+
+    #[arg(long)]
+    pub program: Option<String>,
+
+    #[arg(long)]
+    pub priority: Option<String>,
 
     #[arg(long)]
     pub json: bool,
@@ -65,6 +77,21 @@ pub struct CreateWorkArgs {
 
     #[arg(long)]
     pub description: String,
+
+    #[arg(long)]
+    pub priority: Option<String>,
+
+    #[arg(long)]
+    pub program: Option<String>,
+
+    #[arg(long = "group")]
+    pub group: Option<String>,
+
+    #[arg(long)]
+    pub acceptance_criteria: Option<String>,
+
+    #[arg(long = "depends-on", value_delimiter = ',')]
+    pub dependencies: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -76,6 +103,40 @@ pub struct EditWorkArgs {
 
     #[arg(long)]
     pub description: Option<String>,
+
+    #[arg(long, conflicts_with = "clear_priority")]
+    pub priority: Option<String>,
+
+    #[arg(long)]
+    pub clear_priority: bool,
+
+    #[arg(long, conflicts_with = "clear_program")]
+    pub program: Option<String>,
+
+    #[arg(long)]
+    pub clear_program: bool,
+
+    #[arg(long = "group", conflicts_with = "clear_group")]
+    pub group: Option<String>,
+
+    #[arg(long)]
+    pub clear_group: bool,
+
+    #[arg(long, conflicts_with = "clear_acceptance_criteria")]
+    pub acceptance_criteria: Option<String>,
+
+    #[arg(long)]
+    pub clear_acceptance_criteria: bool,
+
+    #[arg(
+        long = "depends-on",
+        value_delimiter = ',',
+        conflicts_with = "clear_dependencies"
+    )]
+    pub dependencies: Vec<String>,
+
+    #[arg(long)]
+    pub clear_dependencies: bool,
 }
 
 #[derive(Debug, Args)]
@@ -102,11 +163,55 @@ pub struct SetWorkStatusArgs {
 
     #[arg(long)]
     pub reason: Option<String>,
+
+    /// Classify held work as blocked, deferred, or awaiting external validation.
+    #[arg(long, value_enum)]
+    pub hold_kind: Option<CliHoldKind>,
 }
 
 #[derive(Debug, Args)]
 pub struct DeleteWorkArgs {
     pub slug: String,
+}
+
+#[derive(Debug, Args)]
+pub struct ImportWorkArgs {
+    /// JSON schedule path, or - to read from stdin.
+    pub path: String,
+
+    /// Update matching slugs instead of rejecting them.
+    #[arg(long)]
+    pub upsert: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ExportWorkArgs {
+    /// Write JSON to this path instead of stdout.
+    #[arg(long)]
+    pub output: Option<PathBuf>,
+
+    #[arg(long)]
+    pub program: Option<String>,
+
+    #[arg(long)]
+    pub priority: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum CliHoldKind {
+    Blocked,
+    Deferred,
+    ExternalValidation,
+}
+
+impl From<CliHoldKind> for HoldKind {
+    fn from(kind: CliHoldKind) -> Self {
+        match kind {
+            CliHoldKind::Blocked => Self::Blocked,
+            CliHoldKind::Deferred => Self::Deferred,
+            CliHoldKind::ExternalValidation => Self::ExternalValidation,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]

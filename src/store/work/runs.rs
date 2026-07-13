@@ -9,6 +9,13 @@ pub fn start_run(
             let work_item = require_work_item_by_slug(connection, work_slug)?;
             match work_item.status {
                 WorkItemStatus::Pending => {
+                    let readiness = work_readiness(connection, work_slug)?;
+                    if !readiness.blocked_by.is_empty() {
+                        bail!(
+                            "work item {work_slug} is blocked by: {}",
+                            readiness.blocked_by.join(", ")
+                        );
+                    }
                     bail!("work item {work_slug} could not be claimed for a run")
                 }
                 WorkItemStatus::Running => {
@@ -35,7 +42,19 @@ pub fn claim_next_pending_run(
                      SELECT id
                      FROM work_item
                      WHERE status = 'pending'
-                     ORDER BY created_at, id
+                       AND NOT EXISTS (
+                           SELECT 1
+                           FROM work_dependency AS dependency
+                           JOIN work_item AS prerequisite
+                             ON prerequisite.id = dependency.depends_on_work_item_id
+                           WHERE dependency.work_item_id = work_item.id
+                             AND prerequisite.status != 'done'
+                       )
+                     ORDER BY
+                       CASE WHEN priority GLOB 'P[0-9]*'
+                            THEN CAST(substr(priority, 2) AS INTEGER)
+                            ELSE 2147483647 END,
+                       created_at, id
                      LIMIT 1
                  )
                    AND status = 'pending'
@@ -63,6 +82,14 @@ fn claim_pending_run_by_slug(
                  SET status = 'running', updated_at = datetime('now')
                  WHERE slug = ?1
                    AND status = 'pending'
+                   AND NOT EXISTS (
+                       SELECT 1
+                       FROM work_dependency AS dependency
+                       JOIN work_item AS prerequisite
+                         ON prerequisite.id = dependency.depends_on_work_item_id
+                       WHERE dependency.work_item_id = work_item.id
+                         AND prerequisite.status != 'done'
+                   )
                  RETURNING *",
                 params![work_slug],
                 WorkItem::from_row,
@@ -230,4 +257,3 @@ pub fn record_run_phase(
     .to_string();
     record_event(connection, "run", run_id, "phase", &payload)
 }
-

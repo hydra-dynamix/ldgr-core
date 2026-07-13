@@ -1,15 +1,142 @@
 pub fn next_pending_work_item(connection: &Connection) -> anyhow::Result<Option<WorkItem>> {
+    next_ready_work_item(connection, None, None)
+}
+
+pub fn next_ready_work_item(
+    connection: &Connection,
+    program: Option<&str>,
+    priority: Option<&str>,
+) -> anyhow::Result<Option<WorkItem>> {
+    let priority = normalize_priority(priority)?;
     connection
         .query_row(
             "SELECT * FROM work_item
              WHERE status = 'pending'
-             ORDER BY created_at, id
+               AND (?1 IS NULL OR program = ?1)
+               AND (?2 IS NULL OR priority = ?2)
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM work_dependency AS dependency
+                   JOIN work_item AS prerequisite
+                     ON prerequisite.id = dependency.depends_on_work_item_id
+                   WHERE dependency.work_item_id = work_item.id
+                     AND prerequisite.status != 'done'
+               )
+             ORDER BY
+               CASE WHEN priority GLOB 'P[0-9]*'
+                    THEN CAST(substr(priority, 2) AS INTEGER)
+                    ELSE 2147483647 END,
+               created_at, id
              LIMIT 1",
-            [],
+            params![program, priority],
             WorkItem::from_row,
         )
         .optional()
         .context("failed to read next pending work item")
+}
+
+pub fn work_readiness(
+    connection: &Connection,
+    work_slug: &str,
+) -> anyhow::Result<WorkReadiness> {
+    let work_item = require_work_item_by_slug(connection, work_slug)?;
+    let dependencies = dependency_slugs(connection, work_item.id, false)?;
+    let blocked_by = dependency_slugs(connection, work_item.id, true)?;
+    let unblocks = unblocked_slugs(connection, work_item.id)?;
+    Ok(WorkReadiness {
+        ready: work_item.status == WorkItemStatus::Pending && blocked_by.is_empty(),
+        blocked_by,
+        dependencies,
+        unblocks,
+    })
+}
+
+pub fn list_work_items_filtered(
+    connection: &Connection,
+    status: Option<WorkItemStatus>,
+    program: Option<&str>,
+    priority: Option<&str>,
+) -> anyhow::Result<Vec<WorkItem>> {
+    let priority = normalize_priority(priority)?;
+    let mut statement = connection.prepare(
+        "SELECT * FROM work_item
+         WHERE (?1 IS NULL OR status = ?1)
+           AND (?2 IS NULL OR program = ?2)
+           AND (?3 IS NULL OR priority = ?3)
+         ORDER BY
+           CASE WHEN priority GLOB 'P[0-9]*'
+                THEN CAST(substr(priority, 2) AS INTEGER)
+                ELSE 2147483647 END,
+           created_at, id",
+    )?;
+    let rows = statement.query_map(
+        params![status.map(WorkItemStatus::as_str), program, priority],
+        WorkItem::from_row,
+    )?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to read filtered work items")
+}
+
+pub fn last_completed_work_item(
+    connection: &Connection,
+    program: Option<&str>,
+    priority: Option<&str>,
+) -> anyhow::Result<Option<WorkItem>> {
+    let priority = normalize_priority(priority)?;
+    connection
+        .query_row(
+            "SELECT * FROM work_item
+             WHERE status = 'done'
+               AND (?1 IS NULL OR program = ?1)
+               AND (?2 IS NULL OR priority = ?2)
+             ORDER BY updated_at DESC, id DESC
+             LIMIT 1",
+            params![program, priority],
+            WorkItem::from_row,
+        )
+        .optional()
+        .context("failed to read last completed work item")
+}
+
+fn dependency_slugs(
+    connection: &Connection,
+    work_item_id: i64,
+    only_unsatisfied: bool,
+) -> anyhow::Result<Vec<String>> {
+    let query = if only_unsatisfied {
+        "SELECT prerequisite.slug
+         FROM work_dependency AS dependency
+         JOIN work_item AS prerequisite ON prerequisite.id = dependency.depends_on_work_item_id
+         WHERE dependency.work_item_id = ?1 AND prerequisite.status != 'done'
+         ORDER BY prerequisite.slug"
+    } else {
+        "SELECT prerequisite.slug
+         FROM work_dependency AS dependency
+         JOIN work_item AS prerequisite ON prerequisite.id = dependency.depends_on_work_item_id
+         WHERE dependency.work_item_id = ?1
+         ORDER BY prerequisite.slug"
+    };
+    let mut statement = connection.prepare(query)?;
+    let rows = statement
+        .query_map(params![work_item_id], |row| row.get(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to read work dependencies")?;
+    Ok(rows)
+}
+
+fn unblocked_slugs(connection: &Connection, work_item_id: i64) -> anyhow::Result<Vec<String>> {
+    let mut statement = connection.prepare(
+        "SELECT dependent.slug
+         FROM work_dependency AS dependency
+         JOIN work_item AS dependent ON dependent.id = dependency.work_item_id
+         WHERE dependency.depends_on_work_item_id = ?1
+         ORDER BY dependent.slug",
+    )?;
+    let rows = statement
+        .query_map(params![work_item_id], |row| row.get(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to read work items unblocked by dependency")?;
+    Ok(rows)
 }
 
 pub fn oldest_running_work_item(connection: &Connection) -> anyhow::Result<Option<WorkItem>> {
@@ -216,6 +343,33 @@ pub fn list_observations(
         .context("failed to read observations")
 }
 
+pub fn list_observations_for_work(
+    connection: &Connection,
+    work_slug: &str,
+    limit: i64,
+) -> anyhow::Result<Vec<ObservationSummary>> {
+    require_work_item_by_slug(connection, work_slug)?;
+    let mut statement = connection.prepare(
+        "SELECT observation.id AS observation_id,
+                run.id AS run_id,
+                work_item.slug AS work_slug,
+                observation.body AS body,
+                observation.created_at AS created_at
+         FROM observation
+         JOIN run ON run.id = observation.run_id
+         JOIN work_item ON work_item.id = run.work_item_id
+         WHERE work_item.slug = ?1
+         ORDER BY observation.created_at DESC, observation.id DESC
+         LIMIT ?2",
+    )?;
+    let rows = statement.query_map(
+        params![work_slug, limit],
+        observation_summary_from_row,
+    )?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to read observations for work item")
+}
+
 pub fn get_artifact(connection: &Connection, artifact_id: i64) -> anyhow::Result<Artifact> {
     get_artifact_by_id(connection, artifact_id)
 }
@@ -325,4 +479,3 @@ pub fn list_decisions(
     rows.collect::<rusqlite::Result<Vec<_>>>()
         .context("failed to read decisions")
 }
-

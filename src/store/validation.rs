@@ -96,6 +96,32 @@ pub fn list_validation_records(
         .context("failed to read validation records")
 }
 
+pub fn list_validation_records_for_work(
+    connection: &Connection,
+    work_slug: &str,
+    limit: i64,
+) -> anyhow::Result<Vec<ValidationSummary>> {
+    require_work_item_by_slug(connection, work_slug)?;
+    let mut statement = connection.prepare(
+        "SELECT event_log.id AS validation_id,
+                run.id AS run_id,
+                work_item.slug AS work_slug,
+                event_log.payload_json AS payload_json,
+                event_log.created_at AS created_at
+         FROM event_log
+         JOIN run ON run.id = event_log.entity_id
+         JOIN work_item ON work_item.id = run.work_item_id
+         WHERE event_log.entity_type = 'run'
+           AND event_log.event_type = 'validation'
+           AND work_item.slug = ?1
+         ORDER BY event_log.created_at DESC, event_log.id DESC
+         LIMIT ?2",
+    )?;
+    let rows = statement.query_map(params![work_slug, limit], validation_summary_from_row)?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to read validation records for work item")
+}
+
 pub(crate) fn validation_summary_from_row(row: &Row<'_>) -> rusqlite::Result<ValidationSummary> {
     let payload_json: String = row.get("payload_json")?;
     let payload = parse_validation_payload(&payload_json)?;

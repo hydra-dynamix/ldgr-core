@@ -518,7 +518,7 @@ fn full_help_shows_core_command_tree_and_research_split() -> anyhow::Result<()> 
     command.assert().success().stdout(
         predicate::str::contains("Core command tree:")
             .and(predicate::str::contains(
-                "  work\n    list\n    show\n    create\n    edit\n    status\n      set\n    delete",
+                "  work\n    list\n    show\n    create\n    edit\n    import\n    export\n    status\n      set\n    delete",
             ))
             .and(predicate::str::contains(
                 "  notice\n    list\n    add\n    edit\n    clear",
@@ -4016,6 +4016,249 @@ fn web_cockpit_rejects_fragile_or_unsafe_requests() -> anyhow::Result<()> {
 fn free_local_port() -> anyhow::Result<u16> {
     let listener = TcpListener::bind(("127.0.0.1", 0))?;
     Ok(listener.local_addr()?.port())
+}
+
+#[test]
+fn structured_dependencies_gate_readiness_and_reject_cycles() -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    let db_path = project.path().join(".ldgr/ldgr.db");
+    let artifact_root = project.path().join(".ldgr/artifacts");
+    run(project.path(), &db_path, &artifact_root, ["init"])?;
+    run(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        [
+            "work",
+            "create",
+            "registry",
+            "--title",
+            "Registry",
+            "--description",
+            "Build the registry.",
+            "--priority",
+            "P1",
+            "--program",
+            "audit",
+        ],
+    )?;
+    run(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        [
+            "work",
+            "create",
+            "atomicity",
+            "--title",
+            "Atomicity",
+            "--description",
+            "Audit atomic updates.",
+            "--acceptance-criteria",
+            "Concurrent update test passes.",
+            "--priority",
+            "P0",
+            "--program",
+            "audit",
+            "--depends-on",
+            "registry",
+        ],
+    )?;
+
+    command(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        ["status", "--program", "audit"],
+    )?
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("next: registry [P1]"))
+    .stdout(predicate::str::contains("queue: P0=1 P1=1"))
+    .stdout(predicate::str::contains("unblocks: atomicity"));
+    command(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        ["status", "--program", "audit", "--priority", "P0", "--json"],
+    )?
+    .assert()
+    .success()
+    .stdout(predicate::str::contains(
+        "\"state\": \"idle, work blocked\"",
+    ))
+    .stdout(predicate::str::contains("\"ldgr work show atomicity\""))
+    .stdout(predicate::str::contains("\"ldgr work show registry\""))
+    .stdout(predicate::str::contains("\"ldgr run start registry\"").not());
+    command(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        ["run", "start", "atomicity"],
+    )?
+    .assert()
+    .failure()
+    .stderr(predicate::str::contains("blocked by: registry"));
+    run(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        ["work", "status", "set", "registry", "done"],
+    )?;
+    command(project.path(), &db_path, &artifact_root, ["next"])?
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("atomicity Atomicity"));
+    command(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        ["work", "edit", "registry", "--depends-on", "atomicity"],
+    )?
+    .assert()
+    .failure()
+    .stderr(predicate::str::contains(
+        "dependency graph must remain acyclic",
+    ));
+    Ok(())
+}
+
+#[test]
+fn schedule_import_export_round_trips_structured_queue() -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    let db_path = project.path().join(".ldgr/ldgr.db");
+    let artifact_root = project.path().join(".ldgr/artifacts");
+    let input = project.path().join("schedule.json");
+    let output = project.path().join("backup.json");
+    fs::write(
+        &input,
+        r#"{
+  "format": "ldgr.schedule.v1",
+  "work_items": [
+    {"slug":"base","title":"Base","description":"Base work","priority":"P0","program":"audit"},
+    {"slug":"follow","title":"Follow","description":"Follow-up","priority":"P1","program":"audit","group":"registry","acceptance_criteria":"Evidence recorded","dependencies":["base"]},
+    {"slug":"external","title":"External","description":"Await validation","status":"held","hold_kind":"external-validation","hold_reason":"Lab review"}
+  ]
+}"#,
+    )?;
+    run(project.path(), &db_path, &artifact_root, ["init"])?;
+    command(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        ["work", "import", input.to_str().unwrap()],
+    )?
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("created=3"))
+    .stdout(predicate::str::contains("dependencies=1"));
+    command(project.path(), &db_path, &artifact_root, ["status"])?
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("held: external-validation=1"));
+    run(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        ["work", "export", "--output", output.to_str().unwrap()],
+    )?;
+    let backup: serde_json::Value = serde_json::from_str(&fs::read_to_string(output)?)?;
+    assert_eq!(backup["format"], "ldgr.schedule.v1");
+    assert_eq!(backup["work_items"].as_array().unwrap().len(), 3);
+    assert_eq!(backup["work_items"][1]["dependencies"][0], "base");
+    assert_eq!(backup["work_items"][2]["hold_kind"], "external-validation");
+    Ok(())
+}
+
+#[test]
+fn status_scopes_history_and_hides_stale_terminal_loop_when_new_work_exists() -> anyhow::Result<()>
+{
+    let project = TempDir::new()?;
+    let db_path = project.path().join(".ldgr/ldgr.db");
+    let artifact_root = project.path().join(".ldgr/artifacts");
+    run(project.path(), &db_path, &artifact_root, ["init"])?;
+    run(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        [
+            "work",
+            "create",
+            "old-program",
+            "--title",
+            "Old program",
+            "--description",
+            "Previously completed work.",
+        ],
+    )?;
+    run(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        ["run", "start", "old-program"],
+    )?;
+    run(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        [
+            "observe",
+            "old-program",
+            "--body",
+            "stale packaging observation",
+        ],
+    )?;
+    run(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        [
+            "run",
+            "close",
+            "old-program",
+            "--status",
+            "success",
+            "--outcome",
+            "stop",
+            "--rationale",
+            "Old program complete.",
+        ],
+    )?;
+    run(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        [
+            "work",
+            "create",
+            "new-audit",
+            "--title",
+            "New audit",
+            "--description",
+            "Current work.",
+            "--priority",
+            "P0",
+        ],
+    )?;
+
+    command(project.path(), &db_path, &artifact_root, ["status"])?
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("state: idle, work available"))
+        .stdout(predicate::str::contains("next: new-audit [P0]"))
+        .stdout(predicate::str::contains("phase=completed").not())
+        .stdout(predicate::str::contains("stale packaging observation").not());
+    command(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        ["status", "--full"],
+    )?
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("global_history:"))
+    .stdout(predicate::str::contains("stale packaging observation"));
+    Ok(())
 }
 
 fn loopback_sockets_available(test_name: &str) -> bool {

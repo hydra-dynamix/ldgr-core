@@ -26,6 +26,7 @@ use super::super::render::brief_context::{
 };
 use super::super::render::context::print_context;
 use super::super::render::emit;
+use super::super::render::status::{build_status_summary, print_status_summary};
 use super::super::render::text::print_loop_result;
 use super::super::{CLI_DEFAULT_HELP_SECTIONS, INIT_PROJECT_SETUP_PROMPT};
 
@@ -543,6 +544,16 @@ fn install_resolved_index_release(
         &resolved.platform.binary,
         &resolved.platform.platform,
     )?;
+    if installed_binary.is_none()
+        && adapter_manifest_references_binary(install_root, &resolved.platform.binary)?
+    {
+        bail!(
+            "adapter release {} is missing required executable {}/{}; installation was rolled back",
+            resolved.adapter.domain,
+            resolved.platform.platform,
+            resolved.platform.binary
+        );
+    }
     if let Some(binary_path) = installed_binary {
         run_adapter_binary_installer(
             binary_path.as_os_str(),
@@ -1337,6 +1348,16 @@ fn install_adapter_from_release(
             extracted.display()
         );
     }
+    let release_binary = extracted.join(&platform).join(release.binary);
+    if !release_binary.is_file() && adapter_manifest_references_binary(&extracted, release.binary)?
+    {
+        bail!(
+            "adapter release {} is missing required executable {}/{}; existing installation was left unchanged",
+            entry.slug,
+            platform,
+            release.binary
+        );
+    }
     let _ = fs::remove_dir_all(install_root);
     copy_dir_recursive(&extracted, install_root)?;
     let installed_binary = install_release_binary(install_root, home, release.binary, &platform)?;
@@ -1372,6 +1393,27 @@ fn install_release_binary(
     }
     println!("├─ Installed binary {}", dest.display());
     Ok(Some(dest))
+}
+
+fn adapter_manifest_references_binary(install_root: &Path, binary: &str) -> anyhow::Result<bool> {
+    let manifest_path = install_root.join("adapter.toml");
+    if !manifest_path.is_file() {
+        return Ok(false);
+    }
+    let manifest = fs::read_to_string(&manifest_path)?;
+    let manifest_binary = binary.strip_suffix(".exe").unwrap_or(binary);
+    let value: toml::Value = toml::from_str(&manifest)
+        .with_context(|| format!("failed to parse {}", manifest_path.display()))?;
+    Ok(value
+        .get("commands")
+        .and_then(toml::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|command| command.get("argv"))
+        .filter_map(toml::Value::as_array)
+        .filter_map(|argv| argv.first())
+        .filter_map(toml::Value::as_str)
+        .any(|command| command == manifest_binary || command == binary))
 }
 
 fn patch_adapter_argv_to_source_runner(
@@ -2104,9 +2146,17 @@ pub fn handle_status(
     args: StatusArgs,
 ) -> anyhow::Result<()> {
     let context = read_context(connection)?;
-    let brief = brief_context(&context, brief_options(args.recent, args.width));
-    emit(args.json, &brief, print_brief_context)?;
-    if !args.json {
+    let status = build_status_summary(
+        connection,
+        &context,
+        args.program.as_deref(),
+        args.priority.as_deref(),
+        args.recent,
+        args.width,
+        args.full,
+    )?;
+    emit(args.json, &status, print_status_summary)?;
+    if !args.json && args.full {
         print_installed_adapter_summary();
     }
     Ok(())
@@ -2651,6 +2701,34 @@ argv = ["ldgr-code"]
         assert!(manifest.contains("ldgr-code.exe"));
         assert!(!manifest.contains("argv = [\"ldgr-code\"]"));
         toml::from_str::<toml::Value>(&manifest).expect("patched manifest should parse as TOML");
+        Ok(())
+    }
+
+    #[test]
+    fn adapter_manifest_detects_required_release_executable() -> anyhow::Result<()> {
+        let install_root = tempfile::tempdir()?;
+        std::fs::write(
+            install_root.path().join("adapter.toml"),
+            r#"[adapter]
+slug = "code"
+
+[[commands]]
+namespace = "code"
+argv = ["ldgr-code"]
+"#,
+        )?;
+        assert!(adapter_manifest_references_binary(
+            install_root.path(),
+            "ldgr-code"
+        )?);
+        assert!(adapter_manifest_references_binary(
+            install_root.path(),
+            "ldgr-code.exe"
+        )?);
+        assert!(!adapter_manifest_references_binary(
+            install_root.path(),
+            "ldgr-research"
+        )?);
         Ok(())
     }
 }

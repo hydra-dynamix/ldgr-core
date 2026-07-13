@@ -7,4 +7,5 @@ include!("observations.rs");
 include!("artifacts.rs");
 include!("decisions.rs");
 include!("queries.rs");
+include!("schedule.rs");
 include!("tests.rs");

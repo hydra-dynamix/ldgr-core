@@ -10,12 +10,22 @@ pub struct WorkItem {
     pub status: WorkItemStatus,
     pub created_at: String,
     pub updated_at: String,
+    pub priority: Option<String>,
+    pub program: Option<String>,
+    pub group: Option<String>,
+    pub acceptance_criteria: Option<String>,
+    pub hold_kind: Option<HoldKind>,
+    pub hold_reason: Option<String>,
 }
 
 impl WorkItem {
     pub(crate) fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
         let status_text: String = row.get("status")?;
         let status = WorkItemStatus::from_str(&status_text).map_err(parse_error_to_sql_error)?;
+        let hold_kind = row
+            .get::<_, Option<String>>("hold_kind")?
+            .map(|value| HoldKind::from_str(&value).map_err(parse_error_to_sql_error))
+            .transpose()?;
         Ok(Self {
             id: row.get("id")?,
             parent_work_item_id: row.get("parent_work_item_id")?,
@@ -25,6 +35,12 @@ impl WorkItem {
             status,
             created_at: row.get("created_at")?,
             updated_at: row.get("updated_at")?,
+            priority: row.get("priority")?,
+            program: row.get("program")?,
+            group: row.get("work_group")?,
+            acceptance_criteria: row.get("acceptance_criteria")?,
+            hold_kind,
+            hold_reason: row.get("hold_reason")?,
         })
     }
 }
@@ -531,6 +547,12 @@ string_enum!(WorkItemStatus, "work item status", {
     Held => "held",
     Done => "done",
     Canceled => "canceled",
+});
+
+string_enum!(HoldKind, "hold kind", {
+    Blocked => "blocked",
+    Deferred => "deferred",
+    ExternalValidation => "external-validation",
 });
 
 string_enum!(RunStatus, "run status", {

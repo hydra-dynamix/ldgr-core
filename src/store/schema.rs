@@ -1,6 +1,6 @@
 use super::*;
 
-const CURRENT_SCHEMA_VERSION: i64 = 1;
+const CURRENT_SCHEMA_VERSION: i64 = 2;
 
 const SCHEMA_VERSION_TABLE: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -22,7 +22,21 @@ CREATE TABLE IF NOT EXISTS work_item (
     status TEXT NOT NULL DEFAULT 'pending'
         CHECK (status IN ('pending', 'running', 'held', 'done', 'canceled')),
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    priority TEXT,
+    program TEXT,
+    work_group TEXT,
+    acceptance_criteria TEXT,
+    hold_kind TEXT CHECK (hold_kind IS NULL OR hold_kind IN ('blocked', 'deferred', 'external-validation')),
+    hold_reason TEXT
+);
+
+CREATE TABLE IF NOT EXISTS work_dependency (
+    work_item_id INTEGER NOT NULL REFERENCES work_item(id) ON DELETE CASCADE,
+    depends_on_work_item_id INTEGER NOT NULL REFERENCES work_item(id) ON DELETE RESTRICT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (work_item_id, depends_on_work_item_id),
+    CHECK (work_item_id != depends_on_work_item_id)
 );
 
 CREATE TABLE IF NOT EXISTS run (
@@ -147,6 +161,7 @@ CREATE TABLE IF NOT EXISTS loop_intervention (
 const CORE_TABLES: &[&str] = &[
     "schema_version",
     "work_item",
+    "work_dependency",
     "run",
     "observation",
     "global_observation",
@@ -198,6 +213,27 @@ const WORK_ITEM_COLUMNS: &[ColumnSchema] = &[
     column("status", "TEXT", true, Some("'pending'"), false),
     column("created_at", "TEXT", true, Some("datetime('now')"), false),
     column("updated_at", "TEXT", true, Some("datetime('now')"), false),
+    column("priority", "TEXT", false, None, false),
+    column("program", "TEXT", false, None, false),
+    column("work_group", "TEXT", false, None, false),
+    column("acceptance_criteria", "TEXT", false, None, false),
+    column("hold_kind", "TEXT", false, None, false),
+    column("hold_reason", "TEXT", false, None, false),
+];
+const V1_WORK_ITEM_COLUMNS: &[ColumnSchema] = &[
+    column("id", "INTEGER", false, None, true),
+    column("parent_work_item_id", "INTEGER", false, None, false),
+    column("slug", "TEXT", true, None, false),
+    column("title", "TEXT", true, None, false),
+    column("description", "TEXT", true, None, false),
+    column("status", "TEXT", true, Some("'pending'"), false),
+    column("created_at", "TEXT", true, Some("datetime('now')"), false),
+    column("updated_at", "TEXT", true, Some("datetime('now')"), false),
+];
+const WORK_DEPENDENCY_COLUMNS: &[ColumnSchema] = &[
+    column("work_item_id", "INTEGER", true, None, true),
+    column("depends_on_work_item_id", "INTEGER", true, None, true),
+    column("created_at", "TEXT", true, Some("datetime('now')"), false),
 ];
 const RUN_COLUMNS: &[ColumnSchema] = &[
     column("id", "INTEGER", false, None, true),
@@ -308,6 +344,10 @@ const WORK_ITEM_FOREIGN_KEYS: &[ForeignKeySchema] = &[foreign_key(
     "id",
     "SET NULL",
 )];
+const WORK_DEPENDENCY_FOREIGN_KEYS: &[ForeignKeySchema] = &[
+    foreign_key("work_item_id", "work_item", "id", "CASCADE"),
+    foreign_key("depends_on_work_item_id", "work_item", "id", "RESTRICT"),
+];
 const RUN_FOREIGN_KEYS: &[ForeignKeySchema] =
     &[foreign_key("work_item_id", "work_item", "id", "CASCADE")];
 const OBSERVATION_FOREIGN_KEYS: &[ForeignKeySchema] =
@@ -339,6 +379,11 @@ const SCHEMA_VERSION_REQUIRED_SQL: &[&str] = &["CHECK (id = 1)", "CHECK (version
 const WORK_ITEM_REQUIRED_SQL: &[&str] = &[
     "slug TEXT NOT NULL UNIQUE",
     "CHECK (status IN ('pending', 'running', 'held', 'done', 'canceled'))",
+    "CHECK (hold_kind IS NULL OR hold_kind IN ('blocked', 'deferred', 'external-validation'))",
+];
+const WORK_DEPENDENCY_REQUIRED_SQL: &[&str] = &[
+    "PRIMARY KEY (work_item_id, depends_on_work_item_id)",
+    "CHECK (work_item_id != depends_on_work_item_id)",
 ];
 const RUN_REQUIRED_SQL: &[&str] =
     &["CHECK (status IN ('running', 'success', 'failed', 'partial'))"];
@@ -378,6 +423,12 @@ const EXPECTED_SCHEMA: &[TableSchema] = &[
         WORK_ITEM_COLUMNS,
         WORK_ITEM_FOREIGN_KEYS,
         WORK_ITEM_REQUIRED_SQL,
+    ),
+    table(
+        "work_dependency",
+        WORK_DEPENDENCY_COLUMNS,
+        WORK_DEPENDENCY_FOREIGN_KEYS,
+        WORK_DEPENDENCY_REQUIRED_SQL,
     ),
     table("run", RUN_COLUMNS, RUN_FOREIGN_KEYS, RUN_REQUIRED_SQL),
     table(
@@ -489,6 +540,8 @@ const fn table(
 const SCHEMA_INDEXES: &str = r#"
 CREATE INDEX IF NOT EXISTS idx_work_item_status ON work_item(status);
 CREATE INDEX IF NOT EXISTS idx_work_item_parent ON work_item(parent_work_item_id);
+CREATE INDEX IF NOT EXISTS idx_work_item_priority_program ON work_item(priority, program, status);
+CREATE INDEX IF NOT EXISTS idx_work_dependency_depends_on ON work_dependency(depends_on_work_item_id);
 CREATE INDEX IF NOT EXISTS idx_run_work_item ON run(work_item_id);
 CREATE INDEX IF NOT EXISTS idx_run_status ON run(status);
 CREATE INDEX IF NOT EXISTS idx_observation_run ON observation(run_id);
@@ -501,6 +554,24 @@ CREATE INDEX IF NOT EXISTS idx_prompt_bundle_item_bundle ON prompt_bundle_item(b
 CREATE INDEX IF NOT EXISTS idx_decision_work_item ON decision(work_item_id);
 CREATE INDEX IF NOT EXISTS idx_event_log_entity ON event_log(entity_type, entity_id);
 CREATE INDEX IF NOT EXISTS idx_loop_intervention_status ON loop_intervention(status);
+
+CREATE TRIGGER IF NOT EXISTS trg_work_dependency_no_cycle
+BEFORE INSERT ON work_dependency
+WHEN NEW.work_item_id = NEW.depends_on_work_item_id OR EXISTS (
+    WITH RECURSIVE ancestors(id) AS (
+        SELECT depends_on_work_item_id
+        FROM work_dependency
+        WHERE work_item_id = NEW.depends_on_work_item_id
+        UNION
+        SELECT dependency.depends_on_work_item_id
+        FROM work_dependency AS dependency
+        JOIN ancestors ON dependency.work_item_id = ancestors.id
+    )
+    SELECT 1 FROM ancestors WHERE id = NEW.work_item_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'work dependency cycle');
+END;
 "#;
 
 pub(crate) fn ensure_schema(connection: &Connection) -> anyhow::Result<()> {
@@ -514,7 +585,11 @@ pub(crate) fn ensure_schema(connection: &Connection) -> anyhow::Result<()> {
         return Err(incompatible_schema_error("missing schema_version table"));
     }
 
-    let version = schema_version(connection)?;
+    let mut version = schema_version(connection)?;
+    if version == 1 {
+        migrate_v1_to_v2(connection)?;
+        version = schema_version(connection)?;
+    }
     if version != CURRENT_SCHEMA_VERSION {
         return Err(incompatible_schema_error(format!(
             "schema version {version} does not match required version {CURRENT_SCHEMA_VERSION}"
@@ -535,6 +610,76 @@ pub(crate) fn ensure_schema(connection: &Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn migrate_v1_to_v2(connection: &Connection) -> anyhow::Result<()> {
+    if !version_1_schema_matches(connection)? {
+        return Err(incompatible_schema_error(
+            "schema version 1 shape is not eligible for the v2 migration",
+        ));
+    }
+    in_write_transaction(connection, |connection| {
+        connection
+            .execute_batch(
+                r#"
+                ALTER TABLE work_item ADD COLUMN priority TEXT;
+                ALTER TABLE work_item ADD COLUMN program TEXT;
+                ALTER TABLE work_item ADD COLUMN work_group TEXT;
+                ALTER TABLE work_item ADD COLUMN acceptance_criteria TEXT;
+                ALTER TABLE work_item ADD COLUMN hold_kind TEXT CHECK (hold_kind IS NULL OR hold_kind IN ('blocked', 'deferred', 'external-validation'));
+                ALTER TABLE work_item ADD COLUMN hold_reason TEXT;
+                CREATE TABLE work_dependency (
+                    work_item_id INTEGER NOT NULL REFERENCES work_item(id) ON DELETE CASCADE,
+                    depends_on_work_item_id INTEGER NOT NULL REFERENCES work_item(id) ON DELETE RESTRICT,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    PRIMARY KEY (work_item_id, depends_on_work_item_id),
+                    CHECK (work_item_id != depends_on_work_item_id)
+                );
+                "#,
+            )
+            .context("failed to migrate ldgr schema from v1 to v2")?;
+        connection
+            .execute_batch(SCHEMA_INDEXES)
+            .context("failed to create v2 schema indexes and dependency guard")?;
+        set_schema_version(connection, CURRENT_SCHEMA_VERSION)
+    })
+}
+
+fn version_1_schema_matches(connection: &Connection) -> anyhow::Result<bool> {
+    let table_names = application_table_names(connection)?;
+    let v1_tables = CORE_TABLES
+        .iter()
+        .copied()
+        .filter(|name| *name != "work_dependency")
+        .collect::<Vec<_>>();
+    if table_names.len() != v1_tables.len()
+        || table_names
+            .iter()
+            .any(|name| !v1_tables.contains(&name.as_str()))
+    {
+        return Ok(false);
+    }
+    let v1_work_item = TableSchema {
+        name: "work_item",
+        columns: V1_WORK_ITEM_COLUMNS,
+        foreign_keys: WORK_ITEM_FOREIGN_KEYS,
+        required_sql: &[
+            "slug TEXT NOT NULL UNIQUE",
+            "CHECK (status IN ('pending', 'running', 'held', 'done', 'canceled'))",
+        ],
+    };
+    if !table_matches_schema(connection, &v1_work_item)? {
+        return Ok(false);
+    }
+    for table_schema in EXPECTED_SCHEMA {
+        if matches!(table_schema.name, "work_item" | "work_dependency") {
+            continue;
+        }
+        if !table_matches_schema(connection, table_schema)? {
+            return Ok(false);
+        }
+    }
+    work_item_accepts_held_status(connection)
+}
+
 fn create_current_schema(connection: &Connection) -> anyhow::Result<()> {
     connection
         .execute_batch(SCHEMA_VERSION_TABLE)
@@ -550,7 +695,7 @@ fn create_current_schema(connection: &Connection) -> anyhow::Result<()> {
 
 fn incompatible_schema_error(reason: impl fmt::Display) -> anyhow::Error {
     anyhow::anyhow!(
-        "incompatible ldgr database schema: {reason}. This pre-release database shape is not supported by ldgr-core v1 schema; export or migrate needed data manually."
+        "incompatible ldgr database schema: {reason}. This database cannot be migrated automatically to ldgr-core v2 without risking data loss."
     )
 }
 
@@ -801,6 +946,7 @@ mod tests {
         assert_eq!(schema_version(&connection)?, CURRENT_SCHEMA_VERSION);
         for table in [
             "work_item",
+            "work_dependency",
             "run",
             "observation",
             "global_observation",
@@ -838,7 +984,7 @@ mod tests {
     }
 
     #[test]
-    fn incompatible_pre_release_database_is_rejected_without_migration() -> anyhow::Result<()> {
+    fn incompatible_unknown_database_is_rejected_without_mutation() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let db_path = temp.path().join("ldgr.sqlite3");
         {
@@ -871,7 +1017,7 @@ mod tests {
             "{message}"
         );
         assert!(
-            message.contains("pre-release database shape is not supported"),
+            message.contains("cannot be migrated automatically"),
             "{message}"
         );
         let connection = Connection::open(&db_path)?;
@@ -880,14 +1026,14 @@ mod tests {
     }
 
     #[test]
-    fn version_1_database_with_missing_core_constraint_is_rejected() -> anyhow::Result<()> {
+    fn version_2_database_with_missing_core_constraint_is_rejected() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let db_path = temp.path().join("ldgr.sqlite3");
         {
             let connection = Connection::open(&db_path)?;
             create_current_schema(&connection)?;
             rebuild_work_item_without_status_check(&connection)?;
-            assert_eq!(schema_version(&connection)?, 1);
+            assert_eq!(schema_version(&connection)?, CURRENT_SCHEMA_VERSION);
             assert_core_tables_exist(&connection)?;
         }
 
@@ -895,18 +1041,58 @@ mod tests {
     }
 
     #[test]
-    fn version_1_database_with_missing_core_foreign_key_is_rejected() -> anyhow::Result<()> {
+    fn version_2_database_with_missing_core_foreign_key_is_rejected() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let db_path = temp.path().join("ldgr.sqlite3");
         {
             let connection = Connection::open(&db_path)?;
             create_current_schema(&connection)?;
             rebuild_run_without_work_item_foreign_key(&connection)?;
-            assert_eq!(schema_version(&connection)?, 1);
+            assert_eq!(schema_version(&connection)?, CURRENT_SCHEMA_VERSION);
             assert_core_tables_exist(&connection)?;
         }
 
         assert_schema_shape_rejected(&db_path)
+    }
+
+    #[test]
+    fn released_v1_database_migrates_to_v2_without_losing_ledger_data() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let db_path = temp.path().join("ldgr.sqlite3");
+        {
+            let connection = Connection::open(&db_path)?;
+            create_current_schema(&connection)?;
+            downgrade_test_schema_to_v1(&connection)?;
+            connection.execute(
+                "INSERT INTO work_item (slug, title, description, status)
+                 VALUES ('preserved', 'Preserved', 'Released v1 data', 'done')",
+                [],
+            )?;
+            let work_item_id = connection.last_insert_rowid();
+            connection.execute(
+                "INSERT INTO run (work_item_id, command, status, finished_at, notes)
+                 VALUES (?1, 'test', 'success', datetime('now'), 'preserve me')",
+                params![work_item_id],
+            )?;
+            let run_id = connection.last_insert_rowid();
+            connection.execute(
+                "INSERT INTO observation (run_id, body) VALUES (?1, 'durable evidence')",
+                params![run_id],
+            )?;
+            assert_eq!(schema_version(&connection)?, 1);
+        }
+
+        let connection = open_store(&db_path)?;
+        assert_eq!(schema_version(&connection)?, CURRENT_SCHEMA_VERSION);
+        assert!(table_exists(&connection, "work_dependency")?);
+        let item = require_work_item_by_slug(&connection, "preserved")?;
+        assert_eq!(item.status, WorkItemStatus::Done);
+        assert_eq!(item.priority, None);
+        assert_eq!(
+            list_observations(&connection, None, 10)?[0].body,
+            "durable evidence"
+        );
+        Ok(())
     }
 
     fn assert_core_tables_exist(connection: &Connection) -> anyhow::Result<()> {
@@ -926,6 +1112,25 @@ mod tests {
             message.contains("schema shape does not match the current core schema"),
             "{message}"
         );
+        Ok(())
+    }
+
+    fn downgrade_test_schema_to_v1(connection: &Connection) -> anyhow::Result<()> {
+        connection.execute_batch(
+            r#"
+            DROP TRIGGER IF EXISTS trg_work_dependency_no_cycle;
+            DROP INDEX IF EXISTS idx_work_dependency_depends_on;
+            DROP INDEX IF EXISTS idx_work_item_priority_program;
+            DROP TABLE work_dependency;
+            ALTER TABLE work_item DROP COLUMN hold_reason;
+            ALTER TABLE work_item DROP COLUMN hold_kind;
+            ALTER TABLE work_item DROP COLUMN acceptance_criteria;
+            ALTER TABLE work_item DROP COLUMN work_group;
+            ALTER TABLE work_item DROP COLUMN program;
+            ALTER TABLE work_item DROP COLUMN priority;
+            UPDATE schema_version SET version = 1 WHERE id = 1;
+            "#,
+        )?;
         Ok(())
     }
 
