@@ -1418,7 +1418,8 @@ fn patch_adapter_argv_to_installed_binary(
         return Ok(());
     }
     let quoted_path = toml::Value::String(bin_path.display().to_string()).to_string();
-    patch_adapter_argv_command(&manifest, binary, &quoted_path)
+    let manifest_binary = binary.strip_suffix(".exe").unwrap_or(binary);
+    patch_adapter_argv_command(&manifest, manifest_binary, &quoted_path)
 }
 
 fn patch_adapter_argv_command(
@@ -2623,6 +2624,32 @@ argv = ["ldgr-conduct", "status"]
         )));
         assert!(manifest.contains("\"-p\", \"ldgr-conduct\", \"--\"]"));
         assert!(manifest.contains("\"--\", \"status\"]"));
+        toml::from_str::<toml::Value>(&manifest).expect("patched manifest should parse as TOML");
+        Ok(())
+    }
+
+    #[test]
+    fn installed_windows_binary_patches_extensionless_manifest_command() -> anyhow::Result<()> {
+        let install_root = tempfile::tempdir()?;
+        let home = tempfile::tempdir()?;
+        std::fs::create_dir_all(home.path().join(".local/bin"))?;
+        std::fs::write(home.path().join(".local/bin/ldgr-code.exe"), b"binary")?;
+        std::fs::write(
+            install_root.path().join("adapter.toml"),
+            r#"[adapter]
+slug = "code"
+
+[[commands]]
+namespace = "code"
+argv = ["ldgr-code"]
+"#,
+        )?;
+
+        patch_adapter_argv_to_installed_binary(install_root.path(), "ldgr-code.exe", home.path())?;
+
+        let manifest = std::fs::read_to_string(install_root.path().join("adapter.toml"))?;
+        assert!(manifest.contains("ldgr-code.exe"));
+        assert!(!manifest.contains("argv = [\"ldgr-code\"]"));
         toml::from_str::<toml::Value>(&manifest).expect("patched manifest should parse as TOML");
         Ok(())
     }
