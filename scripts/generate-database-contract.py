@@ -75,10 +75,38 @@ def migration_digest(workspace_root: Path, sources: list[Path]) -> str:
         relative = source.relative_to(workspace_root).as_posix().encode("utf-8")
         digest.update(len(relative).to_bytes(8, "big"))
         digest.update(relative)
-        body = source.read_bytes()
+        body = effective_migration_source(source)
         digest.update(len(body).to_bytes(8, "big"))
         digest.update(body)
     return f"sha256:{digest.hexdigest()}"
+
+
+def effective_migration_source(path: Path) -> bytes:
+    """Fingerprint schema/version SQL, excluding tests and unrelated implementation code."""
+    text = path.read_text(encoding="utf-8").split("#[cfg(test)]", 1)[0]
+    versions = []
+    for pattern in VERSION_PATTERNS:
+        versions.extend(match.group(0) for match in pattern.finditer(text))
+    raw_strings = re.findall(r'r#+"(.*?)"#+', text, flags=re.DOTALL)
+    sql_markers = (
+        "CREATE TABLE",
+        "CREATE INDEX",
+        "CREATE TRIGGER",
+        "ALTER TABLE",
+        "DROP TABLE",
+        "DROP INDEX",
+        "DROP TRIGGER",
+        "UPDATE schema_version",
+    )
+    sql = [
+        re.sub(r"\s+", " ", fragment).strip()
+        for fragment in raw_strings
+        if any(marker in fragment for marker in sql_markers)
+    ]
+    canonical = json.dumps(
+        {"versions": versions, "sql": sql}, sort_keys=True, separators=(",", ":")
+    )
+    return canonical.encode("utf-8")
 
 
 def adapter_namespace(component_root: Path) -> str:

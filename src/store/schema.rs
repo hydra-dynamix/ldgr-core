@@ -1651,6 +1651,14 @@ mod tests {
         assert_eq!(backup_metadata.from_schema_version, 2);
         assert_eq!(backup_metadata.to_schema_version, CURRENT_SCHEMA_VERSION);
         assert_eq!(backup_metadata.contract_hash, DATABASE_CONTRACT_HASH);
+        drop(connection);
+        let doctor = doctor_schema(&db_path);
+        assert!(doctor.compatible);
+        assert_eq!(doctor.last_backup.as_deref(), Some(backups[0].as_path()));
+        assert!(doctor
+            .recovery_command
+            .as_deref()
+            .is_some_and(|command| command.contains("cp '")));
         Ok(())
     }
 
