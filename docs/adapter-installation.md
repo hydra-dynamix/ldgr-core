@@ -75,3 +75,10 @@ LDGR_ADAPTER_NAMESPACE
 ```
 
 Core help, status, and context include installed adapter profiles and commands.
+
+## Numerical transition integration
+
+Adapters that participate in opt-in numerical sequence collection use the
+Core-owned interface described in
+[Adapter numerical transition contract](adapter-telemetry.md). Adapters do not
+own consent, buffering, serialization, or transmission.
