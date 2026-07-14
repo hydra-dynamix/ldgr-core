@@ -9,6 +9,7 @@ use tempfile::NamedTempFile;
 pub mod buffer;
 pub mod serializer;
 pub mod transition;
+pub mod transmission;
 
 pub const TELEMETRY_CONSENT_SCHEMA_VERSION: u32 = 1;
 pub const TELEMETRY_CONSENT_POLICY_VERSION: u32 = 1;
@@ -142,6 +143,12 @@ pub fn telemetry_kill_switch_active() -> bool {
             .to_str()
             .is_some_and(|value| value.eq_ignore_ascii_case("off"))
     })
+}
+
+#[cfg(test)]
+pub(crate) fn telemetry_environment_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
 }
 
 pub fn clear_unsent_telemetry(ldgr_home: &Path) -> anyhow::Result<()> {

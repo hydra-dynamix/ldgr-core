@@ -176,20 +176,14 @@ fn sync_directory(_path: &Path) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Mutex, OnceLock};
-
     use super::*;
     use crate::telemetry::transition::{
         COMPLETED_NEGATIVE, COMPLETED_POSITIVE, CORE_WORK_V1, RUNNING,
     };
     use crate::telemetry::{
-        save_telemetry_consent, TelemetryConsent, TelemetryConsentDecision, TELEMETRY_CONSENT_FILE,
+        save_telemetry_consent, telemetry_environment_lock, TelemetryConsent,
+        TelemetryConsentDecision, TELEMETRY_CONSENT_FILE,
     };
-
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
 
     fn enable(home: &Path) -> anyhow::Result<()> {
         save_telemetry_consent(
@@ -224,6 +218,9 @@ mod tests {
 
     #[test]
     fn terminal_sequence_is_one_unlabelled_raw_integer_array() -> anyhow::Result<()> {
+        let _guard = telemetry_environment_lock()
+            .lock()
+            .expect("environment lock poisoned");
         let home = tempfile::tempdir()?;
         enable(home.path())?;
         let mut buffer = LocalSequenceBuffer::begin_after_commit(home.path(), &CORE_WORK_V1)?
@@ -250,6 +247,9 @@ mod tests {
 
     #[test]
     fn consent_removed_before_terminal_discards_the_incomplete_sequence() -> anyhow::Result<()> {
+        let _guard = telemetry_environment_lock()
+            .lock()
+            .expect("environment lock poisoned");
         let home = tempfile::tempdir()?;
         enable(home.path())?;
         let mut buffer = LocalSequenceBuffer::begin_after_commit(home.path(), &CORE_WORK_V1)?
@@ -269,7 +269,9 @@ mod tests {
 
     #[test]
     fn process_kill_switch_prevents_buffering_and_terminal_queueing() -> anyhow::Result<()> {
-        let _guard = env_lock().lock().expect("environment lock poisoned");
+        let _guard = telemetry_environment_lock()
+            .lock()
+            .expect("environment lock poisoned");
         let home = tempfile::tempdir()?;
         enable(home.path())?;
         std::env::set_var("LDGR_TELEMETRY", "off");
