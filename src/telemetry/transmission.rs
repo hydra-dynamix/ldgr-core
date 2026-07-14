@@ -6,7 +6,7 @@ use std::time::Duration;
 use reqwest::blocking::{Client, Request};
 use reqwest::header::{ACCEPT, CONTENT_TYPE};
 use reqwest::redirect::Policy;
-use reqwest::Url;
+use reqwest::{Certificate, Url};
 
 use super::serializer::parse_exact_sequence;
 use super::transition::NumericalProtocol;
@@ -29,6 +29,7 @@ pub struct TransmissionClient {
     collector_origin: Url,
     max_delay: Duration,
     timeout: Duration,
+    additional_root_certificates: Vec<Certificate>,
 }
 
 impl TransmissionClient {
@@ -54,6 +55,7 @@ impl TransmissionClient {
             collector_origin: origin,
             max_delay: DEFAULT_MAX_TRANSMISSION_DELAY,
             timeout: DEFAULT_TRANSMISSION_TIMEOUT,
+            additional_root_certificates: Vec::new(),
         })
     }
 
@@ -65,6 +67,14 @@ impl TransmissionClient {
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
+    }
+
+    /// Add an explicit PEM trust anchor without disabling certificate checks.
+    /// This is intended for private, operator-controlled collectors.
+    pub fn with_root_certificate_pem(mut self, certificate: &[u8]) -> anyhow::Result<Self> {
+        self.additional_root_certificates
+            .push(Certificate::from_pem(certificate)?);
+        Ok(self)
     }
 
     /// Best-effort delivery of pending sequences for exactly one protocol.
@@ -80,6 +90,7 @@ impl TransmissionClient {
     ) -> TransmissionReport {
         let transport = HttpSequenceTransport {
             timeout: self.timeout,
+            additional_root_certificates: &self.additional_root_certificates,
         };
         self.transmit_with(ldgr_home, protocol, &transport)
     }
@@ -153,13 +164,14 @@ trait SequenceTransport {
     fn post(&self, endpoint: &Url, payload: &[u8]) -> bool;
 }
 
-struct HttpSequenceTransport {
+struct HttpSequenceTransport<'certificates> {
     timeout: Duration,
+    additional_root_certificates: &'certificates [Certificate],
 }
 
-impl SequenceTransport for HttpSequenceTransport {
+impl SequenceTransport for HttpSequenceTransport<'_> {
     fn post(&self, endpoint: &Url, payload: &[u8]) -> bool {
-        let Ok(client) = build_http_client(self.timeout) else {
+        let Ok(client) = build_http_client(self.timeout, self.additional_root_certificates) else {
             return false;
         };
         let Ok(request) = build_sequence_request(&client, endpoint.clone(), payload) else {
@@ -172,14 +184,20 @@ impl SequenceTransport for HttpSequenceTransport {
     }
 }
 
-fn build_http_client(timeout: Duration) -> reqwest::Result<Client> {
-    Client::builder()
+fn build_http_client(
+    timeout: Duration,
+    additional_root_certificates: &[Certificate],
+) -> reqwest::Result<Client> {
+    let mut builder = Client::builder()
         .https_only(true)
         .redirect(Policy::none())
         .referer(false)
         .no_proxy()
-        .timeout(timeout)
-        .build()
+        .timeout(timeout);
+    for certificate in additional_root_certificates {
+        builder = builder.add_root_certificate(certificate.clone());
+    }
+    builder.build()
 }
 
 fn build_sequence_request(
@@ -316,7 +334,7 @@ mod tests {
 
     #[test]
     fn request_has_no_product_identity_cookie_auth_or_redirect_surface() -> anyhow::Result<()> {
-        let client = build_http_client(Duration::from_secs(1))?;
+        let client = build_http_client(Duration::from_secs(1), &[])?;
         let request = build_sequence_request(
             &client,
             Url::parse("https://collector.example/sequences/core-work/v1")?,
