@@ -24,7 +24,7 @@ pub use helpers::*;
 pub use ingestion::*;
 pub use mission_log::*;
 pub use prompts::*;
-pub(crate) use schema::*;
+pub use schema::*;
 pub use types::*;
 pub use validation::*;
 pub use work::*;
