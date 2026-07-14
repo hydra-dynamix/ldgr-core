@@ -146,11 +146,11 @@ impl NumericalProtocol {
         Ok(())
     }
 
-    fn declares(&self, state: StateCode) -> bool {
+    pub fn declares(&self, state: StateCode) -> bool {
         self.declared_states.contains(&state)
     }
 
-    fn permits(&self, from: StateCode, to: StateCode) -> bool {
+    pub fn permits(&self, from: StateCode, to: StateCode) -> bool {
         self.allowed_transitions.contains(&(from, to))
     }
 }
@@ -239,6 +239,10 @@ impl<'protocol> CommittedSequence<'protocol> {
 
     pub fn protocol_endpoint(&self) -> &'static str {
         self.protocol.endpoint
+    }
+
+    pub fn protocol(&self) -> &'protocol NumericalProtocol {
+        self.protocol
     }
 
     pub fn numerical_states(&self) -> &[StateCode] {

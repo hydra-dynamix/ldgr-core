@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context};
 use tempfile::NamedTempFile;
 
+use super::serializer::serialize_sequence;
 use super::transition::{
     CommittedSequence, NormalizedTerminal, NumericalProtocol, StateCode, TransitionAcceptance,
 };
@@ -66,7 +67,7 @@ impl<'protocol> LocalSequenceBuffer<'protocol> {
                 self.finalized = true;
                 if queue_terminal_sequence(
                     &self.ldgr_home,
-                    self.sequence.protocol_endpoint(),
+                    self.sequence.protocol(),
                     self.sequence.numerical_states(),
                 )
                 .is_err()
@@ -94,10 +95,11 @@ fn collection_is_eligible(ldgr_home: &Path) -> bool {
 
 fn queue_terminal_sequence(
     ldgr_home: &Path,
-    endpoint: &str,
+    protocol: &NumericalProtocol,
     states: &[StateCode],
 ) -> anyhow::Result<()> {
-    let route = endpoint
+    let route = protocol
+        .endpoint()
         .strip_prefix("/sequences/")
         .context("validated protocol endpoint lost /sequences/ prefix")?;
     let pending_root = ldgr_home.join(TELEMETRY_PENDING_DIRECTORY);
@@ -114,7 +116,10 @@ fn queue_terminal_sequence(
             destination.display()
         )
     })?;
-    serde_json::to_writer(&mut pending, states).context("failed to encode numerical sequence")?;
+    let payload = serialize_sequence(protocol, states)?;
+    pending
+        .write_all(&payload)
+        .context("failed to write numerical sequence")?;
     pending
         .flush()
         .context("failed to flush pending numerical sequence")?;

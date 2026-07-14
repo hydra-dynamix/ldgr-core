@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 
 pub mod buffer;
+pub mod serializer;
 pub mod transition;
 
 pub const TELEMETRY_CONSENT_SCHEMA_VERSION: u32 = 1;
