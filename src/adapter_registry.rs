@@ -27,9 +27,16 @@ impl AdapterRegistry {
     {
         let mut registry = Self::default();
         let mut claimed_names = BTreeMap::<String, String>::new();
+        let mut seen_manifests = BTreeSet::<PathBuf>::new();
 
         for root in roots {
             for manifest_path in manifest_paths(&root, &mut registry.warnings) {
+                let identity = manifest_path
+                    .canonicalize()
+                    .unwrap_or_else(|_| manifest_path.clone());
+                if !seen_manifests.insert(identity) {
+                    continue;
+                }
                 match load_adapter_manifest(&manifest_path) {
                     Ok(mut adapter) => {
                         if let Some(owner) = claimed_names.get(&adapter.slug) {
@@ -417,7 +424,7 @@ fn load_adapter_manifest(manifest_path: &Path) -> anyhow::Result<DiscoveredAdapt
                 format!("adapter {adapter_slug} database contract is incompatible with this Core")
             })?;
         anyhow::ensure!(
-            contract.component.namespace == adapter_slug,
+            contract.component.namespace == adapter_slug.trim_start_matches("ldgr-"),
             "adapter manifest slug {adapter_slug} does not match database component {}",
             contract.component.namespace
         );
