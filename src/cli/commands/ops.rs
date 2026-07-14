@@ -1238,6 +1238,24 @@ static AVAILABLE_ADAPTERS: &[AvailableAdapter] = &[
         git: None,
         release: Some(commercial_release("bench", "ldgr-bench")),
     },
+    AvailableAdapter {
+        slug: "evidence",
+        title: "Evidence adapter",
+        source: "",
+        install: "ldgr adapter install evidence",
+        workspace_package: Some("ldgr-evidence"),
+        git: None,
+        release: Some(commercial_release("evidence", "ldgr-evidence")),
+    },
+    AvailableAdapter {
+        slug: "recall",
+        title: "Recall adapter",
+        source: "",
+        install: "ldgr adapter install recall",
+        workspace_package: Some("ldgr-recall"),
+        git: None,
+        release: Some(commercial_release("recall", "ldgr-recall")),
+    },
 ];
 
 fn available_adapter_catalog() -> &'static [AvailableAdapter] {
