@@ -1,5 +1,15 @@
 use super::*;
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MigrationBackupInfo {
+    pub source: PathBuf,
+    pub backup: PathBuf,
+    pub from_schema_version: i64,
+    pub to_schema_version: i64,
+    pub contract_hash: String,
+    pub created_at_epoch_seconds: u64,
+}
+
 pub fn init_store(db_path: &Path, artifact_root: &Path) -> anyhow::Result<()> {
     if let Some(parent) = db_path.parent() {
         fs::create_dir_all(parent)
@@ -23,6 +33,64 @@ pub fn open_store(db_path: &Path) -> anyhow::Result<Connection> {
             );
         }
     }
+    let connection = open_configured_connection(db_path)?;
+    let migration_origin = preflight_schema_migration(&connection)?;
+    let backup = migration_origin
+        .map(|origin| create_migration_backup(&connection, db_path, origin))
+        .transpose()?;
+    if let Err(error) = ensure_schema(&connection) {
+        if let Some(backup) = backup {
+            return Err(error).with_context(|| {
+                format!(
+                    "schema migration failed; verified backup remains at {}",
+                    backup.backup.display()
+                )
+            });
+        }
+        return Err(error);
+    }
+    verify_connection_integrity(&connection)?;
+    Ok(connection)
+}
+
+pub fn open_store_for_adapter(
+    db_path: &Path,
+    adapter_contract_json: &str,
+) -> anyhow::Result<Connection> {
+    let contract =
+        crate::database_contract::parse_and_validate_adapter_contract(adapter_contract_json)?;
+    anyhow::ensure!(
+        db_path.is_file(),
+        "adapter cannot initialize the central LDGR database at {}; run `ldgr init` with the active Core first",
+        db_path.display()
+    );
+    let connection = open_configured_connection(db_path)?;
+    if let Some(version) = preflight_schema_migration(&connection)? {
+        anyhow::bail!(
+            "adapter {} cannot migrate Core schema v{version}; run the active `ldgr` Core command first",
+            contract.component.namespace
+        );
+    }
+    let registered = list_schema_components(&connection)?
+        .into_iter()
+        .find(|component| component.namespace == contract.component.namespace)
+        .with_context(|| {
+            format!(
+                "central database does not register adapter schema component {}",
+                contract.component.namespace
+            )
+        })?;
+    anyhow::ensure!(
+        registered.schema_version == contract.component.schema_version
+            && registered.migration_digest == contract.component.migration_digest
+            && registered.contract_hash == contract.contract_hash,
+        "central database component {} does not match the adapter build contract",
+        contract.component.namespace
+    );
+    Ok(connection)
+}
+
+fn open_configured_connection(db_path: &Path) -> anyhow::Result<Connection> {
     let connection = Connection::open(db_path)
         .with_context(|| format!("failed to open SQLite database {}", db_path.display()))?;
     connection
@@ -34,8 +102,103 @@ pub fn open_store(db_path: &Path) -> anyhow::Result<Connection> {
     let _granted_mode: String = connection
         .pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0))
         .context("failed to negotiate SQLite journal mode")?;
-    ensure_schema(&connection)?;
     Ok(connection)
+}
+
+fn create_migration_backup(
+    connection: &Connection,
+    db_path: &Path,
+    from_schema_version: i64,
+) -> anyhow::Result<MigrationBackupInfo> {
+    anyhow::ensure!(
+        db_path != Path::new(":memory:"),
+        "cannot create a migration backup for an in-memory database"
+    );
+    let created_at_epoch_seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before Unix epoch")?
+        .as_secs();
+    let file_name = db_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("ldgr.db");
+    let backup = db_path.with_file_name(format!(
+        "{file_name}.backup-schema-v{from_schema_version}-to-v{}-{created_at_epoch_seconds}-{}.sqlite3",
+        CURRENT_SCHEMA_VERSION,
+        std::process::id()
+    ));
+    let mut destination = Connection::open(&backup)
+        .with_context(|| format!("failed to create migration backup {}", backup.display()))?;
+    {
+        let backup_operation = rusqlite::backup::Backup::new(connection, &mut destination)
+            .context("failed to initialize SQLite migration backup")?;
+        backup_operation
+            .run_to_completion(128, std::time::Duration::from_millis(10), None)
+            .context("failed to copy SQLite migration backup")?;
+    }
+    verify_connection_integrity(&destination).with_context(|| {
+        format!(
+            "migration backup {} failed integrity validation",
+            backup.display()
+        )
+    })?;
+    let backed_up_version = current_schema_version(&destination)?;
+    anyhow::ensure!(
+        backed_up_version == from_schema_version,
+        "migration backup schema version {backed_up_version} does not match source {from_schema_version}"
+    );
+    let info = MigrationBackupInfo {
+        source: db_path.to_path_buf(),
+        backup: backup.clone(),
+        from_schema_version,
+        to_schema_version: CURRENT_SCHEMA_VERSION,
+        contract_hash: crate::database_contract::DATABASE_CONTRACT_HASH.to_string(),
+        created_at_epoch_seconds,
+    };
+    let metadata_path = backup.with_extension("json");
+    fs::write(&metadata_path, serde_json::to_vec_pretty(&info)?).with_context(|| {
+        format!(
+            "failed to record migration backup {}",
+            metadata_path.display()
+        )
+    })?;
+    Ok(info)
+}
+
+fn verify_connection_integrity(connection: &Connection) -> anyhow::Result<()> {
+    let integrity: String = connection
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .context("failed to run SQLite integrity check")?;
+    anyhow::ensure!(
+        integrity == "ok",
+        "SQLite integrity check failed: {integrity}"
+    );
+    Ok(())
+}
+
+pub(crate) fn in_migration_transaction<T>(
+    connection: &Connection,
+    operation: impl FnOnce(&Connection) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    anyhow::ensure!(
+        connection.is_autocommit(),
+        "schema migration requires an outermost transaction"
+    );
+    connection
+        .execute_batch("BEGIN EXCLUSIVE")
+        .context("failed to acquire exclusive schema migration lock")?;
+    match operation(connection) {
+        Ok(value) => {
+            connection
+                .execute_batch("COMMIT")
+                .context("failed to commit schema migration")?;
+            Ok(value)
+        }
+        Err(error) => {
+            let _ = connection.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
 }
 
 pub(crate) fn in_write_transaction<T>(
@@ -519,6 +682,59 @@ mod tests {
             ["wal", "delete", "truncate", "persist"].contains(&journal_mode.as_str()),
             "unexpected journal mode {journal_mode}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn adapter_store_open_requires_current_core_without_migrating() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let db = temp.path().join("ldgr.sqlite3");
+        let artifacts = temp.path().join("artifacts");
+        init_store(&db, &artifacts)?;
+        {
+            let connection = Connection::open(&db)?;
+            connection.execute_batch(
+                "DROP TABLE component_record;
+                 DROP TABLE component_ingest;
+                 DROP TABLE schema_component;
+                 UPDATE schema_version SET version = 2 WHERE id = 1;",
+            )?;
+        }
+        let contract = crate::database_contract::generated_adapter_contract_json("example")?;
+        let error = open_store_for_adapter(&db, &contract).unwrap_err();
+        assert!(format!("{error:#}").contains("cannot migrate Core schema v2"));
+        let connection = Connection::open(&db)?;
+        assert_eq!(current_schema_version(&connection)?, 2);
+        let has_catalog: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_component')",
+            [],
+            |row| row.get(0),
+        )?;
+        assert!(!has_catalog);
+        assert!(!fs::read_dir(temp.path())?
+            .filter_map(Result::ok)
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("backup-schema")
+            }));
+        Ok(())
+    }
+
+    #[test]
+    fn adapter_store_open_validates_generated_component() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let db = temp.path().join("ldgr.sqlite3");
+        init_store(&db, &temp.path().join("artifacts"))?;
+        let contract = crate::database_contract::generated_adapter_contract_json("example")?;
+        let connection = open_store_for_adapter(&db, &contract)?;
+        assert_eq!(current_schema_version(&connection)?, CURRENT_SCHEMA_VERSION);
+
+        let missing = temp.path().join("missing/ldgr.sqlite3");
+        let error = open_store_for_adapter(&missing, &contract).unwrap_err();
+        assert!(format!("{error:#}").contains("cannot initialize"));
+        assert!(!missing.exists());
         Ok(())
     }
 }

@@ -11,6 +11,7 @@ use thiserror::Error;
 
 mod context;
 mod helpers;
+mod ingestion;
 mod mission_log;
 mod prompts;
 mod schema;
@@ -20,6 +21,7 @@ mod work;
 
 pub use context::*;
 pub use helpers::*;
+pub use ingestion::*;
 pub use mission_log::*;
 pub use prompts::*;
 pub(crate) use schema::*;

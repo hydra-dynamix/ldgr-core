@@ -1,6 +1,98 @@
 use super::*;
+use crate::database_contract::{
+    DATABASE_CONTRACT_HASH, GENERATED_CORE_SCHEMA_VERSION, GENERATED_DATABASE_COMPONENTS,
+};
+use rusqlite::OpenFlags;
 
-const CURRENT_SCHEMA_VERSION: i64 = 2;
+pub const CURRENT_SCHEMA_VERSION: i64 = 4;
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SchemaDoctorReport {
+    pub database: PathBuf,
+    pub readable: bool,
+    pub compatible: bool,
+    pub active_schema_version: Option<i64>,
+    pub target_schema_version: i64,
+    pub contract_hash: &'static str,
+    pub pending_migrations: Vec<i64>,
+    pub components: Vec<SchemaComponentState>,
+    pub last_backup: Option<PathBuf>,
+    pub recovery_command: Option<String>,
+    pub problem: Option<String>,
+}
+
+pub fn doctor_schema(db_path: &Path) -> SchemaDoctorReport {
+    let mut report = SchemaDoctorReport {
+        database: db_path.to_path_buf(),
+        readable: false,
+        compatible: false,
+        active_schema_version: None,
+        target_schema_version: CURRENT_SCHEMA_VERSION,
+        contract_hash: DATABASE_CONTRACT_HASH,
+        pending_migrations: Vec::new(),
+        components: Vec::new(),
+        last_backup: latest_migration_backup(db_path),
+        recovery_command: None,
+        problem: None,
+    };
+    if let Some(backup) = &report.last_backup {
+        report.recovery_command =
+            Some(format!("cp '{}' '{}'", backup.display(), db_path.display()));
+    }
+    let connection = match Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY) {
+        Ok(connection) => connection,
+        Err(error) => {
+            report.problem = Some(format!("failed to open database read-only: {error}"));
+            return report;
+        }
+    };
+    report.readable = true;
+    match schema_version(&connection) {
+        Ok(version) => {
+            report.active_schema_version = Some(version);
+            if version < CURRENT_SCHEMA_VERSION {
+                report.pending_migrations = ((version + 1)..=CURRENT_SCHEMA_VERSION).collect();
+            }
+        }
+        Err(error) => {
+            report.problem = Some(format!("{error:#}"));
+            return report;
+        }
+    }
+    match preflight_schema_migration(&connection) {
+        Ok(_) => {
+            report.compatible = true;
+            if report.active_schema_version == Some(CURRENT_SCHEMA_VERSION) {
+                match list_schema_components(&connection) {
+                    Ok(components) => report.components = components,
+                    Err(error) => {
+                        report.compatible = false;
+                        report.problem = Some(format!("{error:#}"));
+                    }
+                }
+            }
+        }
+        Err(error) => report.problem = Some(format!("{error:#}")),
+    }
+    report
+}
+
+fn latest_migration_backup(db_path: &Path) -> Option<PathBuf> {
+    let parent = db_path.parent()?;
+    let prefix = format!("{}.backup-schema-v", db_path.file_name()?.to_string_lossy());
+    let mut backups = fs::read_dir(parent)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with(&prefix))
+                && path.extension().and_then(|value| value.to_str()) == Some("sqlite3")
+        })
+        .collect::<Vec<_>>();
+    backups.sort();
+    backups.pop()
+}
 
 const SCHEMA_VERSION_TABLE: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -12,7 +104,45 @@ CREATE TABLE IF NOT EXISTS schema_version (
 INSERT OR IGNORE INTO schema_version (id, version) VALUES (1, 0);
 "#;
 
+const SCHEMA_COMPONENT_TABLE: &str = r#"
+CREATE TABLE IF NOT EXISTS schema_component (
+    namespace TEXT PRIMARY KEY,
+    schema_version INTEGER NOT NULL CHECK (schema_version > 0),
+    minimum_core_schema INTEGER NOT NULL CHECK (minimum_core_schema > 0),
+    migration_digest TEXT NOT NULL CHECK (migration_digest GLOB 'sha256:*'),
+    contract_hash TEXT NOT NULL CHECK (contract_hash GLOB 'sha256:*'),
+    applied_at TEXT NOT NULL DEFAULT (datetime('now')),
+    CHECK (namespace GLOB '[a-z][a-z0-9-]*')
+);
+"#;
+
 const CURRENT_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS component_ingest (
+    id INTEGER PRIMARY KEY,
+    component_namespace TEXT NOT NULL REFERENCES schema_component(namespace) ON DELETE RESTRICT,
+    source_schema_version INTEGER NOT NULL CHECK (source_schema_version > 0),
+    source_contract_hash TEXT NOT NULL CHECK (source_contract_hash GLOB 'sha256:*'),
+    idempotency_key TEXT NOT NULL,
+    payload_digest TEXT NOT NULL CHECK (payload_digest GLOB 'sha256:*'),
+    record_count INTEGER NOT NULL CHECK (record_count >= 0),
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(component_namespace, idempotency_key)
+);
+
+CREATE TABLE IF NOT EXISTS component_record (
+    id INTEGER PRIMARY KEY,
+    ingest_id INTEGER NOT NULL REFERENCES component_ingest(id) ON DELETE CASCADE,
+    record_kind TEXT NOT NULL,
+    record_key TEXT NOT NULL,
+    payload_json TEXT NOT NULL CHECK (json_valid(payload_json)),
+    source_schema_version INTEGER NOT NULL CHECK (source_schema_version > 0),
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(ingest_id, record_kind, record_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_component_ingest_namespace ON component_ingest(component_namespace, created_at);
+CREATE INDEX IF NOT EXISTS idx_component_record_ingest ON component_record(ingest_id);
+
 CREATE TABLE IF NOT EXISTS work_item (
     id INTEGER PRIMARY KEY,
     parent_work_item_id INTEGER REFERENCES work_item(id) ON DELETE SET NULL,
@@ -160,6 +290,9 @@ CREATE TABLE IF NOT EXISTS loop_intervention (
 
 const CORE_TABLES: &[&str] = &[
     "schema_version",
+    "schema_component",
+    "component_ingest",
+    "component_record",
     "work_item",
     "work_dependency",
     "run",
@@ -203,6 +336,33 @@ const SCHEMA_VERSION_COLUMNS: &[ColumnSchema] = &[
     column("id", "INTEGER", false, None, true),
     column("version", "INTEGER", true, None, false),
     column("applied_at", "TEXT", true, Some("datetime('now')"), false),
+];
+const SCHEMA_COMPONENT_COLUMNS: &[ColumnSchema] = &[
+    column("namespace", "TEXT", false, None, true),
+    column("schema_version", "INTEGER", true, None, false),
+    column("minimum_core_schema", "INTEGER", true, None, false),
+    column("migration_digest", "TEXT", true, None, false),
+    column("contract_hash", "TEXT", true, None, false),
+    column("applied_at", "TEXT", true, Some("datetime('now')"), false),
+];
+const COMPONENT_INGEST_COLUMNS: &[ColumnSchema] = &[
+    column("id", "INTEGER", false, None, true),
+    column("component_namespace", "TEXT", true, None, false),
+    column("source_schema_version", "INTEGER", true, None, false),
+    column("source_contract_hash", "TEXT", true, None, false),
+    column("idempotency_key", "TEXT", true, None, false),
+    column("payload_digest", "TEXT", true, None, false),
+    column("record_count", "INTEGER", true, None, false),
+    column("created_at", "TEXT", true, Some("datetime('now')"), false),
+];
+const COMPONENT_RECORD_COLUMNS: &[ColumnSchema] = &[
+    column("id", "INTEGER", false, None, true),
+    column("ingest_id", "INTEGER", true, None, false),
+    column("record_kind", "TEXT", true, None, false),
+    column("record_key", "TEXT", true, None, false),
+    column("payload_json", "TEXT", true, None, false),
+    column("source_schema_version", "INTEGER", true, None, false),
+    column("created_at", "TEXT", true, Some("datetime('now')"), false),
 ];
 const WORK_ITEM_COLUMNS: &[ColumnSchema] = &[
     column("id", "INTEGER", false, None, true),
@@ -344,6 +504,18 @@ const WORK_ITEM_FOREIGN_KEYS: &[ForeignKeySchema] = &[foreign_key(
     "id",
     "SET NULL",
 )];
+const COMPONENT_INGEST_FOREIGN_KEYS: &[ForeignKeySchema] = &[foreign_key(
+    "component_namespace",
+    "schema_component",
+    "namespace",
+    "RESTRICT",
+)];
+const COMPONENT_RECORD_FOREIGN_KEYS: &[ForeignKeySchema] = &[foreign_key(
+    "ingest_id",
+    "component_ingest",
+    "id",
+    "CASCADE",
+)];
 const WORK_DEPENDENCY_FOREIGN_KEYS: &[ForeignKeySchema] = &[
     foreign_key("work_item_id", "work_item", "id", "CASCADE"),
     foreign_key("depends_on_work_item_id", "work_item", "id", "RESTRICT"),
@@ -376,6 +548,25 @@ const LOOP_INTERVENTION_FOREIGN_KEYS: &[ForeignKeySchema] =
 const NO_FOREIGN_KEYS: &[ForeignKeySchema] = &[];
 
 const SCHEMA_VERSION_REQUIRED_SQL: &[&str] = &["CHECK (id = 1)", "CHECK (version >= 0)"];
+const SCHEMA_COMPONENT_REQUIRED_SQL: &[&str] = &[
+    "CHECK (schema_version > 0)",
+    "CHECK (minimum_core_schema > 0)",
+    "CHECK (migration_digest GLOB 'sha256:*')",
+    "CHECK (contract_hash GLOB 'sha256:*')",
+    "CHECK (namespace GLOB '[a-z][a-z0-9-]*')",
+];
+const COMPONENT_INGEST_REQUIRED_SQL: &[&str] = &[
+    "CHECK (source_schema_version > 0)",
+    "CHECK (source_contract_hash GLOB 'sha256:*')",
+    "CHECK (payload_digest GLOB 'sha256:*')",
+    "CHECK (record_count >= 0)",
+    "UNIQUE(component_namespace, idempotency_key)",
+];
+const COMPONENT_RECORD_REQUIRED_SQL: &[&str] = &[
+    "CHECK (json_valid(payload_json))",
+    "CHECK (source_schema_version > 0)",
+    "UNIQUE(ingest_id, record_kind, record_key)",
+];
 const WORK_ITEM_REQUIRED_SQL: &[&str] = &[
     "slug TEXT NOT NULL UNIQUE",
     "CHECK (status IN ('pending', 'running', 'held', 'done', 'canceled'))",
@@ -417,6 +608,24 @@ const EXPECTED_SCHEMA: &[TableSchema] = &[
         SCHEMA_VERSION_COLUMNS,
         NO_FOREIGN_KEYS,
         SCHEMA_VERSION_REQUIRED_SQL,
+    ),
+    table(
+        "schema_component",
+        SCHEMA_COMPONENT_COLUMNS,
+        NO_FOREIGN_KEYS,
+        SCHEMA_COMPONENT_REQUIRED_SQL,
+    ),
+    table(
+        "component_ingest",
+        COMPONENT_INGEST_COLUMNS,
+        COMPONENT_INGEST_FOREIGN_KEYS,
+        COMPONENT_INGEST_REQUIRED_SQL,
+    ),
+    table(
+        "component_record",
+        COMPONENT_RECORD_COLUMNS,
+        COMPONENT_RECORD_FOREIGN_KEYS,
+        COMPONENT_RECORD_REQUIRED_SQL,
     ),
     table(
         "work_item",
@@ -585,11 +794,9 @@ pub(crate) fn ensure_schema(connection: &Connection) -> anyhow::Result<()> {
         return Err(incompatible_schema_error("missing schema_version table"));
     }
 
-    let mut version = schema_version(connection)?;
-    if version == 1 {
-        migrate_v1_to_v2(connection)?;
-        version = schema_version(connection)?;
-    }
+    preflight_schema_migration(connection)?;
+    apply_pending_schema_migrations(connection, None)?;
+    let version = schema_version(connection)?;
     if version != CURRENT_SCHEMA_VERSION {
         return Err(incompatible_schema_error(format!(
             "schema version {version} does not match required version {CURRENT_SCHEMA_VERSION}"
@@ -600,6 +807,7 @@ pub(crate) fn ensure_schema(connection: &Connection) -> anyhow::Result<()> {
             "schema shape does not match the current core schema",
         ));
     }
+    validate_component_catalog(connection)?;
 
     connection
         .execute_batch(CURRENT_SCHEMA)
@@ -610,15 +818,90 @@ pub(crate) fn ensure_schema(connection: &Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
+pub(crate) fn preflight_schema_migration(connection: &Connection) -> anyhow::Result<Option<i64>> {
+    let existing_tables = application_table_names(connection)?;
+    if existing_tables.is_empty() {
+        return Ok(None);
+    }
+    if !table_exists(connection, "schema_version")? {
+        return Err(incompatible_schema_error("missing schema_version table"));
+    }
+    let version = schema_version(connection)?;
+    match version {
+        1 if version_1_schema_matches(connection)? => Ok(Some(1)),
+        1 => Err(incompatible_schema_error(
+            "schema version 1 shape is not eligible for migration",
+        )),
+        2 if version_2_schema_matches(connection)? => Ok(Some(2)),
+        2 => Err(incompatible_schema_error(
+            "schema version 2 shape is not eligible for migration",
+        )),
+        3 if version_3_schema_matches(connection)? => Ok(Some(3)),
+        3 => Err(incompatible_schema_error(
+            "schema version 3 shape is not eligible for migration",
+        )),
+        CURRENT_SCHEMA_VERSION => {
+            if !current_schema_matches(connection)? {
+                return Err(incompatible_schema_error(
+                    "schema shape does not match the current core schema",
+                ));
+            }
+            validate_component_catalog(connection)?;
+            Ok(None)
+        }
+        _ => Err(incompatible_schema_error(format!(
+            "schema version {version} does not match required version {CURRENT_SCHEMA_VERSION}"
+        ))),
+    }
+}
+
+fn apply_pending_schema_migrations(
+    connection: &Connection,
+    fail_after_version: Option<i64>,
+) -> anyhow::Result<()> {
+    let version = schema_version(connection)?;
+    if version == CURRENT_SCHEMA_VERSION {
+        return Ok(());
+    }
+    in_migration_transaction(connection, |connection| {
+        let mut version = schema_version(connection)?;
+        if version == 1 {
+            migrate_v1_to_v2(connection)?;
+            version = 2;
+            if fail_after_version == Some(version) {
+                anyhow::bail!("injected migration failure after schema v{version}");
+            }
+        }
+        if version == 2 {
+            migrate_v2_to_v3(connection)?;
+            version = 3;
+            if fail_after_version == Some(version) {
+                anyhow::bail!("injected migration failure after schema v{version}");
+            }
+        }
+        if version == 3 {
+            migrate_v3_to_v4(connection)?;
+            version = 4;
+            if fail_after_version == Some(version) {
+                anyhow::bail!("injected migration failure after schema v{version}");
+            }
+        }
+        anyhow::ensure!(
+            version == CURRENT_SCHEMA_VERSION,
+            "migration stopped at schema v{version}; expected v{CURRENT_SCHEMA_VERSION}"
+        );
+        validate_foreign_keys(connection)
+    })
+}
+
 fn migrate_v1_to_v2(connection: &Connection) -> anyhow::Result<()> {
     if !version_1_schema_matches(connection)? {
         return Err(incompatible_schema_error(
             "schema version 1 shape is not eligible for the v2 migration",
         ));
     }
-    in_write_transaction(connection, |connection| {
-        connection
-            .execute_batch(
+    connection
+        .execute_batch(
                 r#"
                 ALTER TABLE work_item ADD COLUMN priority TEXT;
                 ALTER TABLE work_item ADD COLUMN program TEXT;
@@ -635,12 +918,115 @@ fn migrate_v1_to_v2(connection: &Connection) -> anyhow::Result<()> {
                 );
                 "#,
             )
-            .context("failed to migrate ldgr schema from v1 to v2")?;
-        connection
-            .execute_batch(SCHEMA_INDEXES)
-            .context("failed to create v2 schema indexes and dependency guard")?;
-        set_schema_version(connection, CURRENT_SCHEMA_VERSION)
-    })
+        .context("failed to migrate ldgr schema from v1 to v2")?;
+    connection
+        .execute_batch(SCHEMA_INDEXES)
+        .context("failed to create v2 schema indexes and dependency guard")?;
+    set_schema_version(connection, 2)
+}
+
+fn migrate_v2_to_v3(connection: &Connection) -> anyhow::Result<()> {
+    if !version_2_schema_matches(connection)? {
+        return Err(incompatible_schema_error(
+            "schema version 2 shape is not eligible for the v3 migration",
+        ));
+    }
+    connection
+        .execute_batch(SCHEMA_COMPONENT_TABLE)
+        .context("failed to create the v3 schema component catalog")?;
+    seed_generated_component_catalog(connection)?;
+    set_schema_version(connection, 3)
+}
+
+fn migrate_v3_to_v4(connection: &Connection) -> anyhow::Result<()> {
+    if !version_3_schema_matches(connection)? {
+        return Err(incompatible_schema_error(
+            "schema version 3 shape is not eligible for the v4 migration",
+        ));
+    }
+    connection
+        .execute_batch(CURRENT_SCHEMA)
+        .context("failed to create the v4 component ingestion ledger")?;
+    connection.execute("DELETE FROM schema_component", [])?;
+    seed_generated_component_catalog(connection)?;
+    connection
+        .execute_batch(SCHEMA_INDEXES)
+        .context("failed to create v4 schema indexes")?;
+    set_schema_version(connection, 4)
+}
+
+fn validate_foreign_keys(connection: &Connection) -> anyhow::Result<()> {
+    let mut statement = connection
+        .prepare("PRAGMA foreign_key_check")
+        .context("failed to prepare foreign-key validation")?;
+    let violations = statement
+        .query_map([], |_| Ok(()))
+        .context("failed to run foreign-key validation")?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    anyhow::ensure!(
+        violations.is_empty(),
+        "foreign-key validation found {} violation(s)",
+        violations.len()
+    );
+    Ok(())
+}
+
+fn version_2_schema_matches(connection: &Connection) -> anyhow::Result<bool> {
+    let table_names = application_table_names(connection)?;
+    let v2_tables = CORE_TABLES
+        .iter()
+        .copied()
+        .filter(|name| {
+            !matches!(
+                *name,
+                "schema_component" | "component_ingest" | "component_record"
+            )
+        })
+        .collect::<Vec<_>>();
+    if table_names.len() != v2_tables.len()
+        || table_names
+            .iter()
+            .any(|name| !v2_tables.contains(&name.as_str()))
+    {
+        return Ok(false);
+    }
+    for table_schema in EXPECTED_SCHEMA {
+        if matches!(
+            table_schema.name,
+            "schema_component" | "component_ingest" | "component_record"
+        ) {
+            continue;
+        }
+        if !table_matches_schema(connection, table_schema)? {
+            return Ok(false);
+        }
+    }
+    work_item_accepts_held_status(connection)
+}
+
+fn version_3_schema_matches(connection: &Connection) -> anyhow::Result<bool> {
+    let table_names = application_table_names(connection)?;
+    let v3_tables = CORE_TABLES
+        .iter()
+        .copied()
+        .filter(|name| !matches!(*name, "component_ingest" | "component_record"))
+        .collect::<Vec<_>>();
+    if table_names.len() != v3_tables.len()
+        || table_names
+            .iter()
+            .any(|name| !v3_tables.contains(&name.as_str()))
+    {
+        return Ok(false);
+    }
+    for table_schema in EXPECTED_SCHEMA {
+        if matches!(table_schema.name, "component_ingest" | "component_record") {
+            continue;
+        }
+        if !table_matches_schema(connection, table_schema)? {
+            return Ok(false);
+        }
+    }
+    work_item_accepts_held_status(connection)
 }
 
 fn version_1_schema_matches(connection: &Connection) -> anyhow::Result<bool> {
@@ -648,7 +1034,12 @@ fn version_1_schema_matches(connection: &Connection) -> anyhow::Result<bool> {
     let v1_tables = CORE_TABLES
         .iter()
         .copied()
-        .filter(|name| *name != "work_dependency")
+        .filter(|name| {
+            !matches!(
+                *name,
+                "work_dependency" | "schema_component" | "component_ingest" | "component_record"
+            )
+        })
         .collect::<Vec<_>>();
     if table_names.len() != v1_tables.len()
         || table_names
@@ -670,7 +1061,14 @@ fn version_1_schema_matches(connection: &Connection) -> anyhow::Result<bool> {
         return Ok(false);
     }
     for table_schema in EXPECTED_SCHEMA {
-        if matches!(table_schema.name, "work_item" | "work_dependency") {
+        if matches!(
+            table_schema.name,
+            "work_item"
+                | "work_dependency"
+                | "schema_component"
+                | "component_ingest"
+                | "component_record"
+        ) {
             continue;
         }
         if !table_matches_schema(connection, table_schema)? {
@@ -681,21 +1079,31 @@ fn version_1_schema_matches(connection: &Connection) -> anyhow::Result<bool> {
 }
 
 fn create_current_schema(connection: &Connection) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        CURRENT_SCHEMA_VERSION == GENERATED_CORE_SCHEMA_VERSION,
+        "generated database contract is stale: Core schema is {} but contract is {}",
+        CURRENT_SCHEMA_VERSION,
+        GENERATED_CORE_SCHEMA_VERSION
+    );
     connection
         .execute_batch(SCHEMA_VERSION_TABLE)
         .context("failed to create schema version table")?;
+    connection
+        .execute_batch(SCHEMA_COMPONENT_TABLE)
+        .context("failed to create schema component catalog")?;
     connection
         .execute_batch(CURRENT_SCHEMA)
         .context("failed to create current schema")?;
     connection
         .execute_batch(SCHEMA_INDEXES)
         .context("failed to create schema indexes")?;
+    seed_generated_component_catalog(connection)?;
     set_schema_version(connection, CURRENT_SCHEMA_VERSION)
 }
 
 fn incompatible_schema_error(reason: impl fmt::Display) -> anyhow::Error {
     anyhow::anyhow!(
-        "incompatible ldgr database schema: {reason}. This database cannot be migrated automatically to ldgr-core v2 without risking data loss."
+        "incompatible ldgr database schema: {reason}. This database cannot be migrated automatically to ldgr-core schema v{CURRENT_SCHEMA_VERSION} without risking data loss."
     )
 }
 
@@ -893,28 +1301,133 @@ fn normalize_sql(value: &str) -> String {
 }
 
 fn work_item_accepts_held_status(connection: &Connection) -> anyhow::Result<bool> {
-    connection
-        .execute_batch("SAVEPOINT ldgr_schema_probe")
-        .context("failed to begin schema probe")?;
-    let probe_slug = format!("__ldgr_schema_probe_{}", std::process::id());
-    let insert_result = connection.execute(
-        "INSERT INTO work_item (slug, title, description, status) VALUES (?1, 'Schema probe', 'Schema probe', 'held')",
-        params![probe_slug],
-    );
-    let rollback_result = connection
-        .execute_batch(
-            "ROLLBACK TO SAVEPOINT ldgr_schema_probe; RELEASE SAVEPOINT ldgr_schema_probe",
-        )
-        .context("failed to roll back schema probe");
-    rollback_result?;
-    match insert_result {
-        Ok(_) => Ok(true),
-        Err(rusqlite::Error::SqliteFailure(_, _)) => Ok(false),
-        Err(error) => Err(error).context("failed to probe held work item status"),
-    }
+    let sql = normalize_sql(&table_create_sql(connection, "work_item")?);
+    Ok(sql.contains("'held'"))
 }
 
-fn schema_version(connection: &Connection) -> anyhow::Result<i64> {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SchemaComponentState {
+    pub namespace: String,
+    pub schema_version: i64,
+    pub minimum_core_schema: i64,
+    pub migration_digest: String,
+    pub contract_hash: String,
+    pub applied_at: String,
+}
+
+pub fn list_schema_components(
+    connection: &Connection,
+) -> anyhow::Result<Vec<SchemaComponentState>> {
+    let mut statement = connection
+        .prepare(
+            "SELECT namespace, schema_version, minimum_core_schema, migration_digest,
+                    contract_hash, applied_at
+             FROM schema_component
+             ORDER BY namespace",
+        )
+        .context("failed to prepare schema component query")?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(SchemaComponentState {
+                namespace: row.get(0)?,
+                schema_version: row.get(1)?,
+                minimum_core_schema: row.get(2)?,
+                migration_digest: row.get(3)?,
+                contract_hash: row.get(4)?,
+                applied_at: row.get(5)?,
+            })
+        })
+        .context("failed to query schema component catalog")?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to read schema component catalog")
+}
+
+fn seed_generated_component_catalog(connection: &Connection) -> anyhow::Result<()> {
+    for component in GENERATED_DATABASE_COMPONENTS {
+        connection
+            .execute(
+                "INSERT INTO schema_component (
+                    namespace, schema_version, minimum_core_schema, migration_digest, contract_hash
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    component.namespace,
+                    component.schema_version,
+                    component.minimum_core_schema,
+                    component.migration_digest,
+                    DATABASE_CONTRACT_HASH,
+                ],
+            )
+            .with_context(|| {
+                format!(
+                    "failed to register generated schema component {}",
+                    component.namespace
+                )
+            })?;
+    }
+    Ok(())
+}
+
+fn validate_component_catalog(connection: &Connection) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        CURRENT_SCHEMA_VERSION == GENERATED_CORE_SCHEMA_VERSION,
+        "generated database contract is stale: Core schema is {} but contract is {}",
+        CURRENT_SCHEMA_VERSION,
+        GENERATED_CORE_SCHEMA_VERSION
+    );
+    let actual = list_schema_components(connection)?;
+    anyhow::ensure!(
+        actual.len() == GENERATED_DATABASE_COMPONENTS.len(),
+        "schema component catalog has {} entries; expected {}",
+        actual.len(),
+        GENERATED_DATABASE_COMPONENTS.len()
+    );
+    for generated in GENERATED_DATABASE_COMPONENTS {
+        let component = actual
+            .iter()
+            .find(|component| component.namespace == generated.namespace)
+            .with_context(|| {
+                format!(
+                    "schema component catalog is missing {}",
+                    generated.namespace
+                )
+            })?;
+        anyhow::ensure!(
+            component.schema_version == generated.schema_version,
+            "schema component {} version {} does not match generated version {}",
+            generated.namespace,
+            component.schema_version,
+            generated.schema_version
+        );
+        anyhow::ensure!(
+            component.minimum_core_schema == generated.minimum_core_schema,
+            "schema component {} minimum Core schema {} does not match generated value {}",
+            generated.namespace,
+            component.minimum_core_schema,
+            generated.minimum_core_schema
+        );
+        anyhow::ensure!(
+            component.migration_digest == generated.migration_digest,
+            "schema component {} migration digest does not match the generated contract",
+            generated.namespace
+        );
+        anyhow::ensure!(
+            component.contract_hash == DATABASE_CONTRACT_HASH,
+            "schema component {} contract hash does not match the active contract",
+            generated.namespace
+        );
+    }
+    let core = actual
+        .iter()
+        .find(|component| component.namespace == "core")
+        .context("schema component catalog is missing core")?;
+    anyhow::ensure!(
+        core.schema_version == schema_version(connection)?,
+        "core component version does not match schema_version"
+    );
+    Ok(())
+}
+
+pub fn current_schema_version(connection: &Connection) -> anyhow::Result<i64> {
     connection
         .query_row(
             "SELECT version FROM schema_version WHERE id = 1",
@@ -922,6 +1435,10 @@ fn schema_version(connection: &Connection) -> anyhow::Result<i64> {
             |row| row.get(0),
         )
         .context("failed to read schema version")
+}
+
+fn schema_version(connection: &Connection) -> anyhow::Result<i64> {
+    current_schema_version(connection)
 }
 
 fn set_schema_version(connection: &Connection, version: i64) -> anyhow::Result<()> {
@@ -945,6 +1462,9 @@ mod tests {
         let connection = open_store(&temp.path().join("ldgr.sqlite3"))?;
         assert_eq!(schema_version(&connection)?, CURRENT_SCHEMA_VERSION);
         for table in [
+            "schema_component",
+            "component_ingest",
+            "component_record",
             "work_item",
             "work_dependency",
             "run",
@@ -961,6 +1481,10 @@ mod tests {
         ] {
             assert!(table_exists(&connection, table)?, "missing {table}");
         }
+        assert_eq!(
+            list_schema_components(&connection)?.len(),
+            GENERATED_DATABASE_COMPONENTS.len()
+        );
         for table in [
             "issue",
             "fact",
@@ -989,24 +1513,9 @@ mod tests {
         let db_path = temp.path().join("ldgr.sqlite3");
         {
             let connection = Connection::open(&db_path)?;
-            connection.execute_batch(
-                r#"
-                CREATE TABLE schema_version (id INTEGER PRIMARY KEY CHECK (id = 1), version INTEGER NOT NULL, applied_at TEXT NOT NULL DEFAULT (datetime('now')));
-                INSERT INTO schema_version (id, version) VALUES (1, 1);
-                CREATE TABLE work_item (
-                    id INTEGER PRIMARY KEY,
-                    slug TEXT NOT NULL UNIQUE,
-                    title TEXT NOT NULL,
-                    description TEXT NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'pending'
-                        CHECK (status IN ('pending', 'running', 'done', 'canceled')),
-                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-                );
-                INSERT INTO work_item (slug, title, description) VALUES ('old-work', 'Old', 'Old');
-                CREATE TABLE fact (id INTEGER PRIMARY KEY);
-                "#,
-            )?;
+            connection.execute_batch(include_str!(
+                "../../tests/fixtures/schema/incompatible-v1-with-adapter-table.sql"
+            ))?;
         }
 
         let error = open_store(&db_path).unwrap_err();
@@ -1021,7 +1530,14 @@ mod tests {
             "{message}"
         );
         let connection = Connection::open(&db_path)?;
-        assert!(table_exists(&connection, "fact")?);
+        assert!(table_exists(&connection, "adapter_unregistered_record")?);
+        assert_eq!(schema_version(&connection)?, 1);
+        let preserved: String = connection.query_row(
+            "SELECT slug FROM work_item WHERE slug = 'preserved-old-work'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(preserved, "preserved-old-work");
         Ok(())
     }
 
@@ -1056,7 +1572,7 @@ mod tests {
     }
 
     #[test]
-    fn released_v1_database_migrates_to_v2_without_losing_ledger_data() -> anyhow::Result<()> {
+    fn released_v1_database_migrates_to_current_without_losing_ledger_data() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let db_path = temp.path().join("ldgr.sqlite3");
         {
@@ -1095,6 +1611,125 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn released_v2_database_gains_complete_component_catalog() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let db_path = temp.path().join("ldgr.sqlite3");
+        {
+            let connection = Connection::open(&db_path)?;
+            create_current_schema(&connection)?;
+            downgrade_test_schema_to_v2(&connection)?;
+            assert_eq!(schema_version(&connection)?, 2);
+            assert!(!table_exists(&connection, "schema_component")?);
+        }
+
+        let connection = open_store(&db_path)?;
+        assert_eq!(schema_version(&connection)?, CURRENT_SCHEMA_VERSION);
+        assert_eq!(
+            list_schema_components(&connection)?.len(),
+            GENERATED_DATABASE_COMPONENTS.len()
+        );
+        validate_component_catalog(&connection)?;
+        let backups = fs::read_dir(temp.path())?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name.contains(&format!("backup-schema-v2-to-v{}", CURRENT_SCHEMA_VERSION))
+                    })
+                    && path.extension().and_then(|value| value.to_str()) == Some("sqlite3")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(backups.len(), 1, "expected one verified migration backup");
+        let backup_connection = Connection::open(&backups[0])?;
+        assert_eq!(schema_version(&backup_connection)?, 2);
+        assert!(!table_exists(&backup_connection, "schema_component")?);
+        let backup_metadata: MigrationBackupInfo =
+            serde_json::from_slice(&fs::read(backups[0].with_extension("json"))?)?;
+        assert_eq!(backup_metadata.from_schema_version, 2);
+        assert_eq!(backup_metadata.to_schema_version, CURRENT_SCHEMA_VERSION);
+        assert_eq!(backup_metadata.contract_hash, DATABASE_CONTRACT_HASH);
+        Ok(())
+    }
+
+    #[test]
+    fn schema_doctor_reports_pending_migrations_without_mutation() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let db_path = temp.path().join("ldgr.sqlite3");
+        {
+            let connection = Connection::open(&db_path)?;
+            create_current_schema(&connection)?;
+            downgrade_test_schema_to_v2(&connection)?;
+        }
+        let report = doctor_schema(&db_path);
+        assert!(report.readable);
+        assert!(report.compatible);
+        assert_eq!(report.active_schema_version, Some(2));
+        assert_eq!(report.pending_migrations, vec![3, 4]);
+        assert!(report.components.is_empty());
+        assert!(report.last_backup.is_none());
+        let connection = Connection::open(&db_path)?;
+        assert_eq!(schema_version(&connection)?, 2);
+        assert!(!table_exists(&connection, "schema_component")?);
+        Ok(())
+    }
+
+    #[test]
+    fn multi_step_migration_rolls_back_to_v1_after_injected_failure() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let db_path = temp.path().join("ldgr.sqlite3");
+        let connection = Connection::open(&db_path)?;
+        create_current_schema(&connection)?;
+        downgrade_test_schema_to_v1(&connection)?;
+        connection.execute(
+            "INSERT INTO work_item (slug, title, description) VALUES ('survivor', 'Survivor', 'Synthetic')",
+            [],
+        )?;
+
+        let error = apply_pending_schema_migrations(&connection, Some(2)).unwrap_err();
+        assert!(format!("{error:#}").contains("injected migration failure"));
+        assert_eq!(schema_version(&connection)?, 1);
+        assert!(!table_exists(&connection, "work_dependency")?);
+        assert!(!table_exists(&connection, "schema_component")?);
+        let survivor: String = connection.query_row(
+            "SELECT slug FROM work_item WHERE slug = 'survivor'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(survivor, "survivor");
+        Ok(())
+    }
+
+    #[test]
+    fn catalog_hash_mismatch_is_rejected_without_repair() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let db_path = temp.path().join("ldgr.sqlite3");
+        {
+            let connection = Connection::open(&db_path)?;
+            create_current_schema(&connection)?;
+            connection.execute(
+                "UPDATE schema_component SET contract_hash = 'sha256:tampered' WHERE namespace = 'research'",
+                [],
+            )?;
+        }
+
+        let error = open_store(&db_path).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("contract hash does not match"),
+            "{error:#}"
+        );
+        let connection = Connection::open(&db_path)?;
+        let hash: String = connection.query_row(
+            "SELECT contract_hash FROM schema_component WHERE namespace = 'research'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(hash, "sha256:tampered");
+        Ok(())
+    }
+
     fn assert_core_tables_exist(connection: &Connection) -> anyhow::Result<()> {
         for table_name in CORE_TABLES {
             assert!(
@@ -1118,6 +1753,9 @@ mod tests {
     fn downgrade_test_schema_to_v1(connection: &Connection) -> anyhow::Result<()> {
         connection.execute_batch(
             r#"
+            DROP TABLE component_record;
+            DROP TABLE component_ingest;
+            DROP TABLE schema_component;
             DROP TRIGGER IF EXISTS trg_work_dependency_no_cycle;
             DROP INDEX IF EXISTS idx_work_dependency_depends_on;
             DROP INDEX IF EXISTS idx_work_item_priority_program;
@@ -1129,6 +1767,18 @@ mod tests {
             ALTER TABLE work_item DROP COLUMN program;
             ALTER TABLE work_item DROP COLUMN priority;
             UPDATE schema_version SET version = 1 WHERE id = 1;
+            "#,
+        )?;
+        Ok(())
+    }
+
+    fn downgrade_test_schema_to_v2(connection: &Connection) -> anyhow::Result<()> {
+        connection.execute_batch(
+            r#"
+            DROP TABLE component_record;
+            DROP TABLE component_ingest;
+            DROP TABLE schema_component;
+            UPDATE schema_version SET version = 2 WHERE id = 1;
             "#,
         )?;
         Ok(())

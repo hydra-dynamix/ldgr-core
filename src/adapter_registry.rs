@@ -159,6 +159,10 @@ pub struct DiscoveredAdapter {
     pub slug: String,
     pub title: String,
     pub core_version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub database_contract_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub component_schema_version: Option<i64>,
     pub aliases: Vec<String>,
     pub manifest_path: PathBuf,
     pub root_path: PathBuf,
@@ -191,6 +195,14 @@ pub struct AdapterCommandNamespace {
     pub summary: Option<String>,
     pub details: Option<String>,
     pub status_args: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub database_contract_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub core_schema_version: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub component_schema_version: Option<i64>,
+    #[serde(skip)]
+    pub adapter_contract_json: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -388,6 +400,31 @@ fn load_adapter_manifest(manifest_path: &Path) -> anyhow::Result<DiscoveredAdapt
     validate_manifest(manifest_dir, &manifest)?;
 
     let adapter_slug = clean_identifier("adapter.slug", &manifest.adapter.slug)?;
+    let generated_contract_text = if manifest.adapter.core_version == "generated" {
+        let contract_path = manifest_dir.join("adapter-database-contract.json");
+        Some(fs::read_to_string(&contract_path).with_context(|| {
+            format!(
+                "adapter {adapter_slug} requires generated database contract {}",
+                contract_path.display()
+            )
+        })?)
+    } else {
+        None
+    };
+    let generated_contract = if let Some(text) = &generated_contract_text {
+        let contract = crate::database_contract::parse_and_validate_adapter_contract(text)
+            .with_context(|| {
+                format!("adapter {adapter_slug} database contract is incompatible with this Core")
+            })?;
+        anyhow::ensure!(
+            contract.component.namespace == adapter_slug,
+            "adapter manifest slug {adapter_slug} does not match database component {}",
+            contract.component.namespace
+        );
+        Some(contract)
+    } else {
+        None
+    };
     let mut aliases = Vec::new();
     let mut seen_aliases = BTreeSet::new();
     for alias in manifest.adapter.aliases {
@@ -442,6 +479,16 @@ fn load_adapter_manifest(manifest_path: &Path) -> anyhow::Result<DiscoveredAdapt
             summary: help.as_ref().and_then(|help| help.summary.clone()),
             details: help.and_then(|help| help.details),
             status_args: command.status_args,
+            database_contract_hash: generated_contract
+                .as_ref()
+                .map(|contract| contract.contract_hash.clone()),
+            core_schema_version: generated_contract
+                .as_ref()
+                .map(|contract| contract.core_schema_version),
+            component_schema_version: generated_contract
+                .as_ref()
+                .map(|contract| contract.component.schema_version),
+            adapter_contract_json: generated_contract_text.clone(),
         });
     }
     if command_namespaces.is_empty() {
@@ -456,6 +503,16 @@ fn load_adapter_manifest(manifest_path: &Path) -> anyhow::Result<DiscoveredAdapt
             summary: Some(format!("Run {adapter_slug} adapter commands.")),
             details: None,
             status_args: Vec::new(),
+            database_contract_hash: generated_contract
+                .as_ref()
+                .map(|contract| contract.contract_hash.clone()),
+            core_schema_version: generated_contract
+                .as_ref()
+                .map(|contract| contract.core_schema_version),
+            component_schema_version: generated_contract
+                .as_ref()
+                .map(|contract| contract.component.schema_version),
+            adapter_contract_json: generated_contract_text.clone(),
         });
     }
 
@@ -465,7 +522,19 @@ fn load_adapter_manifest(manifest_path: &Path) -> anyhow::Result<DiscoveredAdapt
     Ok(DiscoveredAdapter {
         slug: adapter_slug,
         title: nonempty("adapter.title", manifest.adapter.title)?,
-        core_version: nonempty("adapter.core_version", manifest.adapter.core_version)?,
+        core_version: generated_contract
+            .as_ref()
+            .map(|contract| format!("schema-v{}", contract.core_schema_version))
+            .unwrap_or(nonempty(
+                "adapter.core_version",
+                manifest.adapter.core_version,
+            )?),
+        database_contract_hash: generated_contract
+            .as_ref()
+            .map(|contract| contract.contract_hash.clone()),
+        component_schema_version: generated_contract
+            .as_ref()
+            .map(|contract| contract.component.schema_version),
         aliases,
         manifest_path: manifest_path
             .canonicalize()

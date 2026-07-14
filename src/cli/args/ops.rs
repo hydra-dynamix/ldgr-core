@@ -129,6 +129,24 @@ pub struct StatusArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct SchemaArgs {
+    #[command(subcommand)]
+    pub command: SchemaCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SchemaCommand {
+    /// Inspect compatibility, pending migrations, components, and recovery without mutation.
+    Doctor(SchemaDoctorArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct SchemaDoctorArgs {
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
 #[command(
     after_help = "Examples:\n  ldgr web\n  ldgr web --port 4321\n\nThe web cockpit binds to loopback by default and prints a startup URL containing an ephemeral control token for mutating routes. Non-loopback exposure requires --unsafe-expose and an explicit --control-token."
 )]

@@ -31,6 +31,7 @@ pub(crate) const CLI_DEFAULT_HELP_SECTIONS: &str = r#"Core loop:
   validation record <run-id-or-work-slug> --outcome <pass|fail|error|skipped> --rationale <why-if-skipped>
   decision record <work-slug> --outcome continue --rationale <why> --next-slug <slug> --next-title <title> --next-description <description>
   status
+  schema doctor [--json]
   context --brief
   context
 
@@ -169,6 +170,8 @@ enum Command {
     Bundle(BundleArgs),
     /// Print the compact agent-first status summary.
     Status(StatusArgs),
+    /// Inspect the unified database contract and recovery state.
+    Schema(SchemaArgs),
     /// Print the operational cockpit.
     Context(ContextArgs),
     /// Serve the web cockpit UI.
@@ -302,6 +305,7 @@ fn handle_cli(cli: Cli) -> anyhow::Result<()> {
         Command::Status(args) => {
             commands::ops::handle_status(&open_store(&cli.db)?, &cli.artifact_root, args)
         }
+        Command::Schema(args) => commands::ops::handle_schema(&cli.db, args),
         Command::Context(args) => {
             commands::ops::handle_context(&open_store(&cli.db)?, &cli.artifact_root, args)
         }
@@ -413,6 +417,26 @@ fn dispatch_adapter_namespace(
     if command.argv.is_empty() {
         bail!("adapter namespace `{}` has empty argv", command.namespace);
     }
+    if let Some(contract) = &command.adapter_contract_json {
+        let help_only = request
+            .remaining
+            .iter()
+            .any(|argument| matches!(argument.to_str(), Some("--help" | "-h")));
+        if request.db.is_file() {
+            crate::store::open_store_for_adapter(&request.db, contract).with_context(|| {
+                format!(
+                    "adapter {} is incompatible with the active database; run the current `ldgr` Core command first",
+                    command.adapter_slug
+                )
+            })?;
+        } else if !help_only {
+            bail!(
+                "adapter {} requires a Core-initialized database at {}; run `ldgr init` first",
+                command.adapter_slug,
+                request.db.display()
+            );
+        }
+    }
     let working_dir = std::env::current_dir().context("failed to resolve current directory")?;
     let mut process = ProcessCommand::new(&command.argv[0]);
     process
@@ -423,6 +447,15 @@ fn dispatch_adapter_namespace(
         .env("LDGR_WORKING_DIR", working_dir)
         .env("LDGR_ADAPTER_SLUG", &command.adapter_slug)
         .env("LDGR_ADAPTER_NAMESPACE", &request.namespace);
+    if let Some(hash) = &command.database_contract_hash {
+        process.env("LDGR_DATABASE_CONTRACT_HASH", hash);
+    }
+    if let Some(version) = command.core_schema_version {
+        process.env("LDGR_CORE_SCHEMA_VERSION", version.to_string());
+    }
+    if let Some(version) = command.component_schema_version {
+        process.env("LDGR_ADAPTER_SCHEMA_VERSION", version.to_string());
+    }
     let status = process.status().with_context(|| {
         format!(
             "failed to execute adapter `{}` namespace `{}` command `{}`",

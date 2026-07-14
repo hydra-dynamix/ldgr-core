@@ -2,6 +2,7 @@ pub mod adapter_manifest;
 pub mod adapter_registry;
 pub mod claims;
 pub mod cli;
+pub mod database_contract;
 pub mod harness_config;
 pub mod loop_runtime;
 pub mod manifest_integrity;

@@ -32,7 +32,7 @@ verifies its SHA-256 checksum when checksum tooling is available, and installs
 `ldgr` to `~/.local/bin` by default. Override with:
 
 ```sh
-LDGR_VERSION=0.1.8 LDGR_INSTALL_DIR="$HOME/bin" sh -c "$(curl -fsSL https://raw.githubusercontent.com/hydra-dynamix/ldgr-core/main/scripts/install.sh)"
+LDGR_VERSION=0.1.9 LDGR_INSTALL_DIR="$HOME/bin" sh -c "$(curl -fsSL https://raw.githubusercontent.com/hydra-dynamix/ldgr-core/main/scripts/install.sh)"
 ```
 
 Source install remains available:
@@ -46,6 +46,13 @@ cargo install --path .
 ```
 
 SQLite is bundled; source fallback requires a recent stable Rust toolchain.
+
+Before an upgrade, `ldgr schema doctor` inspects the active schema, generated
+adapter contract set, pending migrations, and last verified backup without
+changing the database. Upgrade Core before adapters; Core applies the complete
+migration plan atomically and refuses unknown shapes or incompatible sidecars.
+See `docs/database-upgrade-and-recovery.md` in the LDGR repository for the
+backup and restore procedure.
 
 ## Quick start
 

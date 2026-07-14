@@ -12,7 +12,7 @@ use crate::loop_runtime::{
     run_loop_once, LoopAgent, LoopPromptSource, LoopRuntimeOptions, LoopRuntimeOutcome,
     LoopRuntimeResult,
 };
-use crate::store::{init_store, read_context};
+use crate::store::{doctor_schema, init_store, read_context};
 use crate::telemetry::{
     clear_unsent_telemetry, load_telemetry_consent, save_telemetry_consent,
     telemetry_kill_switch_active, TelemetryConsent, TelemetryConsentDecision,
@@ -24,7 +24,8 @@ use crate::web::{generate_control_token, serve, WebOptions};
 use super::super::args::{
     AdapterReconcileArgs, AdapterUninstallArgs, AdapterUpdateArgs, CliLoopAgent, ContextArgs,
     HarnessKind, InstallAdapterArgs, InstallArgs, InstallCommand, LoopArgs, LoopCommand,
-    LoopRunArgs, StatusArgs, TelemetryArgs, TelemetryCommand, TelemetryInstallChoice, WebArgs,
+    LoopRunArgs, SchemaArgs, SchemaCommand, StatusArgs, TelemetryArgs, TelemetryCommand,
+    TelemetryInstallChoice, WebArgs,
 };
 use super::super::render::brief_context::{
     brief_context, print_brief_context, BriefContextOptions,
@@ -616,6 +617,7 @@ fn install_resolved_index_release(
             extracted.display()
         );
     }
+    validate_adapter_bundle_contract(&extracted, &resolved.adapter.domain)?;
     let mut transaction = InstallTransaction::new(temp.join("rollback"))?;
     transaction.snapshot(install_root)?;
     let binary_source = extracted
@@ -1313,6 +1315,12 @@ fn install_adapter_from_source_root_with_package(
     source_root: &Path,
     install_root: &Path,
 ) -> anyhow::Result<()> {
+    let source_bundle = source_root.join(package);
+    if source_bundle.join("adapter.toml").is_file() {
+        let namespace = package.strip_prefix("ldgr-").unwrap_or(package);
+        let namespace = namespace.strip_suffix("-adapter").unwrap_or(namespace);
+        validate_adapter_bundle_contract(&source_bundle, namespace)?;
+    }
     println!("├─ Source checkout {}", source_root.display());
     let status = Command::new("cargo")
         .arg("run")
@@ -1330,6 +1338,37 @@ fn install_adapter_from_source_root_with_package(
         bail!("adapter installer failed for package `{package}` with status {status}");
     }
     patch_adapter_argv_to_source_runner(install_root, package, source_root)?;
+    Ok(())
+}
+
+fn validate_adapter_bundle_contract(bundle: &Path, adapter: &str) -> anyhow::Result<()> {
+    let manifest_path = bundle.join("adapter.toml");
+    if manifest_path.is_file() {
+        let manifest: toml::Value = toml::from_str(&fs::read_to_string(&manifest_path)?)
+            .with_context(|| format!("failed to parse {}", manifest_path.display()))?;
+        let generated = manifest
+            .get("adapter")
+            .and_then(|value| value.get("core_version"))
+            .and_then(toml::Value::as_str)
+            == Some("generated");
+        if !generated {
+            return Ok(());
+        }
+    }
+    let path = bundle.join("adapter-database-contract.json");
+    let text = fs::read_to_string(&path).with_context(|| {
+        format!(
+            "adapter {adapter} bundle is missing generated database contract {}",
+            path.display()
+        )
+    })?;
+    let contract = crate::database_contract::parse_and_validate_adapter_contract(&text)
+        .with_context(|| format!("adapter {adapter} is incompatible with this Core release"))?;
+    anyhow::ensure!(
+        contract.component.namespace == adapter,
+        "adapter bundle namespace {} does not match requested adapter {adapter}",
+        contract.component.namespace
+    );
     Ok(())
 }
 
@@ -2310,6 +2349,63 @@ const CLAUDE_LDGR_COMMAND: &str = r#"Run `ldgr $ARGUMENTS` in the current projec
 const CLAW_LDGR_COMMAND: &str = r#"Run `ldgr $ARGUMENTS` in the current project and report stdout/stderr back to the conversation. If no arguments are provided, run `ldgr context --brief`.
 "#;
 
+pub fn handle_schema(db: &Path, args: SchemaArgs) -> anyhow::Result<()> {
+    match args.command {
+        SchemaCommand::Doctor(args) => {
+            let report = doctor_schema(db);
+            if args.json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("database: {}", report.database.display());
+                println!("readable: {}", report.readable);
+                println!("compatible: {}", report.compatible);
+                println!(
+                    "schema: active={} target={}",
+                    report
+                        .active_schema_version
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    report.target_schema_version
+                );
+                println!("contract: {}", report.contract_hash);
+                if !report.pending_migrations.is_empty() {
+                    println!(
+                        "pending migrations: {}",
+                        report
+                            .pending_migrations
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    );
+                    println!("upgrade: run the current `ldgr status` once to migrate safely");
+                }
+                println!("components: {}", report.components.len());
+                for component in &report.components {
+                    println!(
+                        "  {} schema-v{} {}",
+                        component.namespace, component.schema_version, component.contract_hash
+                    );
+                }
+                if let Some(backup) = &report.last_backup {
+                    println!("last backup: {}", backup.display());
+                }
+                if let Some(problem) = &report.problem {
+                    println!("problem: {problem}");
+                }
+                if let Some(command) = &report.recovery_command {
+                    println!("recovery: {command}");
+                }
+            }
+            anyhow::ensure!(
+                report.compatible,
+                "database contract doctor found a problem"
+            );
+            Ok(())
+        }
+    }
+}
+
 pub fn handle_status(
     connection: &rusqlite::Connection,
     _artifact_root: &Path,
@@ -2966,6 +3062,31 @@ argv = ["ldgr-code"]
             install_root.path(),
             "ldgr-research"
         )?);
+        Ok(())
+    }
+
+    #[test]
+    fn adapter_bundle_contract_preflight_is_exact_and_read_only() -> anyhow::Result<()> {
+        let bundle = tempfile::tempdir()?;
+        std::fs::write(
+            bundle.path().join("adapter.toml"),
+            "[adapter]\nslug = \"example\"\ncore_version = \"generated\"\n",
+        )?;
+        let missing = validate_adapter_bundle_contract(bundle.path(), "example").unwrap_err();
+        assert!(format!("{missing:#}").contains("missing generated database contract"));
+
+        let valid = crate::database_contract::generated_adapter_contract_json("example")?;
+        std::fs::write(bundle.path().join("adapter-database-contract.json"), &valid)?;
+        validate_adapter_bundle_contract(bundle.path(), "example")?;
+
+        let mut tampered: serde_json::Value = serde_json::from_str(&valid)?;
+        tampered["contract_hash"] = "sha256:tampered".into();
+        std::fs::write(
+            bundle.path().join("adapter-database-contract.json"),
+            serde_json::to_vec(&tampered)?,
+        )?;
+        let error = validate_adapter_bundle_contract(bundle.path(), "example").unwrap_err();
+        assert!(format!("{error:#}").contains("incompatible with this Core release"));
         Ok(())
     }
 }
