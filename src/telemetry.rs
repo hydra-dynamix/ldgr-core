@@ -9,6 +9,8 @@ use tempfile::NamedTempFile;
 pub const TELEMETRY_CONSENT_SCHEMA_VERSION: u32 = 1;
 pub const TELEMETRY_CONSENT_POLICY_VERSION: u32 = 1;
 pub const TELEMETRY_CONSENT_FILE: &str = "telemetry-consent.json";
+pub const TELEMETRY_PENDING_DIRECTORY: &str = "telemetry-pending";
+pub const NUMERICAL_SEQUENCE_PROTOCOLS_V1: &[&str] = &["core-work/v1"];
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -16,6 +18,16 @@ pub enum TelemetryConsentDecision {
     Undecided,
     Enabled,
     Disabled,
+}
+
+impl TelemetryConsentDecision {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Undecided => "undecided",
+            Self::Enabled => "enabled",
+            Self::Disabled => "disabled",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -120,6 +132,35 @@ pub fn save_telemetry_consent(
     Ok(destination)
 }
 
+pub fn telemetry_kill_switch_active() -> bool {
+    std::env::var_os("LDGR_TELEMETRY").is_some_and(|value| {
+        value
+            .to_str()
+            .is_some_and(|value| value.eq_ignore_ascii_case("off"))
+    })
+}
+
+pub fn clear_unsent_telemetry(ldgr_home: &Path) -> anyhow::Result<()> {
+    let pending = ldgr_home.join(TELEMETRY_PENDING_DIRECTORY);
+    let metadata = match fs::symlink_metadata(&pending) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("failed to inspect unsent telemetry {}", pending.display())
+            });
+        }
+    };
+    if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
+        fs::remove_dir_all(&pending)
+            .with_context(|| format!("failed to clear unsent telemetry {}", pending.display()))?;
+    } else {
+        fs::remove_file(&pending)
+            .with_context(|| format!("failed to clear unsent telemetry {}", pending.display()))?;
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 fn sync_parent_directory(directory: &Path) -> anyhow::Result<()> {
     fs::File::open(directory)
@@ -210,6 +251,18 @@ mod tests {
         };
         assert!(save_telemetry_consent(home.path(), &consent).is_err());
         assert!(!telemetry_consent_path(home.path()).exists());
+        Ok(())
+    }
+
+    #[test]
+    fn clearing_unsent_telemetry_is_immediate_and_idempotent() -> anyhow::Result<()> {
+        let home = tempfile::tempdir()?;
+        let pending = home.path().join(TELEMETRY_PENDING_DIRECTORY);
+        fs::create_dir_all(&pending)?;
+        fs::write(pending.join("sequence.json"), "[0,1,3]")?;
+        clear_unsent_telemetry(home.path())?;
+        assert!(!pending.exists());
+        clear_unsent_telemetry(home.path())?;
         Ok(())
     }
 }

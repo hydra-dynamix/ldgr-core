@@ -14,7 +14,9 @@ use crate::loop_runtime::{
 };
 use crate::store::{init_store, read_context};
 use crate::telemetry::{
-    load_telemetry_consent, save_telemetry_consent, TelemetryConsent, TelemetryConsentDecision,
+    clear_unsent_telemetry, load_telemetry_consent, save_telemetry_consent,
+    telemetry_kill_switch_active, TelemetryConsent, TelemetryConsentDecision,
+    NUMERICAL_SEQUENCE_PROTOCOLS_V1, TELEMETRY_CONSENT_POLICY_VERSION,
 };
 use crate::tool_runner::parse_argv_json;
 use crate::web::{generate_control_token, serve, WebOptions};
@@ -22,7 +24,7 @@ use crate::web::{generate_control_token, serve, WebOptions};
 use super::super::args::{
     AdapterReconcileArgs, AdapterUninstallArgs, AdapterUpdateArgs, CliLoopAgent, ContextArgs,
     HarnessKind, InstallAdapterArgs, InstallArgs, InstallCommand, LoopArgs, LoopCommand,
-    LoopRunArgs, StatusArgs, TelemetryInstallChoice, WebArgs,
+    LoopRunArgs, StatusArgs, TelemetryArgs, TelemetryCommand, TelemetryInstallChoice, WebArgs,
 };
 use super::super::render::brief_context::{
     brief_context, print_brief_context, BriefContextOptions,
@@ -155,6 +157,64 @@ pub fn handle_install(args: InstallArgs) -> anyhow::Result<()> {
         }
     }
     println!("└─ Adapter bundles install under ~/.ldgr/adapters/<adapter>.");
+    Ok(())
+}
+
+pub fn handle_telemetry(args: TelemetryArgs) -> anyhow::Result<()> {
+    let ldgr_home = home_dir()?.join(".ldgr");
+    match args.command {
+        TelemetryCommand::Status => print_telemetry_status(&ldgr_home),
+        TelemetryCommand::Enable => {
+            let stdout = io::stdout();
+            let mut output = stdout.lock();
+            print_telemetry_scope(&mut output)?;
+            let consent = TelemetryConsent::current(TelemetryConsentDecision::Enabled);
+            save_telemetry_consent(&ldgr_home, &consent)?;
+            writeln!(output, "sequence collection: enabled")?;
+            if telemetry_kill_switch_active() {
+                writeln!(
+                    output,
+                    "effective collection: disabled by LDGR_TELEMETRY=off"
+                )?;
+            }
+            Ok(())
+        }
+        TelemetryCommand::Disable => {
+            let consent = TelemetryConsent::current(TelemetryConsentDecision::Disabled);
+            save_telemetry_consent(&ldgr_home, &consent)?;
+            clear_unsent_telemetry(&ldgr_home)?;
+            println!("sequence collection: disabled");
+            Ok(())
+        }
+    }
+}
+
+fn print_telemetry_status(ldgr_home: &Path) -> anyhow::Result<()> {
+    let consent = load_telemetry_consent(ldgr_home)?;
+    let kill_switch = telemetry_kill_switch_active();
+    let effective = consent.collection_enabled() && !kill_switch;
+    println!(
+        "sequence collection decision: {}",
+        consent.decision.as_str()
+    );
+    println!(
+        "effective collection: {}",
+        if effective { "enabled" } else { "disabled" }
+    );
+    println!("consent policy version: {}", consent.policy_version);
+    println!(
+        "current consent policy version: {}",
+        TELEMETRY_CONSENT_POLICY_VERSION
+    );
+    println!(
+        "environment kill switch: {}",
+        if kill_switch { "active" } else { "inactive" }
+    );
+    println!(
+        "eligible numerical protocols: {}",
+        NUMERICAL_SEQUENCE_PROTOCOLS_V1.join(", ")
+    );
+    println!("disable: ldgr telemetry disable");
     Ok(())
 }
 
@@ -1776,18 +1836,7 @@ fn prompt_telemetry_consent(
     input: &mut impl BufRead,
     output: &mut impl Write,
 ) -> anyhow::Result<TelemetryConsentDecision> {
-    writeln!(
-        output,
-        "LDGR can share numerical state-transition sequences for research."
-    )?;
-    writeln!(
-        output,
-        "The sequence records state order and whether execution completed with a positive, negative, inconclusive, failed, or cancelled result."
-    )?;
-    writeln!(
-        output,
-        "It does not include project data, names, labels, identifiers, timestamps, environment information, or linkable installation data."
-    )?;
+    print_telemetry_scope(output)?;
     loop {
         write!(output, "Share these sequences? Type Yes or No: ")?;
         output.flush()?;
@@ -1801,6 +1850,22 @@ fn prompt_telemetry_consent(
             _ => writeln!(output, "Please enter Yes or No. No option is preselected.")?,
         }
     }
+}
+
+fn print_telemetry_scope(output: &mut impl Write) -> anyhow::Result<()> {
+    writeln!(
+        output,
+        "LDGR can share numerical state-transition sequences for research."
+    )?;
+    writeln!(
+        output,
+        "The sequence records state order and whether execution completed with a positive, negative, inconclusive, failed, or cancelled result."
+    )?;
+    writeln!(
+        output,
+        "It does not include project data, names, labels, identifiers, timestamps, environment information, or linkable installation data."
+    )?;
+    Ok(())
 }
 
 fn select_harnesses(args: &InstallArgs) -> anyhow::Result<Vec<HarnessKind>> {
