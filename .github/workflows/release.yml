@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Semantic version to release, e.g. 0.1.1. Defaults to Cargo.toml version."
+        description: "Semantic version to release. Must match Cargo.toml."
         required: false
         type: string
       prerelease:
@@ -20,9 +20,50 @@ permissions:
   contents: write
 
 jobs:
+  metadata:
+    name: Validate release metadata
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Resolve and validate version
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo_version="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; data=json.load(sys.stdin); print(next(p["version"] for p in data["packages"] if p["name"]=="ldgr-core"))')"
+          requested_version="${{ github.event_name == 'workflow_dispatch' && inputs.version || '' }}"
+          version="${requested_version:-$cargo_version}"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "version must use semantic version syntax" >&2
+            exit 1
+          fi
+          if [[ "$version" != "$cargo_version" ]]; then
+            echo "requested version $version does not match Cargo.toml version $cargo_version" >&2
+            exit 1
+          fi
+          if [[ "${GITHUB_REF_TYPE}" == "tag" && "${GITHUB_REF_NAME}" != "v${version}" ]]; then
+            echo "tag ${GITHUB_REF_NAME} does not match Cargo.toml version v${version}" >&2
+            exit 1
+          fi
+          prerelease="true"
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            prerelease="${{ inputs.prerelease }}"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+
   build:
     name: Build ${{ matrix.platform }} binary release
+    needs: metadata
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -30,10 +71,10 @@ jobs:
           - os: ubuntu-latest
             platform: linux-x86_64
             binary_ext: ""
-          - os: self-hosted
+          - os: ubuntu-24.04-arm
             platform: linux-aarch64
             binary_ext: ""
-          - os: macos-13
+          - os: macos-15-intel
             platform: macos-x86_64
             binary_ext: ""
           - os: macos-14
@@ -46,11 +87,8 @@ jobs:
       PACKAGE: ldgr-core
       BINARY: ldgr
       RELEASE_NAME: ldgr-core
-      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -58,30 +96,19 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      - name: Resolve version
-        id: meta
-        shell: bash
-        run: |
-          set -euo pipefail
-          version="${{ github.event_name == 'workflow_dispatch' && inputs.version || '' }}"
-          if [[ -z "$version" ]]; then
-            version="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; data=json.load(sys.stdin); print(next(p["version"] for p in data["packages"] if p["name"]=="ldgr-core"))')"
-          fi
-          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]; then
-            echo "version must be semantic version syntax" >&2
-            exit 1
-          fi
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-
       - name: Build binary
-        run: cargo build --release -p "$PACKAGE"
+        run: cargo build --locked --release -p "$PACKAGE"
+        shell: bash
+
+      - name: Smoke test binary
+        run: "target/release/${BINARY}${{ matrix.binary_ext }} --version"
         shell: bash
 
       - name: Package archive
         shell: bash
         run: |
           set -euo pipefail
-          version="${{ steps.meta.outputs.version }}"
+          version="${{ needs.metadata.outputs.version }}"
           platform="${{ matrix.platform }}"
           binary_file="${BINARY}${{ matrix.binary_ext }}"
           staging="dist/${RELEASE_NAME}-${version}/${platform}"
@@ -109,18 +136,61 @@ jobs:
             shasum -a 256 "$archive" > "${archive}.sha256"
           fi
 
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.platform }}
+          path: |
+            dist/ldgr-core-${{ needs.metadata.outputs.version }}-${{ matrix.platform }}.tar.gz
+            dist/ldgr-core-${{ needs.metadata.outputs.version }}-${{ matrix.platform }}.tar.gz.sha256
+          if-no-files-found: error
+
+  publish:
+    name: Publish complete release
+    needs:
+      - metadata
+      - build
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_NAME: ldgr-core
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all platform artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+
+      - name: Verify complete release matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.metadata.outputs.version }}"
+          platforms=(linux-x86_64 linux-aarch64 macos-x86_64 macos-aarch64 windows-x86_64)
+          for platform in "${platforms[@]}"; do
+            archive="dist/${RELEASE_NAME}-${version}-${platform}.tar.gz"
+            test -s "$archive"
+            test -s "${archive}.sha256"
+            sha256sum -c "${archive}.sha256"
+          done
+          test "$(find dist -maxdepth 1 -type f -name '*.tar.gz' | wc -l)" -eq 5
+          test "$(find dist -maxdepth 1 -type f -name '*.tar.gz.sha256' | wc -l)" -eq 5
+
       - name: Create or update GitHub release
         shell: bash
         run: |
           set -euo pipefail
-          version="${{ steps.meta.outputs.version }}"
+          version="${{ needs.metadata.outputs.version }}"
           tag="v${version}"
           title="${RELEASE_NAME} v${version}"
           prerelease_flag=""
-          if [[ "${{ github.event_name == 'workflow_dispatch' && inputs.prerelease || 'true' }}" == "true" ]]; then
+          if [[ "${{ needs.metadata.outputs.prerelease }}" == "true" ]]; then
             prerelease_flag="--prerelease"
           fi
           if ! gh release view "$tag" >/dev/null 2>&1; then
             gh release create "$tag" --title "$title" --notes "${RELEASE_NAME} ${version} binary release from ${GITHUB_SHA}." $prerelease_flag
           fi
-          gh release upload "$tag" dist/${RELEASE_NAME}-${version}-*.tar.gz dist/${RELEASE_NAME}-${version}-*.tar.gz.sha256 --clobber
+          gh release upload "$tag" dist/*.tar.gz dist/*.tar.gz.sha256 --clobber

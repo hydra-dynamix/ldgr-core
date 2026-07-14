@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.7] - 2026-07-14
+
+### Added
+
+- Add explicit one-time, opt-in telemetry consent during installation, visible collection status, local buffering, and privacy-preserving numeric state-transition sequences with an interpretable success or unsuccessful terminal outcome.
+
+### Fixed
+
+- Build Linux ARM64 and macOS Intel archives on current GitHub-hosted runners.
+- Publish binary releases only after every supported platform build and checksum succeeds, preventing incomplete releases from appearing installable.
+
 ## [0.1.6] - 2026-07-13
 
 ### Changed
