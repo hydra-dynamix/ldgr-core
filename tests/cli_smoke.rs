@@ -18,11 +18,18 @@ use tempfile::TempDir;
 fn init_status_and_context_share_installed_domain_help_projection() -> anyhow::Result<()> {
     let project = TempDir::new()?;
     let adapter = project.path().join("adapter");
-    write_adapter_namespace_fixture(&adapter, "fixture", "fixture", "[\"true\"]")?;
-    let manifest = fs::read_to_string(adapter.join("adapter.toml"))?.replace(
-        "namespace = \"fixture\"",
-        "namespace = \"fixture\"\nstatus_args = [\"status\"]",
-    );
+    write_adapter_namespace_fixture(&adapter, "bench", "fixture", "[\"true\"]")?;
+    fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../ldgr-bench/adapter-database-contract.json"),
+        adapter.join("adapter-database-contract.json"),
+    )?;
+    let manifest = fs::read_to_string(adapter.join("adapter.toml"))?
+        .replace("core_version = \"0.1\"", "core_version = \"generated\"")
+        .replace(
+            "namespace = \"fixture\"",
+            "namespace = \"fixture\"\nstatus_args = [\"status\"]",
+        );
     fs::write(adapter.join("adapter.toml"), manifest)?;
     let instruction = "Run ldgr fixture --help for the extended command surface.";
 
@@ -4574,6 +4581,7 @@ fn command<const ARG_COUNT: usize>(
 fn isolated_command(project: &Path) -> anyhow::Result<Command> {
     let mut command = Command::cargo_bin("ldgr")?;
     command
+        .current_dir(project)
         .env(
             "LDGR_ADAPTER_PATH",
             project.join(".ldgr/test-empty-adapters"),
