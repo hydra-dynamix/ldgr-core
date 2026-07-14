@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-## [0.1.7] - 2026-07-14
+## [0.1.8] - 2026-07-14
 
 ### Added
 
@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - Build Linux ARM64 and macOS Intel archives on current GitHub-hosted runners.
 - Publish binary releases only after every supported platform build and checksum succeeds, preventing incomplete releases from appearing installable.
+- Refresh the standalone package lockfile so release checkouts build reproducibly with `--locked` after adding telemetry and installer dependencies.
 
 ## [0.1.6] - 2026-07-13
 

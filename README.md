@@ -32,7 +32,7 @@ verifies its SHA-256 checksum when checksum tooling is available, and installs
 `ldgr` to `~/.local/bin` by default. Override with:
 
 ```sh
-LDGR_VERSION=0.1.7 LDGR_INSTALL_DIR="$HOME/bin" sh -c "$(curl -fsSL https://raw.githubusercontent.com/hydra-dynamix/ldgr-core/main/scripts/install.sh)"
+LDGR_VERSION=0.1.8 LDGR_INSTALL_DIR="$HOME/bin" sh -c "$(curl -fsSL https://raw.githubusercontent.com/hydra-dynamix/ldgr-core/main/scripts/install.sh)"
 ```
 
 Source install remains available:
