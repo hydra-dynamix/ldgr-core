@@ -7,5 +7,6 @@ pub mod loop_runtime;
 pub mod manifest_integrity;
 pub mod release_index;
 pub mod store;
+pub mod telemetry;
 pub mod tool_runner;
 pub mod web;

@@ -376,7 +376,7 @@ pub(crate) fn print_status_summary(summary: &StatusSummary) {
         println!("next: {}{} {}", next.slug, priority, next.title);
         println!("ready: {}", if next.ready { "yes" } else { "no" });
         println!(
-            "dependencies: {}",
+            "next_dependencies: {}",
             if next.dependencies.is_empty() {
                 "none declared".to_owned()
             } else if next.blocked_by.is_empty() {

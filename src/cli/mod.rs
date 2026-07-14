@@ -98,6 +98,10 @@ pub(crate) const CLI_FULL_HELP_SECTIONS: &str = r#"Core command tree:
     list
     show
     dispatch
+  telemetry
+    status
+    enable
+    disable
   notice
     list
     add
@@ -173,6 +177,8 @@ enum Command {
     Loop(LoopArgs),
     /// Discover installed adapter manifests and command metadata.
     Adapter(AdapterArgs),
+    /// Control opt-in numerical state-sequence collection.
+    Telemetry(TelemetryArgs),
     /// Print the next pending work item.
     Next(NextArgs),
 }
@@ -304,6 +310,7 @@ fn handle_cli(cli: Cli) -> anyhow::Result<()> {
             commands::ops::handle_loop(&open_store(&cli.db)?, &cli.artifact_root, args)
         }
         Command::Adapter(args) => commands::adapters::handle_adapter(args),
+        Command::Telemetry(args) => commands::ops::handle_telemetry(args),
         Command::Next(args) => commands::work::handle_next(&open_store(&cli.db)?, args),
     }
 }

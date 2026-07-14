@@ -107,6 +107,128 @@ fn adapter_install_list_reads_explicit_release_index_without_recompile() -> anyh
 }
 
 #[test]
+fn first_install_requires_explicit_telemetry_choice_and_remembers_no() -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    let home = project.path().join(".ldgr/test-empty-home");
+    let consent_path = home.join(".ldgr/telemetry-consent.json");
+
+    let mut missing = isolated_command(project.path())?;
+    missing.args(["install", "--harness", "codex", "--yes", "--no-agentctl"]);
+    missing
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("telemetry choice required"))
+        .stderr(predicate::str::contains("--yes` is not telemetry consent"));
+    assert!(!consent_path.exists());
+
+    let mut decline = isolated_command(project.path())?;
+    decline.args([
+        "install",
+        "--harness",
+        "codex",
+        "--yes",
+        "--no-agentctl",
+        "--telemetry",
+        "disable",
+    ]);
+    decline.assert().success();
+    let consent: serde_json::Value = serde_json::from_str(&fs::read_to_string(&consent_path)?)?;
+    assert_eq!(consent["decision"], "disabled");
+    assert!(home.join(".ldgr/config.json").is_file());
+
+    let mut reinstall = isolated_command(project.path())?;
+    reinstall.args(["install", "--harness", "codex", "--yes", "--no-agentctl"]);
+    reinstall.assert().success();
+    let remembered: serde_json::Value = serde_json::from_str(&fs::read_to_string(&consent_path)?)?;
+    assert_eq!(remembered["decision"], "disabled");
+    Ok(())
+}
+
+#[test]
+fn explicit_install_opt_in_records_enabled_consent() -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    let home = project.path().join(".ldgr/test-empty-home");
+    let mut install = isolated_command(project.path())?;
+    install.args([
+        "install",
+        "--harness",
+        "codex",
+        "--yes",
+        "--no-agentctl",
+        "--telemetry",
+        "enable",
+    ]);
+    install.assert().success();
+    let consent: serde_json::Value = serde_json::from_str(&fs::read_to_string(
+        home.join(".ldgr/telemetry-consent.json"),
+    )?)?;
+    assert_eq!(consent["schema_version"], 1);
+    assert_eq!(consent["policy_version"], 1);
+    assert_eq!(consent["decision"], "enabled");
+    Ok(())
+}
+
+#[test]
+fn telemetry_controls_report_override_and_disable_without_network() -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    let home = project.path().join(".ldgr/test-empty-home");
+    let ldgr_home = home.join(".ldgr");
+    let consent_path = ldgr_home.join("telemetry-consent.json");
+
+    let mut initial_status = isolated_command(project.path())?;
+    initial_status.args(["telemetry", "status"]);
+    initial_status
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "sequence collection decision: undecided",
+        ))
+        .stdout(predicate::str::contains("effective collection: disabled"))
+        .stdout(predicate::str::contains(
+            "eligible numerical protocols: core-work/v1",
+        ));
+    assert!(!consent_path.exists());
+
+    let mut enable = isolated_command(project.path())?;
+    enable.args(["telemetry", "enable"]);
+    enable
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "does not include project data, names, labels, identifiers, timestamps, environment information, or linkable installation data",
+        ))
+        .stdout(predicate::str::contains("sequence collection: enabled"));
+
+    let mut killed_status = isolated_command(project.path())?;
+    killed_status
+        .env("LDGR_TELEMETRY", "off")
+        .args(["telemetry", "status"]);
+    killed_status
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "sequence collection decision: enabled",
+        ))
+        .stdout(predicate::str::contains("effective collection: disabled"))
+        .stdout(predicate::str::contains("environment kill switch: active"));
+
+    let pending = ldgr_home.join("telemetry-pending");
+    fs::create_dir_all(&pending)?;
+    fs::write(pending.join("sequence.json"), "[0,1,3]")?;
+
+    let mut disable = isolated_command(project.path())?;
+    disable.args(["telemetry", "disable"]);
+    disable
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("sequence collection: disabled"));
+    assert!(!pending.exists());
+    let consent: serde_json::Value = serde_json::from_str(&fs::read_to_string(consent_path)?)?;
+    assert_eq!(consent["decision"], "disabled");
+    Ok(())
+}
+
+#[test]
 fn adapter_install_resolves_and_installs_fixture_from_index() -> anyhow::Result<()> {
     let project = TempDir::new()?;
     let bundle = project.path().join("fixture-1.2.3");
@@ -4086,7 +4208,7 @@ fn structured_dependencies_gate_readiness_and_reject_cycles() -> anyhow::Result<
     .assert()
     .success()
     .stdout(predicate::str::contains("next: registry [P1]"))
-    .stdout(predicate::str::contains("dependencies: none declared"))
+    .stdout(predicate::str::contains("next_dependencies: none declared"))
     .stdout(predicate::str::contains("queue: P0=1 P1=1"))
     .stdout(predicate::str::contains("unblocks: atomicity"));
     command(

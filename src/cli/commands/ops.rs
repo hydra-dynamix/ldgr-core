@@ -1,5 +1,5 @@
 use std::fs;
-use std::io;
+use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -13,13 +13,18 @@ use crate::loop_runtime::{
     LoopRuntimeResult,
 };
 use crate::store::{init_store, read_context};
+use crate::telemetry::{
+    clear_unsent_telemetry, load_telemetry_consent, save_telemetry_consent,
+    telemetry_kill_switch_active, TelemetryConsent, TelemetryConsentDecision,
+    NUMERICAL_SEQUENCE_PROTOCOLS_V1, TELEMETRY_CONSENT_POLICY_VERSION,
+};
 use crate::tool_runner::parse_argv_json;
 use crate::web::{generate_control_token, serve, WebOptions};
 
 use super::super::args::{
     AdapterReconcileArgs, AdapterUninstallArgs, AdapterUpdateArgs, CliLoopAgent, ContextArgs,
     HarnessKind, InstallAdapterArgs, InstallArgs, InstallCommand, LoopArgs, LoopCommand,
-    LoopRunArgs, StatusArgs, WebArgs,
+    LoopRunArgs, StatusArgs, TelemetryArgs, TelemetryCommand, TelemetryInstallChoice, WebArgs,
 };
 use super::super::render::brief_context::{
     brief_context, print_brief_context, BriefContextOptions,
@@ -59,6 +64,9 @@ pub fn handle_install(args: InstallArgs) -> anyhow::Result<()> {
         };
     }
     print_installer_header();
+    let home = home_dir()?;
+    let ldgr_home = home.join(".ldgr");
+    resolve_install_telemetry_consent(&args, &ldgr_home)?;
     let harnesses = select_harnesses(&args)?;
     if harnesses.is_empty() {
         return Ok(());
@@ -73,8 +81,6 @@ pub fn handle_install(args: InstallArgs) -> anyhow::Result<()> {
     );
     println!("│");
 
-    let home = home_dir()?;
-    let ldgr_home = home.join(".ldgr");
     fs::create_dir_all(&ldgr_home)?;
     let release_keyring = ldgr_home.join(LDGR_RELEASE_KEYRING_FILE);
     fs::write(&release_keyring, LDGR_RELEASE_KEYRING)?;
@@ -151,6 +157,64 @@ pub fn handle_install(args: InstallArgs) -> anyhow::Result<()> {
         }
     }
     println!("└─ Adapter bundles install under ~/.ldgr/adapters/<adapter>.");
+    Ok(())
+}
+
+pub fn handle_telemetry(args: TelemetryArgs) -> anyhow::Result<()> {
+    let ldgr_home = home_dir()?.join(".ldgr");
+    match args.command {
+        TelemetryCommand::Status => print_telemetry_status(&ldgr_home),
+        TelemetryCommand::Enable => {
+            let stdout = io::stdout();
+            let mut output = stdout.lock();
+            print_telemetry_scope(&mut output)?;
+            let consent = TelemetryConsent::current(TelemetryConsentDecision::Enabled);
+            save_telemetry_consent(&ldgr_home, &consent)?;
+            writeln!(output, "sequence collection: enabled")?;
+            if telemetry_kill_switch_active() {
+                writeln!(
+                    output,
+                    "effective collection: disabled by LDGR_TELEMETRY=off"
+                )?;
+            }
+            Ok(())
+        }
+        TelemetryCommand::Disable => {
+            let consent = TelemetryConsent::current(TelemetryConsentDecision::Disabled);
+            save_telemetry_consent(&ldgr_home, &consent)?;
+            clear_unsent_telemetry(&ldgr_home)?;
+            println!("sequence collection: disabled");
+            Ok(())
+        }
+    }
+}
+
+fn print_telemetry_status(ldgr_home: &Path) -> anyhow::Result<()> {
+    let consent = load_telemetry_consent(ldgr_home)?;
+    let kill_switch = telemetry_kill_switch_active();
+    let effective = consent.collection_enabled() && !kill_switch;
+    println!(
+        "sequence collection decision: {}",
+        consent.decision.as_str()
+    );
+    println!(
+        "effective collection: {}",
+        if effective { "enabled" } else { "disabled" }
+    );
+    println!("consent policy version: {}", consent.policy_version);
+    println!(
+        "current consent policy version: {}",
+        TELEMETRY_CONSENT_POLICY_VERSION
+    );
+    println!(
+        "environment kill switch: {}",
+        if kill_switch { "active" } else { "inactive" }
+    );
+    println!(
+        "eligible numerical protocols: {}",
+        NUMERICAL_SEQUENCE_PROTOCOLS_V1.join(", ")
+    );
+    println!("disable: ldgr telemetry disable");
     Ok(())
 }
 
@@ -1735,6 +1799,75 @@ fn print_installer_header() {
     println!("│");
 }
 
+fn resolve_install_telemetry_consent(
+    args: &InstallArgs,
+    ldgr_home: &Path,
+) -> anyhow::Result<TelemetryConsent> {
+    let existing = load_telemetry_consent(ldgr_home)?;
+    if let Some(choice) = args.telemetry {
+        let decision = match choice {
+            TelemetryInstallChoice::Enable => TelemetryConsentDecision::Enabled,
+            TelemetryInstallChoice::Disable => TelemetryConsentDecision::Disabled,
+        };
+        let consent = TelemetryConsent::current(decision);
+        save_telemetry_consent(ldgr_home, &consent)?;
+        return Ok(consent);
+    }
+    if existing.decision != TelemetryConsentDecision::Undecided {
+        return Ok(existing);
+    }
+    if args.yes || !stdin_is_terminal() {
+        bail!(
+            "telemetry choice required for the first non-interactive install; pass `--telemetry enable` or `--telemetry disable` (`--yes` is not telemetry consent)"
+        );
+    }
+
+    let stdin = io::stdin();
+    let mut input = stdin.lock();
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    let decision = prompt_telemetry_consent(&mut input, &mut output)?;
+    let consent = TelemetryConsent::current(decision);
+    save_telemetry_consent(ldgr_home, &consent)?;
+    Ok(consent)
+}
+
+fn prompt_telemetry_consent(
+    input: &mut impl BufRead,
+    output: &mut impl Write,
+) -> anyhow::Result<TelemetryConsentDecision> {
+    print_telemetry_scope(output)?;
+    loop {
+        write!(output, "Share these sequences? Type Yes or No: ")?;
+        output.flush()?;
+        let mut answer = String::new();
+        if input.read_line(&mut answer)? == 0 {
+            bail!("telemetry choice required; enter Yes or No");
+        }
+        match answer.trim().to_ascii_lowercase().as_str() {
+            "yes" | "y" => return Ok(TelemetryConsentDecision::Enabled),
+            "no" | "n" => return Ok(TelemetryConsentDecision::Disabled),
+            _ => writeln!(output, "Please enter Yes or No. No option is preselected.")?,
+        }
+    }
+}
+
+fn print_telemetry_scope(output: &mut impl Write) -> anyhow::Result<()> {
+    writeln!(
+        output,
+        "LDGR can share numerical state-transition sequences for research."
+    )?;
+    writeln!(
+        output,
+        "The sequence records state order and whether execution completed with a positive, negative, inconclusive, failed, or cancelled result."
+    )?;
+    writeln!(
+        output,
+        "It does not include project data, names, labels, identifiers, timestamps, environment information, or linkable installation data."
+    )?;
+    Ok(())
+}
+
 fn select_harnesses(args: &InstallArgs) -> anyhow::Result<Vec<HarnessKind>> {
     if !args.harness.is_empty() {
         println!(
@@ -2517,6 +2650,32 @@ fn loop_result_failed(result: &LoopRuntimeResult, options: &LoopRuntimeOptions) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn telemetry_prompt_requires_an_explicit_yes_or_no() -> anyhow::Result<()> {
+        let mut input = std::io::Cursor::new(b"\nmaybe\nNo\n");
+        let mut output = Vec::new();
+        assert_eq!(
+            prompt_telemetry_consent(&mut input, &mut output)?,
+            TelemetryConsentDecision::Disabled
+        );
+        let output = String::from_utf8(output)?;
+        assert!(output.contains("positive, negative, inconclusive, failed, or cancelled"));
+        assert!(output.contains("Please enter Yes or No. No option is preselected."));
+        assert_eq!(output.matches("Share these sequences?").count(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn telemetry_prompt_can_enable_collection_explicitly() -> anyhow::Result<()> {
+        let mut input = std::io::Cursor::new(b"Yes\n");
+        let mut output = Vec::new();
+        assert_eq!(
+            prompt_telemetry_consent(&mut input, &mut output)?,
+            TelemetryConsentDecision::Enabled
+        );
+        Ok(())
+    }
 
     #[test]
     fn adapter_typo_suggestion_handles_conduct_transposition() {

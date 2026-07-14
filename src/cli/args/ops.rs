@@ -10,9 +10,15 @@ pub enum HarnessKind {
     Openclaw,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum TelemetryInstallChoice {
+    Enable,
+    Disable,
+}
+
 #[derive(Debug, Args)]
 #[command(
-    after_help = "Examples:\n  ldgr install\n  ldgr install --harness pi --harness claude --adapter conduct --yes\n  ldgr install --yes --no-agentctl\n  ldgr install adapter code --yes\n\nWithout --harness, the installer asks interactively and defaults to Pi. Multiple harnesses may be selected. In interactive mode the installer also offers adapter bundle selection. The selected harness config is recorded under ~/.ldgr/. agentctl is installed when missing unless --no-agentctl is passed."
+    after_help = "Examples:\n  ldgr install\n  ldgr install --harness pi --harness claude --adapter conduct --yes --telemetry disable\n  ldgr install --yes --no-agentctl --telemetry enable\n  ldgr install adapter code --yes\n\nThe first interactive install requires an explicit telemetry Yes or No choice with no default. Non-interactive installs must pass --telemetry enable or --telemetry disable; --yes is not telemetry consent. The decision is remembered and later installs do not ask again. Without --harness, the installer asks interactively and defaults to Pi. Multiple harnesses may be selected. In interactive mode the installer also offers adapter bundle selection. The selected harness config is recorded under ~/.ldgr/. agentctl is installed when missing unless --no-agentctl is passed."
 )]
 pub struct InstallArgs {
     #[command(subcommand)]
@@ -25,6 +31,10 @@ pub struct InstallArgs {
     /// Accept defaults and do not prompt. Defaults to Pi when --harness is omitted.
     #[arg(long)]
     pub yes: bool,
+
+    /// Explicitly enable or disable numerical state-sequence collection.
+    #[arg(long, value_enum)]
+    pub telemetry: Option<TelemetryInstallChoice>,
 
     /// Do not install agentctl even if it is missing from PATH.
     #[arg(long)]
