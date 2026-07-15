@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.11] - 2026-07-15
+
+### Fixed
+
+- Automatically migrate recognized schema-v1 ledgers when opening `ldgr status`, `ldgr context`, or `ldgr init`, with a verified backup reported before mutation.
+- Preserve adapter-owned tables and data while validating and upgrading the Core-owned schema, including older v1 ledgers that predate optional Core prompt tables.
+
 ## [0.1.8] - 2026-07-14
 
 ### Added

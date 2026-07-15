@@ -13,7 +13,8 @@ use crate::loop_runtime::{
     LoopRuntimeResult,
 };
 use crate::store::{
-    doctor_schema, init_store, open_store_with_migration_info, read_context, MigrationBackupInfo,
+    doctor_schema, init_store_with_migration_info, open_store_with_migration_info, read_context,
+    MigrationBackupInfo,
 };
 use crate::telemetry::{
     clear_unsent_telemetry, load_telemetry_consent, save_telemetry_consent,
@@ -47,7 +48,8 @@ const AGENTCTL_REPO: &str = "https://github.com/hydra-dynamix/agentctl";
 
 pub fn handle_init(db: &Path, artifact_root: &Path) -> anyhow::Result<()> {
     let existing_database = db.exists();
-    init_store(db, artifact_root)?;
+    let migration = init_store_with_migration_info(db, artifact_root)?;
+    print_migration_notice(migration.as_ref());
     if existing_database {
         println!("opened existing {} (no data erased)", db.display());
     } else {

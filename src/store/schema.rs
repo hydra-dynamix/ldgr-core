@@ -904,9 +904,9 @@ fn migrate_v1_to_v2(connection: &Connection) -> anyhow::Result<()> {
                 "#,
             )
         .context("failed to migrate ldgr schema from v1 to v2")?;
-    connection
-        .execute_batch(SCHEMA_INDEXES)
-        .context("failed to create v2 schema indexes and dependency guard")?;
+    // The v1 ledger surface predates some optional Core tables. The complete
+    // current schema and its indexes are installed by apply_current_v2_contract
+    // immediately after these in-place column additions.
     set_schema_version(connection, 2)
 }
 
@@ -941,7 +941,6 @@ fn validate_foreign_keys(connection: &Connection) -> anyhow::Result<()> {
 }
 
 fn version_2_schema_matches(connection: &Connection) -> anyhow::Result<bool> {
-    let table_names = application_table_names(connection)?;
     let v2_tables = CORE_TABLES
         .iter()
         .copied()
@@ -952,12 +951,10 @@ fn version_2_schema_matches(connection: &Connection) -> anyhow::Result<bool> {
             )
         })
         .collect::<Vec<_>>();
-    if table_names.len() != v2_tables.len()
-        || table_names
-            .iter()
-            .any(|name| !v2_tables.contains(&name.as_str()))
-    {
-        return Ok(false);
+    for table in &v2_tables {
+        if !table_exists(connection, table)? {
+            return Ok(false);
+        }
     }
     for table_schema in EXPECTED_SCHEMA {
         if matches!(
@@ -999,22 +996,7 @@ fn version_3_schema_matches(connection: &Connection) -> anyhow::Result<bool> {
 }
 
 fn version_1_schema_matches(connection: &Connection) -> anyhow::Result<bool> {
-    let table_names = application_table_names(connection)?;
-    let v1_tables = CORE_TABLES
-        .iter()
-        .copied()
-        .filter(|name| {
-            !matches!(
-                *name,
-                "work_dependency" | "schema_component" | "component_ingest" | "component_record"
-            )
-        })
-        .collect::<Vec<_>>();
-    if table_names.len() != v1_tables.len()
-        || table_names
-            .iter()
-            .any(|name| !v1_tables.contains(&name.as_str()))
-    {
+    if !table_exists(connection, "work_item")? {
         return Ok(false);
     }
     let v1_work_item = TableSchema {
@@ -1040,7 +1022,13 @@ fn version_1_schema_matches(connection: &Connection) -> anyhow::Result<bool> {
         ) {
             continue;
         }
-        if !table_matches_schema(connection, table_schema)? {
+        // Some released v1 binaries did not create the later prompt tables
+        // until those features were first available. Missing Core tables are
+        // safe to create from CURRENT_SCHEMA. Existing Core tables must still
+        // match exactly. Non-Core tables belong to adapters and are preserved.
+        if table_exists(connection, table_schema.name)?
+            && !table_matches_schema(connection, table_schema)?
+        {
             return Ok(false);
         }
     }
@@ -1098,12 +1086,8 @@ fn quoted_identifier(value: &str) -> String {
 }
 
 fn current_schema_matches(connection: &Connection) -> anyhow::Result<bool> {
-    let table_names = application_table_names(connection)?;
-    for table_name in &table_names {
-        if !CORE_TABLES.contains(&table_name.as_str()) {
-            return Ok(false);
-        }
-    }
+    // Adapter-owned tables may coexist in a central ledger. Core validates all
+    // tables it owns but must not reject or mutate names outside that set.
     for table_name in CORE_TABLES {
         if !table_exists(connection, table_name)? {
             return Ok(false);
@@ -1582,6 +1566,49 @@ mod tests {
         assert_eq!(
             list_observations(&connection, None, 10)?[0].body,
             "durable evidence"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn sparse_v1_database_with_adapter_tables_migrates_without_losing_data() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let db_path = temp.path().join("ldgr.sqlite3");
+        {
+            let connection = Connection::open(&db_path)?;
+            create_current_schema(&connection)?;
+            downgrade_test_schema_to_v1(&connection)?;
+            connection.execute_batch(
+                r#"
+                DROP TABLE prompt_bundle_item;
+                DROP TABLE prompt_bundle;
+                DROP TABLE prompt;
+                DROP TABLE prompt_version;
+                CREATE TABLE adapter_profile (
+                    id INTEGER PRIMARY KEY,
+                    payload TEXT NOT NULL
+                );
+                INSERT INTO adapter_profile (payload) VALUES ('preserve adapter data');
+                INSERT INTO work_item (slug, title, description, status)
+                VALUES ('sparse-v1', 'Sparse v1', 'Preserve Core data', 'done');
+                "#,
+            )?;
+        }
+
+        let connection = open_store(&db_path)?;
+        assert_eq!(schema_version(&connection)?, CURRENT_SCHEMA_VERSION);
+        assert!(table_exists(&connection, "prompt")?);
+        assert!(table_exists(&connection, "work_dependency")?);
+        assert!(table_exists(&connection, "adapter_profile")?);
+        let adapter_payload: String = connection.query_row(
+            "SELECT payload FROM adapter_profile WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(adapter_payload, "preserve adapter data");
+        assert_eq!(
+            require_work_item_by_slug(&connection, "sparse-v1")?.status,
+            WorkItemStatus::Done
         );
         Ok(())
     }

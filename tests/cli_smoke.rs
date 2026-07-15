@@ -16,8 +16,9 @@ use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 #[test]
-fn status_and_context_migrate_released_v1_databases_and_report_the_backup() -> anyhow::Result<()> {
-    for entrypoint in [["status"], ["context"]] {
+fn init_status_and_context_migrate_released_v1_databases_and_report_the_backup(
+) -> anyhow::Result<()> {
+    for entrypoint in [["status"], ["context"], ["init"]] {
         let project = TempDir::new()?;
         let db_path = project.path().join(".ldgr/ldgr.db");
         let artifact_root = project.path().join(".ldgr/artifacts");

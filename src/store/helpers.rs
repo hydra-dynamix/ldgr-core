@@ -11,6 +11,13 @@ pub struct MigrationBackupInfo {
 }
 
 pub fn init_store(db_path: &Path, artifact_root: &Path) -> anyhow::Result<()> {
+    init_store_with_migration_info(db_path, artifact_root).map(|_| ())
+}
+
+pub fn init_store_with_migration_info(
+    db_path: &Path,
+    artifact_root: &Path,
+) -> anyhow::Result<Option<MigrationBackupInfo>> {
     if let Some(parent) = db_path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create database directory {}", parent.display()))?;
@@ -21,7 +28,7 @@ pub fn init_store(db_path: &Path, artifact_root: &Path) -> anyhow::Result<()> {
             artifact_root.display()
         )
     })?;
-    open_store(db_path).map(|_| ())
+    open_store_with_migration_info(db_path).map(|(_, migration)| migration)
 }
 
 pub fn open_store(db_path: &Path) -> anyhow::Result<Connection> {
