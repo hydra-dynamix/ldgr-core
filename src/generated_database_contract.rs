@@ -2,21 +2,21 @@
 
 pub const DATABASE_CONTRACT_FORMAT: &str = "ldgr.database-contract.v1";
 pub const ADAPTER_DATABASE_CONTRACT_FORMAT: &str = "ldgr.adapter-database-contract.v1";
-pub const DATABASE_CONTRACT_HASH: &str = "sha256:2d59299bf0738de94997d0f58e104b0de321800064f99d6391f2bdadabf2fc6c";
-pub const GENERATED_CORE_SCHEMA_VERSION: i64 = 4;
+pub const DATABASE_CONTRACT_HASH: &str = "sha256:7e177ee30c2eff7801d30d2f787e59daa24cbfe0eceff4e98bb442058e288aa3";
+pub const GENERATED_CORE_SCHEMA_VERSION: i64 = 2;
 pub const GENERATED_DATABASE_CONTRACT_JSON: &str = include_str!("../schema/database-contract.json");
 
 pub const GENERATED_DATABASE_COMPONENTS: &[DatabaseComponentContract] = &[
-    DatabaseComponentContract { namespace: "bench", schema_version: 1, minimum_core_schema: 4, migration_digest: "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" },
-    DatabaseComponentContract { namespace: "code", schema_version: 1, minimum_core_schema: 4, migration_digest: "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" },
-    DatabaseComponentContract { namespace: "conduct", schema_version: 1, minimum_core_schema: 4, migration_digest: "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" },
-    DatabaseComponentContract { namespace: "core", schema_version: 4, minimum_core_schema: 4, migration_digest: "sha256:337c5c8c682455c18857a120cddba65e92cb9b2ca82e61850e1b1412139fcac3" },
-    DatabaseComponentContract { namespace: "evidence", schema_version: 1, minimum_core_schema: 4, migration_digest: "sha256:c6ccb9b2d2981ee82f02e915eb9d5be3c5b5a9e7d49ae256eae133b05e68e6fe" },
-    DatabaseComponentContract { namespace: "example", schema_version: 1, minimum_core_schema: 4, migration_digest: "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" },
-    DatabaseComponentContract { namespace: "explore", schema_version: 1, minimum_core_schema: 4, migration_digest: "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" },
-    DatabaseComponentContract { namespace: "private-commercial", schema_version: 1, minimum_core_schema: 4, migration_digest: "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" },
-    DatabaseComponentContract { namespace: "programbench", schema_version: 1, minimum_core_schema: 4, migration_digest: "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" },
-    DatabaseComponentContract { namespace: "recall", schema_version: 1, minimum_core_schema: 4, migration_digest: "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" },
-    DatabaseComponentContract { namespace: "research", schema_version: 4, minimum_core_schema: 4, migration_digest: "sha256:1795f5ad5d3dbb3b57b5f733beec88c7f7f2b394d85e10b1bfe97a826d21eda4" },
-    DatabaseComponentContract { namespace: "security", schema_version: 1, minimum_core_schema: 4, migration_digest: "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" },
+    DatabaseComponentContract { namespace: "bench", schema_version: 1, minimum_core_schema: 2, migration_digest: "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" },
+    DatabaseComponentContract { namespace: "code", schema_version: 1, minimum_core_schema: 2, migration_digest: "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" },
+    DatabaseComponentContract { namespace: "conduct", schema_version: 1, minimum_core_schema: 2, migration_digest: "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" },
+    DatabaseComponentContract { namespace: "core", schema_version: 2, minimum_core_schema: 2, migration_digest: "sha256:aa80a85b6d3d42451b2abd3844def99c44f7b236b40b1ad5a69fad7ae5904fc2" },
+    DatabaseComponentContract { namespace: "evidence", schema_version: 1, minimum_core_schema: 2, migration_digest: "sha256:c6ccb9b2d2981ee82f02e915eb9d5be3c5b5a9e7d49ae256eae133b05e68e6fe" },
+    DatabaseComponentContract { namespace: "example", schema_version: 1, minimum_core_schema: 2, migration_digest: "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" },
+    DatabaseComponentContract { namespace: "explore", schema_version: 1, minimum_core_schema: 2, migration_digest: "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" },
+    DatabaseComponentContract { namespace: "private-commercial", schema_version: 1, minimum_core_schema: 2, migration_digest: "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" },
+    DatabaseComponentContract { namespace: "programbench", schema_version: 1, minimum_core_schema: 2, migration_digest: "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" },
+    DatabaseComponentContract { namespace: "recall", schema_version: 1, minimum_core_schema: 2, migration_digest: "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" },
+    DatabaseComponentContract { namespace: "research", schema_version: 4, minimum_core_schema: 2, migration_digest: "sha256:1795f5ad5d3dbb3b57b5f733beec88c7f7f2b394d85e10b1bfe97a826d21eda4" },
+    DatabaseComponentContract { namespace: "security", schema_version: 1, minimum_core_schema: 2, migration_digest: "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" },
 ];

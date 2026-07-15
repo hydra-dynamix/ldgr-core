@@ -25,6 +25,12 @@ pub fn init_store(db_path: &Path, artifact_root: &Path) -> anyhow::Result<()> {
 }
 
 pub fn open_store(db_path: &Path) -> anyhow::Result<Connection> {
+    open_store_with_migration_info(db_path).map(|(connection, _)| connection)
+}
+
+pub fn open_store_with_migration_info(
+    db_path: &Path,
+) -> anyhow::Result<(Connection, Option<MigrationBackupInfo>)> {
     if let Some(parent) = db_path.parent() {
         if !parent.as_os_str().is_empty() && !parent.exists() {
             anyhow::bail!(
@@ -50,7 +56,7 @@ pub fn open_store(db_path: &Path) -> anyhow::Result<Connection> {
         return Err(error);
     }
     verify_connection_integrity(&connection)?;
-    Ok(connection)
+    Ok((connection, backup))
 }
 
 pub fn open_store_for_adapter(

@@ -12,7 +12,9 @@ use crate::loop_runtime::{
     run_loop_once, LoopAgent, LoopPromptSource, LoopRuntimeOptions, LoopRuntimeOutcome,
     LoopRuntimeResult,
 };
-use crate::store::{doctor_schema, init_store, read_context};
+use crate::store::{
+    doctor_schema, init_store, open_store_with_migration_info, read_context, MigrationBackupInfo,
+};
 use crate::telemetry::{
     clear_unsent_telemetry, load_telemetry_consent, save_telemetry_consent,
     telemetry_kill_switch_active, TelemetryConsent, TelemetryConsentDecision,
@@ -24,8 +26,8 @@ use crate::web::{generate_control_token, serve, WebOptions};
 use super::super::args::{
     AdapterReconcileArgs, AdapterUninstallArgs, AdapterUpdateArgs, CliLoopAgent, ContextArgs,
     HarnessKind, InstallAdapterArgs, InstallArgs, InstallCommand, LoopArgs, LoopCommand,
-    LoopRunArgs, SchemaArgs, SchemaCommand, StatusArgs, TelemetryArgs, TelemetryCommand,
-    TelemetryInstallChoice, WebArgs,
+    LoopRunArgs, MigrateArgs, SchemaArgs, SchemaCommand, StatusArgs, TelemetryArgs,
+    TelemetryCommand, TelemetryInstallChoice, WebArgs,
 };
 use super::super::render::brief_context::{
     brief_context, print_brief_context, BriefContextOptions,
@@ -2396,7 +2398,7 @@ pub fn handle_schema(db: &Path, args: SchemaArgs) -> anyhow::Result<()> {
                             .collect::<Vec<_>>()
                             .join(",")
                     );
-                    println!("upgrade: run the current `ldgr status` once to migrate safely");
+                    println!("upgrade: run `ldgr migrate` (or `ldgr status`/`ldgr context`) to migrate safely");
                 }
                 println!("components: {}", report.components.len());
                 for component in &report.components {
@@ -2422,6 +2424,77 @@ pub fn handle_schema(db: &Path, args: SchemaArgs) -> anyhow::Result<()> {
             Ok(())
         }
     }
+}
+
+#[derive(serde::Serialize)]
+struct CliMigrationReport<'a> {
+    database: &'a Path,
+    migrated: bool,
+    from_schema_version: i64,
+    to_schema_version: i64,
+    contract_hash: &'a str,
+    backup: Option<&'a Path>,
+}
+
+pub fn handle_migrate(db: &Path, args: MigrateArgs) -> anyhow::Result<()> {
+    let before = doctor_schema(db);
+    anyhow::ensure!(before.readable, "database is not readable");
+    anyhow::ensure!(
+        before.compatible,
+        "database is not eligible for automatic migration: {}",
+        before
+            .problem
+            .as_deref()
+            .unwrap_or("unknown schema problem")
+    );
+    let from_schema_version = before
+        .active_schema_version
+        .context("database does not report an active schema version")?;
+    let (connection, migration) = open_store_with_migration_info(db)?;
+    drop(connection);
+    let report = CliMigrationReport {
+        database: db,
+        migrated: migration.is_some(),
+        from_schema_version,
+        to_schema_version: crate::store::CURRENT_SCHEMA_VERSION,
+        contract_hash: crate::database_contract::DATABASE_CONTRACT_HASH,
+        backup: migration.as_ref().map(|info| info.backup.as_path()),
+    };
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else if let Some(migration) = migration.as_ref() {
+        println!(
+            "migrated {}: Core schema v{} -> v{}",
+            db.display(),
+            migration.from_schema_version,
+            migration.to_schema_version
+        );
+        println!("verified backup: {}", migration.backup.display());
+        println!("contract: {}", migration.contract_hash);
+    } else {
+        println!(
+            "no migration needed: {} is already on Core schema v{}",
+            db.display(),
+            crate::store::CURRENT_SCHEMA_VERSION
+        );
+        println!(
+            "contract: {}",
+            crate::database_contract::DATABASE_CONTRACT_HASH
+        );
+    }
+    Ok(())
+}
+
+pub fn print_migration_notice(migration: Option<&MigrationBackupInfo>) {
+    let Some(migration) = migration else {
+        return;
+    };
+    eprintln!(
+        "migration: LDGR Core upgraded schema v{} -> v{}; verified backup: {}",
+        migration.from_schema_version,
+        migration.to_schema_version,
+        migration.backup.display()
+    );
 }
 
 pub fn handle_status(

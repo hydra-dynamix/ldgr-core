@@ -4,7 +4,7 @@ use crate::database_contract::{
 };
 use rusqlite::OpenFlags;
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 4;
+pub const CURRENT_SCHEMA_VERSION: i64 = 2;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SchemaDoctorReport {
@@ -50,9 +50,6 @@ pub fn doctor_schema(db_path: &Path) -> SchemaDoctorReport {
     match schema_version(&connection) {
         Ok(version) => {
             report.active_schema_version = Some(version);
-            if version < CURRENT_SCHEMA_VERSION {
-                report.pending_migrations = ((version + 1)..=CURRENT_SCHEMA_VERSION).collect();
-            }
         }
         Err(error) => {
             report.problem = Some(format!("{error:#}"));
@@ -60,9 +57,11 @@ pub fn doctor_schema(db_path: &Path) -> SchemaDoctorReport {
         }
     }
     match preflight_schema_migration(&connection) {
-        Ok(_) => {
+        Ok(migration_origin) => {
             report.compatible = true;
-            if report.active_schema_version == Some(CURRENT_SCHEMA_VERSION) {
+            if migration_origin.is_some() {
+                report.pending_migrations = vec![CURRENT_SCHEMA_VERSION];
+            } else if report.active_schema_version == Some(CURRENT_SCHEMA_VERSION) {
                 match list_schema_components(&connection) {
                     Ok(components) => report.components = components,
                     Err(error) => {
@@ -832,23 +831,22 @@ pub(crate) fn preflight_schema_migration(connection: &Connection) -> anyhow::Res
         1 => Err(incompatible_schema_error(
             "schema version 1 shape is not eligible for migration",
         )),
+        2 if current_schema_matches(connection)? => {
+            validate_component_catalog(connection)?;
+            Ok(None)
+        }
         2 if version_2_schema_matches(connection)? => Ok(Some(2)),
         2 => Err(incompatible_schema_error(
             "schema version 2 shape is not eligible for migration",
         )),
         3 if version_3_schema_matches(connection)? => Ok(Some(3)),
         3 => Err(incompatible_schema_error(
-            "schema version 3 shape is not eligible for migration",
+            "obsolete schema version 3 shape is not eligible for normalization to schema v2",
         )),
-        CURRENT_SCHEMA_VERSION => {
-            if !current_schema_matches(connection)? {
-                return Err(incompatible_schema_error(
-                    "schema shape does not match the current core schema",
-                ));
-            }
-            validate_component_catalog(connection)?;
-            Ok(None)
-        }
+        4 if current_schema_matches(connection)? => Ok(Some(4)),
+        4 => Err(incompatible_schema_error(
+            "obsolete schema version 4 shape is not eligible for normalization to schema v2",
+        )),
         _ => Err(incompatible_schema_error(format!(
             "schema version {version} does not match required version {CURRENT_SCHEMA_VERSION}"
         ))),
@@ -859,37 +857,24 @@ fn apply_pending_schema_migrations(
     connection: &Connection,
     fail_after_version: Option<i64>,
 ) -> anyhow::Result<()> {
-    let version = schema_version(connection)?;
-    if version == CURRENT_SCHEMA_VERSION {
+    let migration_origin = preflight_schema_migration(connection)?;
+    if migration_origin.is_none() {
         return Ok(());
     }
     in_migration_transaction(connection, |connection| {
-        let mut version = schema_version(connection)?;
+        let version = schema_version(connection)?;
         if version == 1 {
             migrate_v1_to_v2(connection)?;
-            version = 2;
-            if fail_after_version == Some(version) {
-                anyhow::bail!("injected migration failure after schema v{version}");
+            if fail_after_version == Some(CURRENT_SCHEMA_VERSION) {
+                anyhow::bail!("injected migration failure after schema v{CURRENT_SCHEMA_VERSION}");
             }
         }
-        if version == 2 {
-            migrate_v2_to_v3(connection)?;
-            version = 3;
-            if fail_after_version == Some(version) {
-                anyhow::bail!("injected migration failure after schema v{version}");
-            }
-        }
-        if version == 3 {
-            migrate_v3_to_v4(connection)?;
-            version = 4;
-            if fail_after_version == Some(version) {
-                anyhow::bail!("injected migration failure after schema v{version}");
-            }
-        }
+        apply_current_v2_contract(connection)?;
         anyhow::ensure!(
-            version == CURRENT_SCHEMA_VERSION,
-            "migration stopped at schema v{version}; expected v{CURRENT_SCHEMA_VERSION}"
+            current_schema_matches(connection)?,
+            "normalized schema shape does not match ldgr-core schema v{CURRENT_SCHEMA_VERSION}"
         );
+        validate_component_catalog(connection)?;
         validate_foreign_keys(connection)
     })
 }
@@ -925,34 +910,18 @@ fn migrate_v1_to_v2(connection: &Connection) -> anyhow::Result<()> {
     set_schema_version(connection, 2)
 }
 
-fn migrate_v2_to_v3(connection: &Connection) -> anyhow::Result<()> {
-    if !version_2_schema_matches(connection)? {
-        return Err(incompatible_schema_error(
-            "schema version 2 shape is not eligible for the v3 migration",
-        ));
-    }
+fn apply_current_v2_contract(connection: &Connection) -> anyhow::Result<()> {
     connection
         .execute_batch(SCHEMA_COMPONENT_TABLE)
-        .context("failed to create the v3 schema component catalog")?;
-    seed_generated_component_catalog(connection)?;
-    set_schema_version(connection, 3)
-}
-
-fn migrate_v3_to_v4(connection: &Connection) -> anyhow::Result<()> {
-    if !version_3_schema_matches(connection)? {
-        return Err(incompatible_schema_error(
-            "schema version 3 shape is not eligible for the v4 migration",
-        ));
-    }
+        .context("failed to create the v2 schema component catalog")?;
     connection
         .execute_batch(CURRENT_SCHEMA)
-        .context("failed to create the v4 component ingestion ledger")?;
-    connection.execute("DELETE FROM schema_component", [])?;
+        .context("failed to create the v2 component ingestion ledger")?;
     seed_generated_component_catalog(connection)?;
     connection
         .execute_batch(SCHEMA_INDEXES)
-        .context("failed to create v4 schema indexes")?;
-    set_schema_version(connection, 4)
+        .context("failed to create v2 schema indexes")?;
+    set_schema_version(connection, CURRENT_SCHEMA_VERSION)
 }
 
 fn validate_foreign_keys(connection: &Connection) -> anyhow::Result<()> {
@@ -1348,7 +1317,13 @@ fn seed_generated_component_catalog(connection: &Connection) -> anyhow::Result<(
             .execute(
                 "INSERT INTO schema_component (
                     namespace, schema_version, minimum_core_schema, migration_digest, contract_hash
-                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(namespace) DO UPDATE SET
+                    schema_version = excluded.schema_version,
+                    minimum_core_schema = excluded.minimum_core_schema,
+                    migration_digest = excluded.migration_digest,
+                    contract_hash = excluded.contract_hash,
+                    applied_at = datetime('now')",
                 params![
                     component.namespace,
                     component.schema_version,
@@ -1675,7 +1650,7 @@ mod tests {
         assert!(report.readable);
         assert!(report.compatible);
         assert_eq!(report.active_schema_version, Some(2));
-        assert_eq!(report.pending_migrations, vec![3, 4]);
+        assert_eq!(report.pending_migrations, vec![2]);
         assert!(report.components.is_empty());
         assert!(report.last_backup.is_none());
         let connection = Connection::open(&db_path)?;
@@ -1738,6 +1713,94 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn withdrawn_v4_database_is_normalized_to_v2_without_losing_ingestion() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let db_path = temp.path().join("ldgr.sqlite3");
+        {
+            let connection = Connection::open(&db_path)?;
+            create_current_schema(&connection)?;
+            connection.execute(
+                "INSERT INTO component_ingest (
+                    component_namespace, source_schema_version, source_contract_hash,
+                    idempotency_key, payload_digest, record_count
+                 ) VALUES ('research', 4, 'sha256:withdrawn-v4', 'preserved',
+                           'sha256:preserved', 0)",
+                [],
+            )?;
+            connection.execute(
+                "UPDATE schema_component
+                 SET minimum_core_schema = 4, contract_hash = 'sha256:withdrawn-v4'",
+                [],
+            )?;
+            connection.execute(
+                "UPDATE schema_component SET schema_version = 4 WHERE namespace = 'core'",
+                [],
+            )?;
+            set_schema_version(&connection, 4)?;
+        }
+
+        let connection = open_store(&db_path)?;
+        assert_eq!(schema_version(&connection)?, 2);
+        validate_component_catalog(&connection)?;
+        let preserved: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM component_ingest WHERE idempotency_key = 'preserved'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(preserved, 1);
+        let backups = fs::read_dir(temp.path())?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.contains("backup-schema-v4-to-v2"))
+                    && path.extension().and_then(|value| value.to_str()) == Some("sqlite3")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(backups.len(), 1, "expected one verified v4-to-v2 backup");
+        let backup_connection = Connection::open(&backups[0])?;
+        assert_eq!(schema_version(&backup_connection)?, 4);
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_withdrawn_v4_catalog_rolls_back_normalization() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let db_path = temp.path().join("ldgr.sqlite3");
+        {
+            let connection = Connection::open(&db_path)?;
+            create_current_schema(&connection)?;
+            connection.execute(
+                "INSERT INTO schema_component (
+                    namespace, schema_version, minimum_core_schema, migration_digest, contract_hash
+                 ) VALUES ('unknown-adapter', 1, 2, 'sha256:unknown', 'sha256:withdrawn-v4')",
+                [],
+            )?;
+            connection.execute(
+                "UPDATE schema_component SET contract_hash = 'sha256:withdrawn-v4'",
+                [],
+            )?;
+            set_schema_version(&connection, 4)?;
+        }
+
+        let error = open_store(&db_path).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("expected"),
+            "unexpected error: {error:#}"
+        );
+        let connection = Connection::open(&db_path)?;
+        assert_eq!(schema_version(&connection)?, 4);
+        let unknown_count: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM schema_component WHERE namespace = 'unknown-adapter'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(unknown_count, 1);
+        Ok(())
+    }
+
     fn assert_core_tables_exist(connection: &Connection) -> anyhow::Result<()> {
         for table_name in CORE_TABLES {
             assert!(
@@ -1752,7 +1815,8 @@ mod tests {
         let error = open_store(db_path).unwrap_err();
         let message = format!("{error:#}");
         assert!(
-            message.contains("schema shape does not match the current core schema"),
+            message.contains("incompatible ldgr database schema")
+                && message.contains("cannot be migrated automatically"),
             "{message}"
         );
         Ok(())

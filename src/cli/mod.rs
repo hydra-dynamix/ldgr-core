@@ -32,6 +32,7 @@ pub(crate) const CLI_DEFAULT_HELP_SECTIONS: &str = r#"Core loop:
   decision record <work-slug> --outcome continue --rationale <why> --next-slug <slug> --next-title <title> --next-description <description>
   status
   schema doctor [--json]
+  migrate [--json]
   context --brief
   context
 
@@ -51,6 +52,7 @@ Default help shows the day-one workflow. Run `ldgr --full` for the core command 
 
 pub(crate) const CLI_FULL_HELP_SECTIONS: &str = r#"Core command tree:
   init
+  migrate
   status
   context
     --brief
@@ -172,6 +174,8 @@ enum Command {
     Status(StatusArgs),
     /// Inspect the unified database contract and recovery state.
     Schema(SchemaArgs),
+    /// Safely migrate a recognized older project database using LDGR Core.
+    Migrate(MigrateArgs),
     /// Print the operational cockpit.
     Context(ContextArgs),
     /// Serve the web cockpit UI.
@@ -303,11 +307,16 @@ fn handle_cli(cli: Cli) -> anyhow::Result<()> {
         Command::Prompt(args) => commands::prompts::handle_prompt(&open_store(&cli.db)?, args),
         Command::Bundle(args) => commands::prompts::handle_bundle(&open_store(&cli.db)?, args),
         Command::Status(args) => {
-            commands::ops::handle_status(&open_store(&cli.db)?, &cli.artifact_root, args)
+            let (connection, migration) = crate::store::open_store_with_migration_info(&cli.db)?;
+            commands::ops::print_migration_notice(migration.as_ref());
+            commands::ops::handle_status(&connection, &cli.artifact_root, args)
         }
         Command::Schema(args) => commands::ops::handle_schema(&cli.db, args),
+        Command::Migrate(args) => commands::ops::handle_migrate(&cli.db, args),
         Command::Context(args) => {
-            commands::ops::handle_context(&open_store(&cli.db)?, &cli.artifact_root, args)
+            let (connection, migration) = crate::store::open_store_with_migration_info(&cli.db)?;
+            commands::ops::print_migration_notice(migration.as_ref());
+            commands::ops::handle_context(&connection, &cli.artifact_root, args)
         }
         Command::Web(args) => commands::ops::handle_web(&cli.db, &cli.artifact_root, args),
         Command::Loop(args) => {

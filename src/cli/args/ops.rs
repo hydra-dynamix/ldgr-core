@@ -80,7 +80,7 @@ pub struct InstallAdapterArgs {
 
 #[derive(Debug, Args)]
 #[command(
-    after_help = "Examples:\n  ldgr context --brief\n  ldgr context --json\n\nContext is the expanded handoff view. Start with `ldgr status`; use context when you need deeper history."
+    after_help = "Examples:\n  ldgr context --brief\n  ldgr context --json\n\nContext is the expanded handoff view. Start with `ldgr status`; use context when you need deeper history. Opening a recognized older database runs the Core-owned migration and reports its verified backup."
 )]
 pub struct ContextArgs {
     #[arg(long)]
@@ -101,7 +101,7 @@ pub struct ContextArgs {
 
 #[derive(Debug, Args)]
 #[command(
-    after_help = "Examples:\n  ldgr status\n  ldgr status --program audit --priority P0\n  ldgr status --full\n  ldgr status --json\n\nStatus is read-only. Default output is scoped to actionable work; --full includes global history. To change work state, use `ldgr work status set <work> <status>`."
+    after_help = "Examples:\n  ldgr status\n  ldgr status --program audit --priority P0\n  ldgr status --full\n  ldgr status --json\n\nStatus does not change work state. Opening a recognized older database runs the Core-owned migration and reports its verified backup. Default output is scoped to actionable work; --full includes global history. To change work state, use `ldgr work status set <work> <status>`."
 )]
 pub struct StatusArgs {
     #[arg(long)]
@@ -142,6 +142,15 @@ pub enum SchemaCommand {
 
 #[derive(Debug, Args)]
 pub struct SchemaDoctorArgs {
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+#[command(
+    after_help = "Examples:\n  ldgr migrate\n  ldgr migrate --json\n\nMigration is owned exclusively by LDGR Core. It creates and verifies a backup before changing a recognized older database. Use `ldgr schema doctor` first for a non-mutating preview."
+)]
+pub struct MigrateArgs {
     #[arg(long)]
     pub json: bool,
 }

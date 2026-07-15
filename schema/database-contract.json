@@ -3,74 +3,74 @@
     {
       "migration_digest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
       "migration_sources": [],
-      "minimum_core_schema": 4,
+      "minimum_core_schema": 2,
       "namespace": "bench",
       "schema_version": 1
     },
     {
       "migration_digest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
       "migration_sources": [],
-      "minimum_core_schema": 4,
+      "minimum_core_schema": 2,
       "namespace": "code",
       "schema_version": 1
     },
     {
       "migration_digest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
       "migration_sources": [],
-      "minimum_core_schema": 4,
+      "minimum_core_schema": 2,
       "namespace": "conduct",
       "schema_version": 1
     },
     {
-      "migration_digest": "sha256:337c5c8c682455c18857a120cddba65e92cb9b2ca82e61850e1b1412139fcac3",
+      "migration_digest": "sha256:aa80a85b6d3d42451b2abd3844def99c44f7b236b40b1ad5a69fad7ae5904fc2",
       "migration_sources": [
         "ldgr-core/src/store/schema.rs"
       ],
-      "minimum_core_schema": 4,
+      "minimum_core_schema": 2,
       "namespace": "core",
-      "schema_version": 4
+      "schema_version": 2
     },
     {
       "migration_digest": "sha256:c6ccb9b2d2981ee82f02e915eb9d5be3c5b5a9e7d49ae256eae133b05e68e6fe",
       "migration_sources": [
         "ldgr-evidence/src/schema.rs"
       ],
-      "minimum_core_schema": 4,
+      "minimum_core_schema": 2,
       "namespace": "evidence",
       "schema_version": 1
     },
     {
       "migration_digest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
       "migration_sources": [],
-      "minimum_core_schema": 4,
+      "minimum_core_schema": 2,
       "namespace": "example",
       "schema_version": 1
     },
     {
       "migration_digest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
       "migration_sources": [],
-      "minimum_core_schema": 4,
+      "minimum_core_schema": 2,
       "namespace": "explore",
       "schema_version": 1
     },
     {
       "migration_digest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
       "migration_sources": [],
-      "minimum_core_schema": 4,
+      "minimum_core_schema": 2,
       "namespace": "private-commercial",
       "schema_version": 1
     },
     {
       "migration_digest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
       "migration_sources": [],
-      "minimum_core_schema": 4,
+      "minimum_core_schema": 2,
       "namespace": "programbench",
       "schema_version": 1
     },
     {
       "migration_digest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
       "migration_sources": [],
-      "minimum_core_schema": 4,
+      "minimum_core_schema": 2,
       "namespace": "recall",
       "schema_version": 1
     },
@@ -79,19 +79,19 @@
       "migration_sources": [
         "ldgr-research/src/migrations.rs"
       ],
-      "minimum_core_schema": 4,
+      "minimum_core_schema": 2,
       "namespace": "research",
       "schema_version": 4
     },
     {
       "migration_digest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
       "migration_sources": [],
-      "minimum_core_schema": 4,
+      "minimum_core_schema": 2,
       "namespace": "security",
       "schema_version": 1
     }
   ],
-  "contract_hash": "sha256:2d59299bf0738de94997d0f58e104b0de321800064f99d6391f2bdadabf2fc6c",
-  "core_schema_version": 4,
+  "contract_hash": "sha256:7e177ee30c2eff7801d30d2f787e59daa24cbfe0eceff4e98bb442058e288aa3",
+  "core_schema_version": 2,
   "format": "ldgr.database-contract.v1"
 }

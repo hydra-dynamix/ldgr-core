@@ -11,8 +11,67 @@ use assert_cmd::Command;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use ed25519_dalek::{Signer, SigningKey};
 use predicates::prelude::*;
+use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
+
+#[test]
+fn status_and_context_migrate_released_v1_databases_and_report_the_backup() -> anyhow::Result<()> {
+    for entrypoint in [["status"], ["context"]] {
+        let project = TempDir::new()?;
+        let db_path = project.path().join(".ldgr/ldgr.db");
+        let artifact_root = project.path().join(".ldgr/artifacts");
+        run(project.path(), &db_path, &artifact_root, ["init"])?;
+        downgrade_cli_fixture_to_v1(&db_path)?;
+
+        command(project.path(), &db_path, &artifact_root, entrypoint)?
+            .assert()
+            .success()
+            .stderr(predicate::str::contains(
+                "migration: LDGR Core upgraded schema v1 -> v2; verified backup:",
+            ));
+
+        let connection = Connection::open(&db_path)?;
+        let version: i64 = connection.query_row(
+            "SELECT version FROM schema_version WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(version, 2);
+        assert!(fs::read_dir(db_path.parent().unwrap())?.any(|entry| {
+            entry.is_ok_and(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("backup-schema-v1-to-v2")
+            })
+        }));
+    }
+    Ok(())
+}
+
+#[test]
+fn explicit_migrate_command_returns_machine_readable_result() -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    let db_path = project.path().join(".ldgr/ldgr.db");
+    let artifact_root = project.path().join(".ldgr/artifacts");
+    run(project.path(), &db_path, &artifact_root, ["init"])?;
+    downgrade_cli_fixture_to_v1(&db_path)?;
+
+    command(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        ["migrate", "--json"],
+    )?
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("\"migrated\": true"))
+    .stdout(predicate::str::contains("\"from_schema_version\": 1"))
+    .stdout(predicate::str::contains("\"to_schema_version\": 2"))
+    .stdout(predicate::str::contains("backup-schema-v1-to-v2"));
+    Ok(())
+}
 
 #[test]
 fn init_status_and_context_share_installed_domain_help_projection() -> anyhow::Result<()> {
@@ -20,8 +79,7 @@ fn init_status_and_context_share_installed_domain_help_projection() -> anyhow::R
     let adapter = project.path().join("adapter");
     write_adapter_namespace_fixture(&adapter, "bench", "fixture", "[\"true\"]")?;
     fs::copy(
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../ldgr-bench/adapter-database-contract.json"),
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../ldgr-bench/adapter-database-contract.json"),
         adapter.join("adapter-database-contract.json"),
     )?;
     let manifest = fs::read_to_string(adapter.join("adapter.toml"))?
@@ -4589,6 +4647,29 @@ fn isolated_command(project: &Path) -> anyhow::Result<Command> {
         .env("LDGR_HOME", project.join(".ldgr/test-empty-ldgr-home"))
         .env("HOME", project.join(".ldgr/test-empty-home"));
     Ok(command)
+}
+
+fn downgrade_cli_fixture_to_v1(db_path: &Path) -> anyhow::Result<()> {
+    let connection = Connection::open(db_path)?;
+    connection.execute_batch(
+        r#"
+        DROP TABLE component_record;
+        DROP TABLE component_ingest;
+        DROP TABLE schema_component;
+        DROP TRIGGER IF EXISTS trg_work_dependency_no_cycle;
+        DROP INDEX IF EXISTS idx_work_dependency_depends_on;
+        DROP INDEX IF EXISTS idx_work_item_priority_program;
+        DROP TABLE work_dependency;
+        ALTER TABLE work_item DROP COLUMN hold_reason;
+        ALTER TABLE work_item DROP COLUMN hold_kind;
+        ALTER TABLE work_item DROP COLUMN acceptance_criteria;
+        ALTER TABLE work_item DROP COLUMN work_group;
+        ALTER TABLE work_item DROP COLUMN program;
+        ALTER TABLE work_item DROP COLUMN priority;
+        UPDATE schema_version SET version = 1 WHERE id = 1;
+        "#,
+    )?;
+    Ok(())
 }
 
 fn write_adapter_fixture(dir: &Path, slug: &str, alias: &str) -> anyhow::Result<()> {
