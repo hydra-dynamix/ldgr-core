@@ -4372,6 +4372,248 @@ fn schedule_import_export_round_trips_structured_queue() -> anyhow::Result<()> {
 }
 
 #[test]
+fn work_views_dependency_edits_and_graphs_expose_readiness() -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    let db_path = project.path().join(".ldgr/ldgr.db");
+    let artifact_root = project.path().join(".ldgr/artifacts");
+    run(project.path(), &db_path, &artifact_root, ["init"])?;
+    run(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        [
+            "work",
+            "create",
+            "base",
+            "--title",
+            "Base",
+            "--description",
+            "Build base.",
+        ],
+    )?;
+    run(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        [
+            "work",
+            "create",
+            "gate",
+            "--title",
+            "Gate",
+            "--description",
+            "Run gate.",
+            "--depends-on",
+            "base",
+        ],
+    )?;
+
+    command(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        ["work", "show", "gate", "--json"],
+    )?
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("\"slug\": \"base\""))
+    .stdout(predicate::str::contains("\"satisfied\": false"))
+    .stdout(predicate::str::contains("\"ready\": false"))
+    .stdout(predicate::str::contains("dependency base is pending"));
+    command(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        ["work", "list", "--json"],
+    )?
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("\"dependents\""))
+    .stdout(predicate::str::contains("\"blocker_reasons\""));
+    command(project.path(), &db_path, &artifact_root, ["work", "graph"])?
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("gate [pending; blocked]"))
+        .stdout(predicate::str::contains(
+            "depends_on: base [pending; satisfied=false]",
+        ));
+    command(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        ["work", "graph", "--format", "mermaid"],
+    )?
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("flowchart LR"))
+    .stdout(predicate::str::contains(" --> "));
+
+    run(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        ["work", "dependency", "remove", "gate", "base"],
+    )?;
+    command(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        ["work", "show", "gate", "--json"],
+    )?
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("\"ready\": true"));
+    run(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        ["work", "dependency", "add", "gate", "base"],
+    )?;
+    command(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        ["work", "dependency", "add", "base", "gate"],
+    )?
+    .assert()
+    .failure()
+    .stderr(predicate::str::contains(
+        "dependency graph must remain acyclic",
+    ));
+    Ok(())
+}
+
+#[test]
+fn work_import_dry_run_example_and_audit_are_actionable() -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    let db_path = project.path().join(".ldgr/ldgr.db");
+    let artifact_root = project.path().join(".ldgr/artifacts");
+    let schedule = project.path().join("schedule.json");
+    fs::write(
+        &schedule,
+        r#"{
+  "format": "ldgr.schedule.v1",
+  "work_items": [
+    {"slug":"base","title":"Base","description":"Build base.","priority":"P1"},
+    {"slug":"gate","title":"Gate","description":"Run gate.","priority":"P0","dependencies":["base"]},
+    {"slug":"orphan","title":"Orphan","description":"Independent branch."}
+  ]
+}"#,
+    )?;
+    run(project.path(), &db_path, &artifact_root, ["init"])?;
+    command(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        ["work", "import", schedule.to_str().unwrap(), "--dry-run"],
+    )?
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("validated schedule: created=3"));
+    command(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        ["work", "list", "--json"],
+    )?
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("\"slug\": \"base\"").not());
+    command(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        ["work", "export", "--example"],
+    )?
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("\"format\": \"ldgr.schedule.v1\""))
+    .stdout(predicate::str::contains("\"release-gate\""));
+    run(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        ["work", "import", schedule.to_str().unwrap()],
+    )?;
+    command(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        ["work", "audit", "--json"],
+    )?
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("\"ok\": false"))
+    .stdout(predicate::str::contains("\"priority_inversion\""))
+    .stdout(predicate::str::contains("\"multiple_terminal_nodes\""));
+    command(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        ["status", "--full", "--json"],
+    )?
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("\"queue\""))
+    .stdout(predicate::str::contains("\"dependencies\""))
+    .stdout(predicate::str::contains("\"blocker_reasons\""));
+    Ok(())
+}
+
+#[test]
+fn run_finish_identifies_the_pending_work_decision() -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    let db_path = project.path().join(".ldgr/ldgr.db");
+    let artifact_root = project.path().join(".ldgr/artifacts");
+    run(project.path(), &db_path, &artifact_root, ["init"])?;
+    run(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        [
+            "work",
+            "create",
+            "finish-guidance",
+            "--title",
+            "Finish guidance",
+            "--description",
+            "Exercise finish guidance.",
+        ],
+    )?;
+    run(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        ["run", "start", "finish-guidance"],
+    )?;
+    command(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        ["run", "finish", "finish-guidance", "--status", "success"],
+    )?
+    .assert()
+    .success()
+    .stdout(predicate::str::contains(
+        "state: run finished, work decision pending",
+    ))
+    .stdout(predicate::str::contains(
+        "decision_required: ldgr decision record finish-guidance",
+    ));
+    command(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        ["status", "--full", "--json"],
+    )?
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("\"pending_decision\""))
+    .stdout(predicate::str::contains("\"work\": \"finish-guidance\""));
+    Ok(())
+}
+
+#[test]
 fn status_scopes_history_and_hides_stale_terminal_loop_when_new_work_exists() -> anyhow::Result<()>
 {
     let project = TempDir::new()?;

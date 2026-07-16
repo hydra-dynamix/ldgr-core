@@ -2,8 +2,8 @@ use std::path::Path;
 
 use crate::store::{
     add_artifact, add_observation, add_validation_record, close_run, finish_run, get_artifact,
-    get_run, list_artifacts, list_observations, list_runs, list_validation_records,
-    resolve_run_reference, start_run, NextWorkSpec, RunStatus,
+    get_run, get_work_item_by_id, list_artifacts, list_observations, list_runs,
+    list_validation_records, resolve_run_reference, start_run, NextWorkSpec, RunStatus,
 };
 
 use super::super::args::{
@@ -41,6 +41,15 @@ pub fn handle_run(connection: &rusqlite::Connection, args: RunArgs) -> anyhow::R
                 args.notes.as_deref(),
             )?;
             println!("finished run {} [{}]", run.id, run.status.as_str());
+            let work_item = get_work_item_by_id(connection, run.work_item_id)?;
+            println!("state: run finished, work decision pending");
+            println!(
+                "decision_required: ldgr decision record {} --outcome <continue|stop|inconclusive> --rationale <why>",
+                work_item.slug
+            );
+            println!(
+                "tip: use `ldgr run close ...` next time to finish the run and record its decision atomically"
+            );
         }
         RunCommand::Close(args) => {
             let next_work = optional_next_work(

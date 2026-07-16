@@ -5,9 +5,9 @@ use serde::Serialize;
 
 use crate::store::{
     last_completed_work_item, list_decisions, list_observations_for_work,
-    list_validation_records_for_work, list_work_items_filtered, next_ready_work_item,
-    work_readiness, DecisionSummary, ObservationSummary, StoreContext, ValidationSummary, WorkItem,
-    WorkItemStatus,
+    list_validation_records_for_work, list_work_item_views_filtered, list_work_items_filtered,
+    next_ready_work_item, work_readiness, DecisionSummary, ObservationSummary, StoreContext,
+    ValidationSummary, WorkItem, WorkItemStatus, WorkItemView,
 };
 
 use super::brief_context::{
@@ -34,6 +34,8 @@ pub(crate) struct StatusSummary {
     pub installed_adapter_namespaces: Vec<BriefAdapterNamespace>,
     pub handoff: BriefHandoff,
     pub next_commands: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queue: Option<Vec<WorkItemView>>,
     pub brief_context_command: String,
     pub full_context_command: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -150,6 +152,11 @@ pub(crate) fn build_status_summary(
             has_active_run: counts.running > 0,
             has_next_work: next.is_some(),
             needs_decision: counts.running > 0,
+            pending_decision: brief.handoff.pending_decision.clone().filter(|pending| {
+                work_items
+                    .iter()
+                    .any(|work_item| work_item.slug == pending.work)
+            }),
         }
     } else {
         brief.handoff.clone()
@@ -164,6 +171,20 @@ pub(crate) fn build_status_summary(
     } else {
         brief.next_commands.clone()
     };
+    let queue = full
+        .then(|| list_work_item_views_filtered(connection, None, program, priority))
+        .transpose()?
+        .map(|items| {
+            items
+                .into_iter()
+                .filter(|item| {
+                    !matches!(
+                        item.work_item.status,
+                        WorkItemStatus::Done | WorkItemStatus::Canceled
+                    )
+                })
+                .collect()
+        });
     Ok(StatusSummary {
         state,
         filters: StatusFilters {
@@ -189,6 +210,7 @@ pub(crate) fn build_status_summary(
         installed_adapter_namespaces: brief.installed_adapter_namespaces.clone(),
         handoff,
         next_commands,
+        queue,
         brief_context_command: brief.brief_context_command.clone(),
         full_context_command: brief.full_context_command.clone(),
         global_history,

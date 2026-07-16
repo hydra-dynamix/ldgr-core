@@ -98,14 +98,27 @@ ldgr work create atomicity --title "Atomicity audit" --description "Audit update
   --priority P0 --program audit --group accounts \
   --acceptance-criteria "Concurrent update test passes." \
   --depends-on registry
+ldgr work dependency add atomicity schema
+ldgr work dependency remove atomicity schema
+ldgr work graph --blocked
+ldgr work graph --format mermaid
+ldgr work audit
 ldgr status --program audit --priority P0
 ```
+
+`--depends-on` accepts comma-separated slugs, repeated flags, or both. `work
+edit --depends-on ...` replaces the complete dependency set; use `work
+dependency add/remove` to change one edge. `work show` and `work list --json`
+include dependency and dependent status, satisfaction, effective readiness, and
+blocker reasons.
 
 Use a JSON schedule to create or back up a large queue in one command. Imports
 are transactional, and `--upsert` updates matching slugs.
 
 ```sh
 ldgr work export --output .ldgr/schedule-backup.json
+ldgr work export --example
+ldgr work import schedule.json --dry-run
 ldgr work import schedule.json
 ldgr work import schedule.json --upsert
 ```

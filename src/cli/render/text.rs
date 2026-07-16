@@ -2,26 +2,10 @@ use crate::loop_runtime::LoopRuntimeResult;
 use crate::store::{
     Artifact, ArtifactSummary, DecisionSummary, GlobalObservation, InvestigationRun,
     LoopIntervention, ObservationSummary, RunListItem, ValidationRecord, ValidationSummary,
-    WorkItem,
+    WorkItem, WorkItemView,
 };
 
 use super::display_exit_code;
-
-pub(crate) fn print_work_items(work_items: &[WorkItem]) {
-    if work_items.is_empty() {
-        println!("No work items.");
-        return;
-    }
-    for work_item in work_items {
-        println!(
-            "{} [{}] {}",
-            work_item.slug,
-            work_item.status.as_str(),
-            work_item.title
-        );
-        println!("  id={} updated_at={}", work_item.id, work_item.updated_at);
-    }
-}
 
 pub(crate) fn print_work_item(work_item: &WorkItem) {
     println!("Work item: {}", work_item.slug);
@@ -52,6 +36,74 @@ pub(crate) fn print_work_item(work_item: &WorkItem) {
     }
     println!("created_at: {}", work_item.created_at);
     println!("updated_at: {}", work_item.updated_at);
+}
+
+pub(crate) fn print_work_item_views(work_items: &[WorkItemView]) {
+    if work_items.is_empty() {
+        println!("No work items.");
+        return;
+    }
+    for work_item in work_items {
+        let item = &work_item.work_item;
+        println!("{} [{}] {}", item.slug, item.status.as_str(), item.title);
+        println!(
+            "  id={} ready={} updated_at={}",
+            item.id, work_item.ready, item.updated_at
+        );
+        print_dependency_summary(work_item, "  ");
+        if !work_item.blocker_reasons.is_empty() {
+            println!(
+                "  blocker_reasons: {}",
+                work_item.blocker_reasons.join("; ")
+            );
+        }
+    }
+}
+
+pub(crate) fn print_work_item_view(work_item: &WorkItemView) {
+    print_work_item(&work_item.work_item);
+    println!("ready: {}", work_item.ready);
+    print_dependency_summary(work_item, "");
+    if work_item.blocker_reasons.is_empty() {
+        println!("blocker_reasons: none");
+    } else {
+        println!("blocker_reasons:");
+        for reason in &work_item.blocker_reasons {
+            println!("- {reason}");
+        }
+    }
+}
+
+fn print_dependency_summary(work_item: &WorkItemView, indent: &str) {
+    if work_item.dependencies.is_empty() {
+        println!("{indent}dependencies: none");
+    } else {
+        let dependencies = work_item
+            .dependencies
+            .iter()
+            .map(|dependency| {
+                format!(
+                    "{} [{}; satisfied={}]",
+                    dependency.slug,
+                    dependency.status.as_str(),
+                    dependency.satisfied
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("{indent}dependencies: {dependencies}");
+    }
+    if work_item.dependents.is_empty() {
+        println!("{indent}dependents: none");
+    } else {
+        let dependents = work_item
+            .dependents
+            .iter()
+            .map(|dependent| format!("{} [{}]", dependent.slug, dependent.status.as_str()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("{indent}dependents: {dependents}");
+    }
 }
 
 pub(crate) fn print_runs(runs: &[RunListItem]) {

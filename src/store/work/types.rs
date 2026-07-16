@@ -35,6 +35,29 @@ pub struct WorkReadiness {
     pub unblocks: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WorkDependencyState {
+    pub slug: String,
+    pub status: WorkItemStatus,
+    pub satisfied: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WorkDependentState {
+    pub slug: String,
+    pub status: WorkItemStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WorkItemView {
+    #[serde(flatten)]
+    pub work_item: WorkItem,
+    pub dependencies: Vec<WorkDependencyState>,
+    pub dependents: Vec<WorkDependentState>,
+    pub ready: bool,
+    pub blocker_reasons: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScheduleFile {
     pub format: String,
