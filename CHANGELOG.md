@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.12] - 2026-07-16
+
+### Added
+
+- Expose direct dependencies, dependents, dependency satisfaction, effective readiness, and blocker reasons from work-item list and detail views.
+- Add individual dependency edge editing with `ldgr work dependency add` and `ldgr work dependency remove`.
+- Add human-readable, JSON, filtered, and Mermaid dependency graph inspection with `ldgr work graph`.
+- Add `ldgr work audit` findings for graph structure, canceled dependencies, priority inversions, terminal reachability, and missing validation records.
+- Add transactional import dry-runs and an exported example schedule document.
+
+### Changed
+
+- Include the enriched nonterminal queue and scoped pending-decision identity in full machine-readable status output.
+- Explain dependency-list syntax and the distinction between `run finish` and `run close` in CLI help.
+- Print the required work-decision command after `run finish` leaves a completed run awaiting its decision.
+
 ## [0.1.11] - 2026-07-15
 
 ### Fixed

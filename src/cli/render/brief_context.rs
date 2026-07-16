@@ -103,6 +103,14 @@ pub(crate) struct BriefHandoff {
     pub has_active_run: bool,
     pub has_next_work: bool,
     pub needs_decision: bool,
+    pub pending_decision: Option<BriefPendingDecision>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct BriefPendingDecision {
+    pub run: Option<i64>,
+    pub work: String,
+    pub run_status: Option<String>,
 }
 
 pub(crate) fn brief_context(context: &StoreContext, options: BriefContextOptions) -> BriefContext {
@@ -244,10 +252,24 @@ pub(crate) fn print_brief_context(context: &BriefContext) {
 
 fn brief_handoff(context: &StoreContext) -> BriefHandoff {
     let has_active_run = !context.active_runs.is_empty();
+    let pending_decision =
+        (context.loop_state.current_phase == "needs_decision").then(|| BriefPendingDecision {
+            run: context.loop_state.run_id,
+            work: context
+                .loop_state
+                .work_slug
+                .clone()
+                .unwrap_or_else(|| "unknown".to_owned()),
+            run_status: context
+                .loop_state
+                .terminal_status
+                .map(|status| status.as_str().to_owned()),
+        });
     BriefHandoff {
         has_active_run,
         has_next_work: context.next_work_item.is_some(),
         needs_decision: has_active_run || context.running_work_items > 0,
+        pending_decision,
     }
 }
 
@@ -351,6 +373,17 @@ fn print_handoff(handoff: &BriefHandoff) {
         "handoff: active_run={} next_work={} needs_decision={}",
         handoff.has_active_run, handoff.has_next_work, handoff.needs_decision
     );
+    if let Some(pending) = &handoff.pending_decision {
+        println!(
+            "pending_decision: run={} work={} run_status={}",
+            pending
+                .run
+                .map(|run| run.to_string())
+                .unwrap_or_else(|| "unknown".to_owned()),
+            pending.work,
+            pending.run_status.as_deref().unwrap_or("unknown")
+        );
+    }
     if handoff.has_active_run {
         println!(
             "signoff: complete the active run with `ldgr run close ...` before signing off unless you are explicitly handing off unfinished work"

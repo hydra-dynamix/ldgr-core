@@ -4,7 +4,7 @@ use clap::{Args, Subcommand, ValueEnum};
 
 use crate::store::{GlobalObservationKind, GlobalObservationStatus, HoldKind, WorkItemStatus};
 
-const WORK_HELP: &str = "Examples:\n  ldgr work create fix-login --title \"Fix login\" --description \"Repair token refresh.\"\n  ldgr work edit fix-login --description \"Repair refresh and add regression coverage.\"\n  ldgr work status set fix-login held --reason \"Waiting for dependency.\"\n\nUse work status set for lifecycle changes; use work edit only for title/description corrections.";
+const WORK_HELP: &str = "Examples:\n  ldgr work create fix-login --title \"Fix login\" --description \"Repair token refresh.\" --depends-on schema,registry\n  ldgr work edit fix-login --priority P0 --group release --acceptance-criteria \"Regression test passes.\"\n  ldgr work dependency add fix-login schema\n  ldgr work graph --format mermaid\n  ldgr work audit\n  ldgr work status set fix-login held --reason \"Waiting for dependency.\"\n\n--depends-on accepts a comma-separated list, repeated flags, or both. On work edit it replaces the complete dependency set; use work dependency add/remove for one edge. Imports are validated and committed transactionally.";
 
 const NOTICE_HELP: &str = "Examples:\n  ldgr notice add --kind notification --body \"Prefer the simpler fix.\"\n  ldgr notice edit 1 --body \"Course correction handled.\" --clear-source\n  ldgr notice clear 1 --reason \"No longer relevant.\"\n\nNotices are operator-visible steering outside a run. Observations remain attached to runs.";
 
@@ -33,8 +33,14 @@ pub enum WorkCommand {
     Show(ShowWorkArgs),
     /// Create a pending work item.
     Create(CreateWorkArgs),
-    /// Edit a work item's title or description.
+    /// Edit work metadata or replace its complete dependency set.
     Edit(EditWorkArgs),
+    /// Add or remove individual dependency edges.
+    Dependency(WorkDependencyArgs),
+    /// Inspect the work dependency graph.
+    Graph(WorkGraphArgs),
+    /// Audit the schedule for structural problems.
+    Audit(WorkAuditArgs),
     /// Set a work item's lifecycle status.
     Status(WorkStatusArgs),
     /// Remove a work item and its dependent records.
@@ -90,6 +96,7 @@ pub struct CreateWorkArgs {
     #[arg(long)]
     pub acceptance_criteria: Option<String>,
 
+    /// Dependency slugs; accepts commas and/or repeated --depends-on flags.
     #[arg(long = "depends-on", value_delimiter = ',')]
     pub dependencies: Vec<String>,
 }
@@ -128,6 +135,7 @@ pub struct EditWorkArgs {
     #[arg(long)]
     pub clear_acceptance_criteria: bool,
 
+    /// Replacement dependency set; accepts commas and/or repeated flags.
     #[arg(
         long = "depends-on",
         value_delimiter = ',',
@@ -137,6 +145,58 @@ pub struct EditWorkArgs {
 
     #[arg(long)]
     pub clear_dependencies: bool,
+}
+
+#[derive(Debug, Args)]
+#[command(
+    after_help = "Examples:\n  ldgr work dependency add child prerequisite\n  ldgr work dependency remove child prerequisite\n\nThe child is blocked until the prerequisite is done. Dependency changes reject self-edges and cycles."
+)]
+pub struct WorkDependencyArgs {
+    #[command(subcommand)]
+    pub command: WorkDependencyCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum WorkDependencyCommand {
+    /// Make CHILD depend on PREREQUISITE.
+    Add(EditWorkDependencyArgs),
+    /// Remove CHILD's dependency on PREREQUISITE.
+    Remove(EditWorkDependencyArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct EditWorkDependencyArgs {
+    /// Work item that is blocked by the dependency.
+    pub child: String,
+    /// Work item that must be completed first.
+    pub prerequisite: String,
+}
+
+#[derive(Debug, Args)]
+pub struct WorkGraphArgs {
+    /// Show only work that is effectively ready.
+    #[arg(long, conflicts_with = "blocked")]
+    pub ready: bool,
+
+    /// Show only nonterminal work that is not effectively ready.
+    #[arg(long)]
+    pub blocked: bool,
+
+    #[arg(long, value_enum, default_value_t = CliWorkGraphFormat::Human)]
+    pub format: CliWorkGraphFormat,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum CliWorkGraphFormat {
+    Human,
+    Json,
+    Mermaid,
+}
+
+#[derive(Debug, Args)]
+pub struct WorkAuditArgs {
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -175,6 +235,9 @@ pub struct DeleteWorkArgs {
 }
 
 #[derive(Debug, Args)]
+#[command(
+    after_help = "Example document:\n  {\n    \"format\": \"ldgr.schedule.v1\",\n    \"work_items\": [\n      {\"slug\":\"base\",\"title\":\"Base\",\"description\":\"Build base.\"},\n      {\"slug\":\"gate\",\"title\":\"Gate\",\"description\":\"Validate.\",\"dependencies\":[\"base\"]}\n    ]\n  }\n\nThe complete import is one transaction: any invalid item, missing dependency, or cycle rolls it back. Use `ldgr work export --example` for a fuller document."
+)]
 pub struct ImportWorkArgs {
     /// JSON schedule path, or - to read from stdin.
     pub path: String,
@@ -182,6 +245,10 @@ pub struct ImportWorkArgs {
     /// Update matching slugs instead of rejecting them.
     #[arg(long)]
     pub upsert: bool,
+
+    /// Validate the complete import without changing the ledger.
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Args)]
@@ -195,6 +262,10 @@ pub struct ExportWorkArgs {
 
     #[arg(long)]
     pub priority: Option<String>,
+
+    /// Print an example schedule document instead of exporting the ledger.
+    #[arg(long, conflicts_with_all = ["output", "program", "priority"])]
+    pub example: bool,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]

@@ -1,5 +1,39 @@
 pub const SCHEDULE_FORMAT: &str = "ldgr.schedule.v1";
 
+pub fn example_schedule() -> ScheduleFile {
+    ScheduleFile {
+        format: SCHEDULE_FORMAT.to_owned(),
+        work_items: vec![
+            ScheduleWorkItem {
+                slug: "foundation".to_owned(),
+                title: "Build foundation".to_owned(),
+                description: "Implement and validate the prerequisite work.".to_owned(),
+                status: Some("pending".to_owned()),
+                priority: Some("P0".to_owned()),
+                program: Some("release".to_owned()),
+                group: Some("implementation".to_owned()),
+                acceptance_criteria: Some("Foundation validation passes.".to_owned()),
+                hold_kind: None,
+                hold_reason: None,
+                dependencies: Vec::new(),
+            },
+            ScheduleWorkItem {
+                slug: "release-gate".to_owned(),
+                title: "Run release gate".to_owned(),
+                description: "Validate the complete release candidate.".to_owned(),
+                status: Some("pending".to_owned()),
+                priority: Some("P1".to_owned()),
+                program: Some("release".to_owned()),
+                group: Some("validation".to_owned()),
+                acceptance_criteria: Some("All release checks pass.".to_owned()),
+                hold_kind: None,
+                hold_reason: None,
+                dependencies: vec!["foundation".to_owned()],
+            },
+        ],
+    }
+}
+
 pub fn export_schedule(
     connection: &Connection,
     program: Option<&str>,
@@ -133,6 +167,24 @@ pub fn import_schedule(
             dependencies: dependency_count,
         })
     })
+}
+
+pub fn dry_run_import_schedule(
+    connection: &Connection,
+    schedule: &ScheduleFile,
+    upsert: bool,
+) -> anyhow::Result<ImportScheduleResult> {
+    connection
+        .execute_batch("SAVEPOINT ldgr_import_dry_run")
+        .context("failed to begin schedule import dry-run")?;
+    let result = import_schedule(connection, schedule, upsert);
+    let rollback = connection.execute_batch(
+        "ROLLBACK TO SAVEPOINT ldgr_import_dry_run; RELEASE SAVEPOINT ldgr_import_dry_run",
+    );
+    if let Err(error) = rollback {
+        return Err(error).context("failed to roll back schedule import dry-run");
+    }
+    result
 }
 
 fn validate_schedule(schedule: &ScheduleFile) -> anyhow::Result<()> {

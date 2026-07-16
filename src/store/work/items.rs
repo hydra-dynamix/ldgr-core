@@ -411,6 +411,68 @@ pub(crate) fn replace_work_dependencies(
     Ok(())
 }
 
+pub fn add_work_dependency(
+    connection: &Connection,
+    child_slug: &str,
+    prerequisite_slug: &str,
+) -> anyhow::Result<()> {
+    let child = require_work_item_by_slug(connection, child_slug)?;
+    let prerequisite = require_work_item_by_slug(connection, prerequisite_slug)?;
+    if child.id == prerequisite.id {
+        bail!("work item {child_slug} cannot depend on itself");
+    }
+    in_write_transaction(connection, |connection| {
+        let exists = connection.query_row(
+            "SELECT EXISTS (
+                SELECT 1 FROM work_dependency
+                WHERE work_item_id = ?1 AND depends_on_work_item_id = ?2
+             )",
+            params![child.id, prerequisite.id],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if exists {
+            bail!("work item {child_slug} already depends on {prerequisite_slug}");
+        }
+        let inserted = connection
+            .execute(
+                "INSERT INTO work_dependency (work_item_id, depends_on_work_item_id)
+                 VALUES (?1, ?2)",
+                params![child.id, prerequisite.id],
+            )
+            .with_context(|| {
+                format!(
+                    "failed to add dependency from {child_slug} to {prerequisite_slug} (dependency graph must remain acyclic)"
+                )
+            })?;
+        debug_assert_eq!(inserted, 1);
+        let payload = serde_json::json!({ "prerequisite": prerequisite_slug }).to_string();
+        record_event(connection, "work_item", child.id, "dependency_add", &payload)?;
+        Ok(())
+    })
+}
+
+pub fn remove_work_dependency(
+    connection: &Connection,
+    child_slug: &str,
+    prerequisite_slug: &str,
+) -> anyhow::Result<()> {
+    let child = require_work_item_by_slug(connection, child_slug)?;
+    let prerequisite = require_work_item_by_slug(connection, prerequisite_slug)?;
+    in_write_transaction(connection, |connection| {
+        let removed = connection.execute(
+            "DELETE FROM work_dependency
+             WHERE work_item_id = ?1 AND depends_on_work_item_id = ?2",
+            params![child.id, prerequisite.id],
+        )?;
+        if removed == 0 {
+            bail!("work item {child_slug} does not depend on {prerequisite_slug}");
+        }
+        let payload = serde_json::json!({ "prerequisite": prerequisite_slug }).to_string();
+        record_event(connection, "work_item", child.id, "dependency_remove", &payload)?;
+        Ok(())
+    })
+}
+
 pub fn delete_work_item(connection: &Connection, slug: &str) -> anyhow::Result<()> {
     let work_item = require_work_item_by_slug(connection, slug)?;
     in_write_transaction(connection, |connection| {

@@ -27,7 +27,7 @@ pub enum RunCommand {
     Show(ShowRunArgs),
     /// Start a run for a work item.
     Start(StartRunArgs),
-    /// Finish a run with a terminal status.
+    /// Finish a run, leaving its work decision pending.
     Finish(FinishRunArgs),
     /// Finish a run and record the associated work decision.
     Close(CloseRunArgs),
@@ -59,6 +59,9 @@ pub struct StartRunArgs {
 }
 
 #[derive(Debug, Args)]
+#[command(
+    after_help = "`run finish` records only the run result. The work item remains running in the \"run finished, work decision pending\" state until `ldgr decision record ...` is called. Prefer `ldgr run close ...` when the run result and work decision are both known."
+)]
 pub struct FinishRunArgs {
     pub run_id: String,
 

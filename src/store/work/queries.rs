@@ -51,6 +51,108 @@ pub fn work_readiness(
     })
 }
 
+pub fn work_item_view(
+    connection: &Connection,
+    work_item: WorkItem,
+) -> anyhow::Result<WorkItemView> {
+    let dependencies = dependency_states(connection, work_item.id)?;
+    let dependents = dependent_states(connection, work_item.id)?;
+    let mut blocker_reasons = dependencies
+        .iter()
+        .filter(|dependency| !dependency.satisfied)
+        .map(|dependency| {
+            format!(
+                "dependency {} is {}",
+                dependency.slug,
+                dependency.status.as_str()
+            )
+        })
+        .collect::<Vec<_>>();
+    if work_item.status != WorkItemStatus::Pending {
+        blocker_reasons.insert(
+            0,
+            format!("work item status is {}", work_item.status.as_str()),
+        );
+    }
+    Ok(WorkItemView {
+        ready: work_item.status == WorkItemStatus::Pending && blocker_reasons.is_empty(),
+        work_item,
+        dependencies,
+        dependents,
+        blocker_reasons,
+    })
+}
+
+pub fn get_work_item_view_by_slug(
+    connection: &Connection,
+    slug: &str,
+) -> anyhow::Result<WorkItemView> {
+    work_item_view(connection, get_work_item_by_slug(connection, slug)?)
+}
+
+pub fn list_work_item_views_filtered(
+    connection: &Connection,
+    status: Option<WorkItemStatus>,
+    program: Option<&str>,
+    priority: Option<&str>,
+) -> anyhow::Result<Vec<WorkItemView>> {
+    list_work_items_filtered(connection, status, program, priority)?
+        .into_iter()
+        .map(|work_item| work_item_view(connection, work_item))
+        .collect()
+}
+
+fn dependency_states(
+    connection: &Connection,
+    work_item_id: i64,
+) -> anyhow::Result<Vec<WorkDependencyState>> {
+    let query = "SELECT prerequisite.slug, prerequisite.status
+         FROM work_dependency AS dependency
+         JOIN work_item AS prerequisite ON prerequisite.id = dependency.depends_on_work_item_id
+         WHERE dependency.work_item_id = ?1
+         ORDER BY prerequisite.slug";
+    let mut statement = connection.prepare(query)?;
+    let states = statement
+        .query_map(params![work_item_id], |row| {
+            let status_text: String = row.get(1)?;
+            let status = WorkItemStatus::from_str(&status_text)
+                .map_err(parse_error_to_sql_error)?;
+            Ok(WorkDependencyState {
+                slug: row.get(0)?,
+                satisfied: status == WorkItemStatus::Done,
+                status,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to read work dependency states")?;
+    Ok(states)
+}
+
+fn dependent_states(
+    connection: &Connection,
+    work_item_id: i64,
+) -> anyhow::Result<Vec<WorkDependentState>> {
+    let mut statement = connection.prepare(
+        "SELECT dependent.slug, dependent.status
+         FROM work_dependency AS dependency
+         JOIN work_item AS dependent ON dependent.id = dependency.work_item_id
+         WHERE dependency.depends_on_work_item_id = ?1
+         ORDER BY dependent.slug",
+    )?;
+    let states = statement
+        .query_map(params![work_item_id], |row| {
+            let status_text: String = row.get(1)?;
+            Ok(WorkDependentState {
+                slug: row.get(0)?,
+                status: WorkItemStatus::from_str(&status_text)
+                    .map_err(parse_error_to_sql_error)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to read dependent work item states")?;
+    Ok(states)
+}
+
 pub fn list_work_items_filtered(
     connection: &Connection,
     status: Option<WorkItemStatus>,
