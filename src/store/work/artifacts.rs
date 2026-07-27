@@ -129,3 +129,28 @@ fn sanitize_artifact_file_name(value: &str) -> String {
         .collect()
 }
 
+
+#[cfg(test)]
+mod sanitize_tests {
+    use super::sanitize_artifact_file_name;
+
+    #[test]
+    fn replaces_every_character_that_is_unsafe_in_a_file_name() {
+        // Covers characters that cannot appear in a Windows filename at all,
+        // so they cannot be exercised through an on-disk fixture.
+        assert_eq!(
+            sanitize_artifact_file_name("external report?.md"),
+            "external_report_.md"
+        );
+        assert_eq!(sanitize_artifact_file_name("a:b*c\"d<e>f|g.md"), "a_b_c_d_e_f_g.md");
+        assert_eq!(sanitize_artifact_file_name("../../escape.md"), ".._.._escape.md");
+    }
+
+    #[test]
+    fn keeps_portable_name_characters() {
+        assert_eq!(
+            sanitize_artifact_file_name("report-v1.2_final+draft.md"),
+            "report-v1.2_final+draft.md"
+        );
+    }
+}

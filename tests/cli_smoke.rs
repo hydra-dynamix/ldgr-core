@@ -844,13 +844,24 @@ fn destructive_corrections_are_displayed_but_not_saved_for_rerun() -> anyhow::Re
     .stderr(predicate::str::contains("Use `ldgr rerun`").not());
     assert!(!project.path().join(".ldgr/last-rerun.json").exists());
 
-    command(project.path(), &db_path, &artifact_root, ["wrk"])?
+    // `adaptr` resolves to exactly one canonical subcommand, but `adapter`
+    // alone is not runnable, so the correction is shown and not saved.
+    command(project.path(), &db_path, &artifact_root, ["adaptr"])?
         .assert()
         .failure()
         .stderr(predicate::str::contains(
             "This correction is incomplete and was not saved for `ldgr rerun`.",
         ))
         .stderr(predicate::str::contains("Use `ldgr rerun`").not());
+
+    // `wrk` is within edit distance of both `work` and `workflow`. Ambiguous
+    // input must not be corrected at all, not even as a suggestion.
+    command(project.path(), &db_path, &artifact_root, ["wrk"])?
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Suggested rerun (not executed):").not())
+        .stderr(predicate::str::contains("Use `ldgr rerun`").not());
+    assert!(!project.path().join(".ldgr/last-rerun.json").exists());
     Ok(())
 }
 

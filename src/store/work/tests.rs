@@ -361,7 +361,10 @@ mod tests {
         )?;
         assert_eq!(internal.path, PathBuf::from("report.md"));
 
-        let external_path = temp.path().join("external report?.md");
+        // `?` is illegal in a Windows filename, so the on-disk fixture uses a
+        // portable name. Sanitizing genuinely illegal characters is covered by
+        // the unit tests for `sanitize_artifact_file_name`, which need no file.
+        let external_path = temp.path().join("external report.md");
         fs::write(&external_path, "outside")?;
         let external = add_artifact(
             &connection,
@@ -377,7 +380,7 @@ mod tests {
         assert!(external
             .path
             .to_string_lossy()
-            .ends_with("external_report_.md"));
+            .ends_with("external_report.md"));
         assert_eq!(
             fs::read_to_string(artifact_root.join(external.path))?,
             "outside"

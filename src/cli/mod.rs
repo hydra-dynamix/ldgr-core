@@ -136,6 +136,9 @@ Effective workflow:
 
 #[derive(Debug, Parser)]
 #[command(name = "ldgr")]
+// Usage lines otherwise echo argv[0], which is `ldgr.exe` on Windows. Agents
+// copy these strings verbatim, so keep them identical on every platform.
+#[command(bin_name = "ldgr")]
 #[command(about = "A minimal durable investigation loop.")]
 #[command(version)]
 #[command(after_help = CLI_DEFAULT_HELP_SECTIONS)]
