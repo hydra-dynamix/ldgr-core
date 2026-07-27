@@ -388,6 +388,7 @@ pub(crate) fn require_work_item_by_slug(
     connection: &Connection,
     slug: &str,
 ) -> anyhow::Result<WorkItem> {
+    let slug = slug.trim();
     connection
         .query_row(
             "SELECT * FROM work_item WHERE slug = ?1",

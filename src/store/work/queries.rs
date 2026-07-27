@@ -7,12 +7,13 @@ pub fn next_ready_work_item(
     program: Option<&str>,
     priority: Option<&str>,
 ) -> anyhow::Result<Option<WorkItem>> {
+    let program = program.map(|value| value.trim().to_ascii_lowercase());
     let priority = normalize_priority(priority)?;
     connection
         .query_row(
             "SELECT * FROM work_item
              WHERE status = 'pending'
-               AND (?1 IS NULL OR program = ?1)
+               AND (?1 IS NULL OR lower(program) = ?1)
                AND (?2 IS NULL OR priority = ?2)
                AND NOT EXISTS (
                    SELECT 1
@@ -23,9 +24,15 @@ pub fn next_ready_work_item(
                      AND prerequisite.status != 'done'
                )
              ORDER BY
-               CASE WHEN priority GLOB 'P[0-9]*'
-                    THEN CAST(substr(priority, 2) AS INTEGER)
-                    ELSE 2147483647 END,
+               CASE
+                    WHEN priority GLOB 'P[0-9]*' THEN CAST(substr(priority, 2) AS INTEGER)
+                    WHEN lower(priority) IN ('critical', 'urgent', 'highest') THEN 0
+                    WHEN lower(priority) = 'high' THEN 1
+                    WHEN lower(priority) IN ('medium', 'normal') THEN 2
+                    WHEN lower(priority) = 'low' THEN 3
+                    WHEN lower(priority) = 'lowest' THEN 4
+                    ELSE 2147483647
+               END,
                created_at, id
              LIMIT 1",
             params![program, priority],
@@ -159,16 +166,23 @@ pub fn list_work_items_filtered(
     program: Option<&str>,
     priority: Option<&str>,
 ) -> anyhow::Result<Vec<WorkItem>> {
+    let program = program.map(|value| value.trim().to_ascii_lowercase());
     let priority = normalize_priority(priority)?;
     let mut statement = connection.prepare(
         "SELECT * FROM work_item
          WHERE (?1 IS NULL OR status = ?1)
-           AND (?2 IS NULL OR program = ?2)
+           AND (?2 IS NULL OR lower(program) = ?2)
            AND (?3 IS NULL OR priority = ?3)
          ORDER BY
-           CASE WHEN priority GLOB 'P[0-9]*'
-                THEN CAST(substr(priority, 2) AS INTEGER)
-                ELSE 2147483647 END,
+           CASE
+                WHEN priority GLOB 'P[0-9]*' THEN CAST(substr(priority, 2) AS INTEGER)
+                WHEN lower(priority) IN ('critical', 'urgent', 'highest') THEN 0
+                WHEN lower(priority) = 'high' THEN 1
+                WHEN lower(priority) IN ('medium', 'normal') THEN 2
+                WHEN lower(priority) = 'low' THEN 3
+                WHEN lower(priority) = 'lowest' THEN 4
+                ELSE 2147483647
+           END,
            created_at, id",
     )?;
     let rows = statement.query_map(
@@ -184,12 +198,13 @@ pub fn last_completed_work_item(
     program: Option<&str>,
     priority: Option<&str>,
 ) -> anyhow::Result<Option<WorkItem>> {
+    let program = program.map(|value| value.trim().to_ascii_lowercase());
     let priority = normalize_priority(priority)?;
     connection
         .query_row(
             "SELECT * FROM work_item
              WHERE status = 'done'
-               AND (?1 IS NULL OR program = ?1)
+               AND (?1 IS NULL OR lower(program) = ?1)
                AND (?2 IS NULL OR priority = ?2)
              ORDER BY updated_at DESC, id DESC
              LIMIT 1",

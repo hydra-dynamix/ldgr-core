@@ -23,11 +23,17 @@ pub fn create_work_item_with_metadata(
     description: &str,
     metadata: WorkItemMetadata<'_>,
 ) -> anyhow::Result<WorkItem> {
+    let slug = slug.trim();
+    let title = title.trim();
+    let description = description.trim();
     validate_work_fields(slug, title, description)?;
     let priority = normalize_priority(metadata.priority)?;
     validate_optional_label("program", metadata.program)?;
     validate_optional_label("group", metadata.group)?;
     validate_optional_text("acceptance criteria", metadata.acceptance_criteria)?;
+    let program = metadata.program.map(normalize_label);
+    let group = metadata.group.map(normalize_label);
+    let acceptance_criteria = metadata.acceptance_criteria.map(str::trim);
     in_write_transaction(connection, |connection| {
         connection
             .execute(
@@ -41,9 +47,9 @@ pub fn create_work_item_with_metadata(
                     title,
                     description,
                     priority,
-                    metadata.program,
-                    metadata.group,
-                    metadata.acceptance_criteria,
+                    program,
+                    group,
+                    acceptance_criteria,
                 ],
             )
             .with_context(|| format!("failed to create work item {slug}"))?;
@@ -51,9 +57,9 @@ pub fn create_work_item_with_metadata(
         replace_work_dependencies(connection, work_item_id, metadata.dependencies)?;
         let payload = serde_json::json!({
             "priority": priority,
-            "program": metadata.program,
-            "group": metadata.group,
-            "acceptance_criteria": metadata.acceptance_criteria,
+            "program": program,
+            "group": group,
+            "acceptance_criteria": acceptance_criteria,
             "dependencies": metadata.dependencies,
         })
         .to_string();
@@ -114,20 +120,23 @@ pub fn edit_work_item_fields(
         validate_optional_text("acceptance criteria", value)?;
     }
     let work_item = require_work_item_by_slug(connection, slug)?;
-    let next_title = patch.title.unwrap_or(&work_item.title);
-    let next_description = patch.description.unwrap_or(&work_item.description);
+    let next_title = patch.title.map(str::trim).unwrap_or(&work_item.title);
+    let next_description = patch
+        .description
+        .map(str::trim)
+        .unwrap_or(&work_item.description);
     let next_priority = priority.unwrap_or_else(|| work_item.priority.clone());
     let next_program = patch
         .program
-        .map(|value| value.map(str::to_owned))
+        .map(|value| value.map(normalize_label))
         .unwrap_or_else(|| work_item.program.clone());
     let next_group = patch
         .group
-        .map(|value| value.map(str::to_owned))
+        .map(|value| value.map(normalize_label))
         .unwrap_or_else(|| work_item.group.clone());
     let next_acceptance = patch
         .acceptance_criteria
-        .map(|value| value.map(str::to_owned))
+        .map(|value| value.map(|text| text.trim().to_owned()))
         .unwrap_or_else(|| work_item.acceptance_criteria.clone());
     in_write_transaction(connection, |connection| {
         connection
@@ -357,14 +366,29 @@ pub(crate) fn normalize_priority(priority: Option<&str>) -> anyhow::Result<Optio
     let Some(priority) = priority else {
         return Ok(None);
     };
-    let normalized = priority.trim().to_ascii_uppercase();
-    if normalized.len() < 2
-        || !normalized.starts_with('P')
-        || !normalized[1..].chars().all(|character| character.is_ascii_digit())
-    {
-        bail!("priority must use P<number> form, for example P0 or P1");
+    let trimmed = priority.trim();
+    if trimmed.is_empty() {
+        bail!("priority must not be empty; omit --priority or use --clear-priority when editing");
     }
+
+    // Preserve the established P<number> convention without requiring it.
+    // Priority is a label: high/medium/low and domain-specific values carry
+    // clear intent and should not make an otherwise valid command fail.
+    let normalized = if trimmed.len() >= 2
+        && matches!(trimmed.as_bytes().first(), Some(b'P' | b'p'))
+        && trimmed[1..]
+            .chars()
+            .all(|character| character.is_ascii_digit())
+    {
+        format!("P{}", &trimmed[1..])
+    } else {
+        trimmed.to_ascii_lowercase()
+    };
     Ok(Some(normalized))
+}
+
+fn normalize_label(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
 }
 
 fn validate_optional_label(name: &str, value: Option<&str>) -> anyhow::Result<()> {
@@ -392,6 +416,10 @@ pub(crate) fn replace_work_dependencies(
     )?;
     let mut seen = std::collections::BTreeSet::new();
     for dependency_slug in dependencies {
+        let dependency_slug = dependency_slug.trim();
+        if dependency_slug.is_empty() {
+            continue;
+        }
         if !seen.insert(dependency_slug) {
             continue;
         }

@@ -35,7 +35,7 @@ pub enum RunCommand {
 
 #[derive(Debug, Args)]
 pub struct ListRunArgs {
-    #[arg(long, value_enum)]
+    #[arg(long, value_enum, ignore_case = true)]
     pub status: Option<CliRunFilterStatus>,
 
     #[arg(long)]
@@ -65,7 +65,7 @@ pub struct StartRunArgs {
 pub struct FinishRunArgs {
     pub run_id: String,
 
-    #[arg(long, value_enum)]
+    #[arg(long, value_enum, ignore_case = true)]
     pub status: CliRunStatus,
 
     #[arg(long)]
@@ -76,10 +76,10 @@ pub struct FinishRunArgs {
 pub struct CloseRunArgs {
     pub run_id: String,
 
-    #[arg(long, value_enum)]
+    #[arg(long, value_enum, ignore_case = true)]
     pub status: CliRunStatus,
 
-    #[arg(long, value_enum)]
+    #[arg(long, value_enum, ignore_case = true)]
     pub outcome: CliCloseDecisionOutcome,
 
     #[arg(long)]
@@ -308,7 +308,7 @@ pub struct ListValidationArgs {
 pub struct RecordValidationArgs {
     pub run_id: String,
 
-    #[arg(long, value_enum)]
+    #[arg(long, value_enum, ignore_case = true)]
     pub outcome: CliValidationOutcome,
 
     #[arg(long)]

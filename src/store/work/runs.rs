@@ -3,6 +3,7 @@ pub fn start_run(
     work_slug: &str,
     command: Option<&str>,
 ) -> anyhow::Result<InvestigationRun> {
+    let work_slug = work_slug.trim();
     match claim_pending_run_by_slug(connection, work_slug, command)? {
         Some(claimed) => Ok(claimed.run),
         None => {
@@ -51,9 +52,15 @@ pub fn claim_next_pending_run(
                              AND prerequisite.status != 'done'
                        )
                      ORDER BY
-                       CASE WHEN priority GLOB 'P[0-9]*'
-                            THEN CAST(substr(priority, 2) AS INTEGER)
-                            ELSE 2147483647 END,
+                       CASE
+                            WHEN priority GLOB 'P[0-9]*' THEN CAST(substr(priority, 2) AS INTEGER)
+                            WHEN lower(priority) IN ('critical', 'urgent', 'highest') THEN 0
+                            WHEN lower(priority) = 'high' THEN 1
+                            WHEN lower(priority) IN ('medium', 'normal') THEN 2
+                            WHEN lower(priority) = 'low' THEN 3
+                            WHEN lower(priority) = 'lowest' THEN 4
+                            ELSE 2147483647
+                       END,
                        created_at, id
                      LIMIT 1
                  )

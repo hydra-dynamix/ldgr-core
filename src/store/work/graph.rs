@@ -176,10 +176,23 @@ pub fn audit_work_graph(connection: &Connection) -> anyhow::Result<WorkAudit> {
 }
 
 fn priority_rank(priority: Option<&str>) -> u64 {
-    priority
-        .and_then(|value| value.strip_prefix('P'))
+    let Some(priority) = priority else {
+        return u64::MAX;
+    };
+    if let Some(rank) = priority
+        .strip_prefix('P')
         .and_then(|value| value.parse().ok())
-        .unwrap_or(u64::MAX)
+    {
+        return rank;
+    }
+    match priority.to_ascii_lowercase().as_str() {
+        "critical" | "urgent" | "highest" => 0,
+        "high" => 1,
+        "medium" | "normal" => 2,
+        "low" => 3,
+        "lowest" => 4,
+        _ => u64::MAX,
+    }
 }
 
 fn has_dependency_cycle(graph: &WorkGraph) -> bool {

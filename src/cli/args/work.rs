@@ -53,12 +53,13 @@ pub enum WorkCommand {
 
 #[derive(Debug, Args)]
 pub struct ListWorkArgs {
-    #[arg(long, value_enum)]
+    #[arg(long, value_enum, ignore_case = true)]
     pub status: Option<CliWorkItemStatus>,
 
     #[arg(long)]
     pub program: Option<String>,
 
+    /// Priority label, such as P0, high, medium, or low.
     #[arg(long)]
     pub priority: Option<String>,
 
@@ -182,12 +183,13 @@ pub struct WorkGraphArgs {
     #[arg(long)]
     pub blocked: bool,
 
-    #[arg(long, value_enum, default_value_t = CliWorkGraphFormat::Human)]
+    #[arg(long, value_enum, ignore_case = true, default_value_t = CliWorkGraphFormat::Human)]
     pub format: CliWorkGraphFormat,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum CliWorkGraphFormat {
+    #[value(alias = "text")]
     Human,
     Json,
     Mermaid,
@@ -218,14 +220,14 @@ pub enum WorkStatusCommand {
 pub struct SetWorkStatusArgs {
     pub slug: String,
 
-    #[arg(value_enum)]
+    #[arg(value_enum, ignore_case = true)]
     pub status: CliWorkItemStatus,
 
     #[arg(long)]
     pub reason: Option<String>,
 
     /// Classify held work as blocked, deferred, or awaiting external validation.
-    #[arg(long, value_enum)]
+    #[arg(long, value_enum, ignore_case = true)]
     pub hold_kind: Option<CliHoldKind>,
 }
 
@@ -272,6 +274,12 @@ pub struct ExportWorkArgs {
 pub enum CliHoldKind {
     Blocked,
     Deferred,
+    #[value(
+        alias = "external",
+        alias = "validation",
+        alias = "awaiting-validation",
+        alias = "external_validation"
+    )]
     ExternalValidation,
 }
 
@@ -289,7 +297,12 @@ impl From<CliHoldKind> for HoldKind {
 pub enum CliWorkItemStatus {
     #[value(alias = "todo", alias = "queued")]
     Pending,
-    #[value(alias = "active", alias = "in-progress")]
+    #[value(
+        alias = "active",
+        alias = "in-progress",
+        alias = "in_progress",
+        alias = "inprogress"
+    )]
     Running,
     #[value(alias = "blocked", alias = "paused", alias = "deferred")]
     Held,
@@ -339,7 +352,7 @@ pub enum NoticeCommand {
 
 #[derive(Debug, Args)]
 pub struct ListNoticeArgs {
-    #[arg(long, value_enum, default_value = "active")]
+    #[arg(long, value_enum, ignore_case = true, default_value = "active")]
     pub status: CliGlobalObservationStatus,
 
     #[arg(long, default_value_t = 20)]
@@ -351,7 +364,7 @@ pub struct ListNoticeArgs {
 
 #[derive(Debug, Args)]
 pub struct AddNoticeArgs {
-    #[arg(long, value_enum, default_value = "observation")]
+    #[arg(long, value_enum, ignore_case = true, default_value = "observation")]
     pub kind: CliGlobalObservationKind,
 
     #[arg(long)]
@@ -365,7 +378,7 @@ pub struct AddNoticeArgs {
 pub struct EditNoticeArgs {
     pub id: i64,
 
-    #[arg(long, value_enum)]
+    #[arg(long, value_enum, ignore_case = true)]
     pub kind: Option<CliGlobalObservationKind>,
 
     #[arg(long)]
@@ -377,7 +390,7 @@ pub struct EditNoticeArgs {
     #[arg(long)]
     pub clear_source: bool,
 
-    #[arg(long, value_enum)]
+    #[arg(long, value_enum, ignore_case = true)]
     pub status: Option<CliGlobalObservationStatus>,
 }
 
@@ -391,7 +404,9 @@ pub struct ClearNoticeArgs {
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum CliGlobalObservationKind {
+    #[value(alias = "note")]
     Observation,
+    #[value(alias = "notice")]
     Notification,
 }
 

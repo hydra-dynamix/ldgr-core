@@ -81,10 +81,11 @@ pub fn import_schedule(
         let mut created = 0;
         let mut updated = 0;
         for item in &schedule.work_items {
+            let slug = item.slug.trim();
             let existing = connection
                 .query_row(
                     "SELECT * FROM work_item WHERE slug = ?1",
-                    params![item.slug],
+                    params![slug],
                     WorkItem::from_row,
                 )
                 .optional()?;
@@ -94,14 +95,19 @@ pub fn import_schedule(
                     item.slug
                 );
             }
-            let status = item.status.as_deref().unwrap_or("pending");
+            let status = parse_schedule_work_status(item.status.as_deref().unwrap_or("pending"))?;
             let priority = normalize_priority(item.priority.as_deref())?;
-            let hold_kind = if status == "held" {
-                Some(item.hold_kind.as_deref().unwrap_or("blocked"))
+            let program = item.program.as_deref().map(normalize_label);
+            let group = item.group.as_deref().map(normalize_label);
+            let acceptance_criteria = item.acceptance_criteria.as_deref().map(str::trim);
+            let hold_kind = if status == WorkItemStatus::Held {
+                Some(parse_schedule_hold_kind(
+                    item.hold_kind.as_deref().unwrap_or("blocked"),
+                )?)
             } else {
                 None
             };
-            let hold_reason = (status == "held")
+            let hold_reason = (status == WorkItemStatus::Held)
                 .then_some(item.hold_reason.as_deref())
                 .flatten();
             if let Some(existing) = existing {
@@ -112,14 +118,14 @@ pub fn import_schedule(
                          hold_kind = ?8, hold_reason = ?9, updated_at = datetime('now')
                      WHERE id = ?10",
                     params![
-                        item.title,
-                        item.description,
-                        status,
+                        item.title.trim(),
+                        item.description.trim(),
+                        status.as_str(),
                         priority,
-                        item.program,
-                        item.group,
-                        item.acceptance_criteria,
-                        hold_kind,
+                        program,
+                        group,
+                        acceptance_criteria,
+                        hold_kind.map(HoldKind::as_str),
                         hold_reason,
                         existing.id,
                     ],
@@ -132,15 +138,15 @@ pub fn import_schedule(
                         acceptance_criteria, hold_kind, hold_reason
                      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                     params![
-                        item.slug,
-                        item.title,
-                        item.description,
-                        status,
+                        slug,
+                        item.title.trim(),
+                        item.description.trim(),
+                        status.as_str(),
                         priority,
-                        item.program,
-                        item.group,
-                        item.acceptance_criteria,
-                        hold_kind,
+                        program,
+                        group,
+                        acceptance_criteria,
+                        hold_kind.map(HoldKind::as_str),
                         hold_reason,
                     ],
                 )?;
@@ -152,7 +158,13 @@ pub fn import_schedule(
         for item in &schedule.work_items {
             let work_item = require_work_item_by_slug(connection, &item.slug)?;
             replace_work_dependencies(connection, work_item.id, &item.dependencies)?;
-            dependency_count += item.dependencies.len();
+            dependency_count += item
+                .dependencies
+                .iter()
+                .map(|slug| slug.trim())
+                .filter(|slug| !slug.is_empty())
+                .collect::<std::collections::BTreeSet<_>>()
+                .len();
             let payload = serde_json::json!({
                 "source": SCHEDULE_FORMAT,
                 "upsert": upsert,
@@ -191,21 +203,49 @@ fn validate_schedule(schedule: &ScheduleFile) -> anyhow::Result<()> {
     let mut slugs = std::collections::BTreeSet::new();
     for item in &schedule.work_items {
         validate_work_fields(&item.slug, &item.title, &item.description)?;
-        if !slugs.insert(item.slug.as_str()) {
+        if !slugs.insert(item.slug.trim()) {
             bail!("schedule contains duplicate work item slug {}", item.slug);
         }
         normalize_priority(item.priority.as_deref())?;
         validate_optional_label("program", item.program.as_deref())?;
         validate_optional_label("group", item.group.as_deref())?;
         validate_optional_text("acceptance criteria", item.acceptance_criteria.as_deref())?;
-        let status = item.status.as_deref().unwrap_or("pending");
-        WorkItemStatus::from_str(status)
-            .map_err(|_| anyhow::anyhow!("invalid status {status} for work item {}", item.slug))?;
+        let status = parse_schedule_work_status(item.status.as_deref().unwrap_or("pending"))?;
         if let Some(kind) = item.hold_kind.as_deref() {
-            HoldKind::from_str(kind).map_err(|_| {
-                anyhow::anyhow!("invalid hold kind {kind} for work item {}", item.slug)
-            })?;
+            parse_schedule_hold_kind(kind)?;
+        }
+        if status != WorkItemStatus::Held && item.hold_kind.is_some() {
+            bail!("hold_kind is only valid for held work item {}", item.slug);
         }
     }
     Ok(())
+}
+
+fn parse_schedule_work_status(value: &str) -> anyhow::Result<WorkItemStatus> {
+    let normalized = value.trim().to_ascii_lowercase().replace('_', "-");
+    match normalized.as_str() {
+        "pending" | "todo" | "queued" => Ok(WorkItemStatus::Pending),
+        "running" | "active" | "in-progress" | "inprogress" => Ok(WorkItemStatus::Running),
+        "held" | "blocked" | "paused" | "deferred" => Ok(WorkItemStatus::Held),
+        "done" | "complete" | "completed" | "finished" | "success" | "succeeded"
+        | "ok" => Ok(WorkItemStatus::Done),
+        "canceled" | "cancelled" | "abandoned" | "dropped" => Ok(WorkItemStatus::Canceled),
+        _ => bail!(
+            "invalid work item status `{value}`; expected pending, running, held, done, or canceled"
+        ),
+    }
+}
+
+fn parse_schedule_hold_kind(value: &str) -> anyhow::Result<HoldKind> {
+    let normalized = value.trim().to_ascii_lowercase().replace('_', "-");
+    match normalized.as_str() {
+        "blocked" => Ok(HoldKind::Blocked),
+        "deferred" => Ok(HoldKind::Deferred),
+        "external" | "validation" | "awaiting-validation" | "external-validation" => {
+            Ok(HoldKind::ExternalValidation)
+        }
+        _ => bail!(
+            "invalid hold kind `{value}`; expected blocked, deferred, or external-validation"
+        ),
+    }
 }

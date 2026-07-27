@@ -28,10 +28,11 @@ fn resolve_next_work_item_id(
     current_work_item: &WorkItem,
     next_work: NextWorkSpec<'_>,
 ) -> anyhow::Result<i64> {
+    let next_slug = next_work.slug.trim();
     let existing = connection
         .query_row(
             "SELECT * FROM work_item WHERE slug = ?1",
-            params![next_work.slug],
+            params![next_slug],
             WorkItem::from_row,
         )
         .optional()
@@ -61,7 +62,7 @@ fn resolve_next_work_item_id(
     let created = create_work_item(
         connection,
         Some(current_work_item.id),
-        next_work.slug,
+        next_slug,
         title,
         description,
     )?;
@@ -120,4 +121,3 @@ fn record_decision_unchecked(
     record_event(connection, "work_item", work_item.id, "finish", "{}")?;
     get_decision_by_id(connection, decision_id)
 }
-

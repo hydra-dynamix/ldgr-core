@@ -35,7 +35,7 @@ pub struct ListDecisionArgs {
 pub struct RecordDecisionArgs {
     pub work_slug: String,
 
-    #[arg(long, value_enum)]
+    #[arg(long, value_enum, ignore_case = true)]
     pub outcome: CliDecisionOutcome,
 
     #[arg(long)]
