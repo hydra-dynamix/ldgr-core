@@ -5,7 +5,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use anyhow::{bail, Context};
-use dialoguer::{theme::ColorfulTheme, Confirm, MultiSelect};
+use dialoguer::{theme::ColorfulTheme, Confirm, MultiSelect, Select};
 
 use crate::adapter_registry::AdapterRegistry;
 use crate::loop_runtime::{
@@ -27,7 +27,8 @@ use crate::web::{generate_control_token, serve, WebOptions};
 use super::super::args::{
     AdapterReconcileArgs, AdapterUninstallArgs, AdapterUpdateArgs, CliLoopAgent, ContextArgs,
     HarnessKind, InstallAdapterArgs, InstallArgs, InstallCommand, LoopArgs, LoopCommand,
-    LoopRunArgs, MigrateArgs, SchemaArgs, SchemaCommand, StatusArgs, TelemetryArgs,
+    ConfigArgs, ConfigCommand, LoopRunArgs, MigrateArgs, SchemaArgs, SchemaCommand, StatusArgs,
+    TelemetryArgs, WorkflowArgs,
     TelemetryCommand, TelemetryInstallChoice, WebArgs,
 };
 use super::super::render::brief_context::{
@@ -38,8 +39,8 @@ use super::super::render::emit;
 use super::super::render::status::{build_status_summary, print_status_summary};
 use super::super::render::text::print_loop_result;
 use super::super::{CLI_DEFAULT_HELP_SECTIONS, INIT_PROJECT_SETUP_PROMPT};
+use crate::harness_config::InterviewDepth;
 
-const LDGR_CONTEXT_EXTENSION: &str = include_str!("../../../extensions/ldgr-context.ts");
 const LDGR_CORE_LOOP_PROMPT: &str = include_str!("../../../prompts/loop-prompt.md");
 const LDGR_CORE_LOOP_PROMPT_FILE: &str = "ldgr-core-loop.md";
 const LDGR_RELEASE_KEYRING: &str = include_str!("../../../release-keyring.json");
@@ -76,6 +77,7 @@ pub fn handle_install(args: InstallArgs) -> anyhow::Result<()> {
     if harnesses.is_empty() {
         return Ok(());
     }
+    let interview_depth = select_interview_depth(&args)?;
     println!(
         "√ Harnesses: {}",
         harnesses
@@ -97,6 +99,7 @@ pub fn handle_install(args: InstallArgs) -> anyhow::Result<()> {
     fs::write(&core_loop_prompt, LDGR_CORE_LOOP_PROMPT)?;
     println!("├─ Core loop prompt {}", core_loop_prompt.display());
     let mut installed = Vec::new();
+    installed.push(install_shared_skill(&home)?);
     for harness in &harnesses {
         installed.push(install_harness(*harness, &home)?);
     }
@@ -107,6 +110,7 @@ pub fn handle_install(args: InstallArgs) -> anyhow::Result<()> {
         "schema_version": 1,
         "default_harness": harnesses.first().map(|harness| harness_name(*harness)).unwrap_or("pi"),
         "selected_harnesses": harnesses.iter().map(|harness| harness_name(*harness)).collect::<Vec<_>>(),
+        "interview_depth": interview_depth.as_str(),
         "installed": installed,
         "agentctl": agentctl,
         "agentctl_config": agentctl_config,
@@ -129,6 +133,7 @@ pub fn handle_install(args: InstallArgs) -> anyhow::Result<()> {
     println!("√ LDGR install complete");
     println!("│");
     println!("◇ Next steps");
+    println!("│  Run `ldgr workflow` to understand this project's workflow.");
     if harnesses.contains(&HarnessKind::Pi) {
         println!("│  Run /reload in Pi, then use /ldgr <args>, /ldgr-context, or /run-loop.");
     }
@@ -1978,6 +1983,36 @@ fn select_harnesses(args: &InstallArgs) -> anyhow::Result<Vec<HarnessKind>> {
     Ok(harnesses)
 }
 
+/// Resolve the requirements-interview depth from the flag, or ask for it.
+/// Non-interactive installs take the default rather than blocking.
+fn select_interview_depth(args: &InstallArgs) -> anyhow::Result<InterviewDepth> {
+    if let Some(raw) = &args.interview_depth {
+        let depth = InterviewDepth::parse(raw).ok_or_else(|| {
+            anyhow::anyhow!("unknown --interview-depth `{raw}`; expected high, medium, low, or none")
+        })?;
+        println!("◇ Requirements interview: {}", depth.as_str());
+        return Ok(depth);
+    }
+    if args.yes || !stdin_is_terminal() {
+        let depth = InterviewDepth::default();
+        println!("◇ Requirements interview: {} (default)", depth.as_str());
+        return Ok(depth);
+    }
+    let items = InterviewDepth::VALUES
+        .iter()
+        .map(|depth| format!("{} — {}", depth.as_str(), depth.describe()))
+        .collect::<Vec<_>>();
+    let theme = ColorfulTheme::default();
+    let selection = Select::with_theme(&theme)
+        .with_prompt("How thoroughly should the agent interview you about project requirements?")
+        .items(&items)
+        .default(1)
+        .interact_opt()?;
+    Ok(selection
+        .and_then(|index| InterviewDepth::VALUES.get(index).copied())
+        .unwrap_or_default())
+}
+
 fn select_adapters(args: &InstallArgs) -> anyhow::Result<Vec<String>> {
     if !args.adapter.is_empty() {
         let adapters = args
@@ -2023,12 +2058,7 @@ fn select_adapter_bundles() -> anyhow::Result<Vec<String>> {
 }
 
 fn install_harness(harness: HarnessKind, home: &Path) -> anyhow::Result<serde_json::Value> {
-    match harness {
-        HarnessKind::Pi => install_pi_harness(home),
-        HarnessKind::Codex => install_codex_harness(home),
-        HarnessKind::Claude => install_claude_harness(home),
-        HarnessKind::Openclaw => install_openclaw_harness(home),
-    }
+    install_harness_skill(harness, home)
 }
 
 fn ensure_agentctl_dependency(skip: bool) -> anyhow::Result<serde_json::Value> {
@@ -2252,62 +2282,49 @@ fn command_on_path(command: &str) -> bool {
         .is_ok()
 }
 
-fn install_pi_harness(home: &Path) -> anyhow::Result<serde_json::Value> {
-    let extension = home.join(".pi/agent/extensions/ldgr-context.ts");
-    write_file(&extension, LDGR_CONTEXT_EXTENSION)?;
-    println!("├─ Pi extension {}", extension.display());
+/// Global skill root for a harness. See docs/harness-skill-locations.md.
+fn harness_skill_root(harness: HarnessKind, home: &Path) -> PathBuf {
+    match harness {
+        HarnessKind::Pi => home.join(".pi/agent/skills"),
+        HarnessKind::Codex => home.join(".codex/skills"),
+        HarnessKind::Claude => home.join(".claude/skills"),
+        HarnessKind::Openclaw => home.join(".openclaw/skills"),
+    }
+}
+
+/// The cross-tool convention root. Several harnesses scan it, including some
+/// with no global root of their own, so it is always written.
+fn shared_skill_root(home: &Path) -> PathBuf {
+    home.join(".agents/skills")
+}
+
+/// Installing ldgr into a harness means one thing: writing the single skill.
+/// There are no extensions, slash commands, or per-harness guides — the skill
+/// routes the agent to the CLI, and the CLI describes itself.
+fn install_harness_skill(harness: HarnessKind, home: &Path) -> anyhow::Result<serde_json::Value> {
+    let root = harness_skill_root(harness, home);
+    let skill = root.join("ldgr/SKILL.md");
+    write_file(&skill, LDGR_SKILL)?;
+    println!("├─ {} skill {}", harness_name(harness), skill.display());
     Ok(serde_json::json!({
-        "harness": "pi",
-        "extension_paths": [extension],
-        "skill_paths": [home.join(".pi/agent/skills")],
-        "reload": "Run /reload in Pi, then use /ldgr <args>, /ldgr-context, or /run-loop [adapter] [loop args]."
+        "harness": harness_name(harness),
+        "skill_paths": [root],
+        "skill_file": skill,
     }))
 }
 
-fn install_codex_harness(home: &Path) -> anyhow::Result<serde_json::Value> {
-    let doc = home.join(".codex/ldgr/LDGR.md");
-    write_file(&doc, LDGR_HARNESS_GUIDE)?;
-    let instructions = home.join(".codex/prompts/ldgr-core.md");
-    write_file(&instructions, CODEX_INSTRUCTIONS)?;
-    println!("├─ Codex guide {}", doc.display());
-    println!("├─ Codex prompt {}", instructions.display());
+/// Written on every install so harnesses that read the shared convention pick
+/// ldgr up without being named explicitly.
+fn install_shared_skill(home: &Path) -> anyhow::Result<serde_json::Value> {
+    let root = shared_skill_root(home);
+    let skill = root.join("ldgr/SKILL.md");
+    write_file(&skill, LDGR_SKILL)?;
+    println!("├─ Shared agent skill {}", skill.display());
     Ok(serde_json::json!({
-        "harness": "codex",
-        "prompt_paths": [home.join(".codex/prompts")],
-        "skill_paths": [home.join(".codex/skills")],
-        "prompt_file": instructions,
-        "guide_path": doc,
-        "extension_equivalent": "Codex CLI has plugin/MCP surfaces, but no local Pi-style slash-command extension was detected; LDGR installs global prompts, skills, and a guide instead."
-    }))
-}
-
-fn install_claude_harness(home: &Path) -> anyhow::Result<serde_json::Value> {
-    let skill = home.join(".claude/skills/ldgr-core/SKILL.md");
-    let command = home.join(".claude/commands/ldgr.md");
-    write_file(&skill, LDGR_CORE_SKILL)?;
-    write_file(&command, CLAUDE_LDGR_COMMAND)?;
-    println!("├─ Claude Code skill {}", skill.display());
-    println!("├─ Claude Code slash command {}", command.display());
-    Ok(serde_json::json!({
-        "harness": "claude",
-        "skill_paths": [home.join(".claude/skills")],
-        "command_paths": [command],
-        "usage": "Restart/reload Claude Code, then use /ldgr <args>."
-    }))
-}
-
-fn install_openclaw_harness(home: &Path) -> anyhow::Result<serde_json::Value> {
-    let skill = home.join(".openclaw/skills/ldgr-core/SKILL.md");
-    let command = home.join(".openclaw/commands/ldgr.md");
-    write_file(&skill, LDGR_CORE_SKILL)?;
-    write_file(&command, CLAW_LDGR_COMMAND)?;
-    println!("├─ OpenClaw skill fallback {}", skill.display());
-    println!("├─ OpenClaw command fallback {}", command.display());
-    Ok(serde_json::json!({
-        "harness": "openclaw",
-        "skill_paths": [home.join(".openclaw/skills")],
-        "command_paths": [command],
-        "extension_equivalent": "OpenClaw compatibility is recorded as skill/command prompt files; adapt these paths if your OpenClaw distribution uses different resource roots."
+        "harness": "agents",
+        "skill_paths": [root],
+        "skill_file": skill,
+        "note": "Cross-tool convention root scanned by several harnesses.",
     }))
 }
 
@@ -2340,36 +2357,109 @@ fn harness_name(harness: HarnessKind) -> &'static str {
     }
 }
 
-const LDGR_HARNESS_GUIDE: &str = r#"# LDGR harness guide
+/// The one skill ldgr installs. Everything else an agent needs is discoverable
+/// from the CLI itself via `ldgr workflow` and `--help`.
+const LDGR_SKILL: &str = include_str!("../../../skills/ldgr/SKILL.md");
 
-Use LDGR as the durable project ledger. Start with `ldgr status`; expand to `ldgr context --brief` or `ldgr context` when needed. When a user asks for `/ldgr <args>` behavior in a harness without a local extension API, run `ldgr <args>` from the shell and paste stdout/stderr back into the conversation.
+const CORE_WORKFLOW: &str = include_str!("../../../workflows/core.md");
 
-Adapter installers should read `~/.ldgr/config.json`, validate their own license when applicable, install adapter bundle files under `~/.ldgr/adapters/<adapter>` by default, and install adapter-owned prompts, skills, commands, and extensions into the paths declared by each configured harness entry.
-"#;
+/// Read the configured interview depth, falling back to the default when no
+/// config exists yet. A missing or unreadable config is not an error here —
+/// the workflow is still worth printing.
+fn configured_interview_depth() -> InterviewDepth {
+    home_dir()
+        .ok()
+        .map(|home| home.join(".ldgr/config.json"))
+        .and_then(|path| fs::read_to_string(path).ok())
+        .and_then(|text| crate::harness_config::parse_harness_config(&text).ok())
+        .map(|config| config.interview_depth)
+        .unwrap_or_default()
+}
 
-const CODEX_INSTRUCTIONS: &str = r#"# LDGR
+pub fn handle_workflow(args: WorkflowArgs) -> anyhow::Result<()> {
+    let depth = configured_interview_depth();
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "namespace": "core",
+                "workflow": CORE_WORKFLOW,
+                "interview_depth": depth.as_str(),
+                "interview_depth_behavior": depth.describe(),
+                "adapter_workflows": "ldgr <adapter> workflow",
+            }))?
+        );
+    } else {
+        print!("{CORE_WORKFLOW}");
+        println!(
+            "\nConfigured requirements interview: {} — {}.",
+            depth.as_str(),
+            depth.describe()
+        );
+        println!("Change it with `ldgr config set interview-depth <high|medium|low|none>`.");
+        println!("Installed adapters expose their own workflow: `ldgr <adapter> workflow`.");
+    }
+    Ok(())
+}
 
-When the user asks for LDGR state or says `/ldgr <args>`, run `ldgr <args>` from the shell and report stdout/stderr. With no args, run `ldgr context --brief`. Use `ldgr status` first for project on-ramp work.
-"#;
-
-const LDGR_CORE_SKILL: &str = r#"---
-name: ldgr-core
-description: Use when working with LDGR durable project ledgers, context, status, work items, runs, observations, artifacts, validations, or decisions.
----
-
-# LDGR Core
-
-- Start with `ldgr status`.
-- Use `ldgr context --brief` for compact handoff context and `ldgr context` for deeper history.
-- When asked for `/ldgr <args>` behavior, run `ldgr <args>` and include stdout/stderr in the conversation.
-- Record durable work with one work item, one run, observations/artifacts, validation evidence, and a closing decision.
-"#;
-
-const CLAUDE_LDGR_COMMAND: &str = r#"Run `ldgr $ARGUMENTS` in the current project and report stdout/stderr back to the conversation. If no arguments are provided, run `ldgr context --brief`.
-"#;
-
-const CLAW_LDGR_COMMAND: &str = r#"Run `ldgr $ARGUMENTS` in the current project and report stdout/stderr back to the conversation. If no arguments are provided, run `ldgr context --brief`.
-"#;
+pub fn handle_config(args: ConfigArgs) -> anyhow::Result<()> {
+    let config_path = home_dir()?.join(".ldgr/config.json");
+    match args.command {
+        ConfigCommand::Show(show) => {
+            let depth = configured_interview_depth();
+            if show.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "config_path": config_path,
+                        "exists": config_path.is_file(),
+                        "interview_depth": depth.as_str(),
+                    }))?
+                );
+            } else {
+                println!("config: {}", config_path.display());
+                if !config_path.is_file() {
+                    println!("status: not written yet; run `ldgr install`");
+                }
+                println!("interview_depth: {} — {}", depth.as_str(), depth.describe());
+            }
+            Ok(())
+        }
+        ConfigCommand::Set(set) => {
+            let key = set.key.trim().to_ascii_lowercase().replace('_', "-");
+            if key != "interview-depth" {
+                anyhow::bail!("unknown config key `{}`; expected interview-depth", set.key);
+            }
+            let depth = InterviewDepth::parse(&set.value).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "unknown interview-depth `{}`; expected high, medium, low, or none",
+                    set.value
+                )
+            })?;
+            // Preserve every other key in the file, including ones this build
+            // does not know about.
+            let mut document: serde_json::Value = if config_path.is_file() {
+                serde_json::from_str(&fs::read_to_string(&config_path)?)?
+            } else {
+                serde_json::json!({ "schema_version": 1 })
+            };
+            let object = document
+                .as_object_mut()
+                .ok_or_else(|| anyhow::anyhow!("{} is not a JSON object", config_path.display()))?;
+            object.insert(
+                "interview_depth".to_owned(),
+                serde_json::Value::String(depth.as_str().to_owned()),
+            );
+            write_file(
+                &config_path,
+                &format!("{}\n", serde_json::to_string_pretty(&document)?),
+            )?;
+            println!("interview_depth: {} — {}", depth.as_str(), depth.describe());
+            println!("wrote {}", config_path.display());
+            Ok(())
+        }
+    }
+}
 
 pub fn handle_schema(db: &Path, args: SchemaArgs) -> anyhow::Result<()> {
     match args.command {
@@ -2670,18 +2760,15 @@ pub fn handle_loop(
 }
 
 fn install_core_harness_resources() -> anyhow::Result<()> {
-    fs::create_dir_all(".pi/extensions")?;
-    fs::write(".pi/extensions/ldgr-context.ts", LDGR_CONTEXT_EXTENSION)?;
     fs::create_dir_all(".ldgr")?;
     fs::write(
         ".ldgr/harness-setup.md",
         "# LDGR harness setup\n\n\
-`ldgr init` installed the Pi project-local extension `.pi/extensions/ldgr-context.ts`.\n\n\
-If your agent harness is Pi, run `/reload` so `/ldgr <args>`, `/ldgr-context`, and `/run-loop` become available. `/ldgr` runs the LDGR CLI in the project and pipes stdout/stderr back into the conversation; with no args it runs `ldgr context --brief`. `/run-loop [adapter] [loop args]` selects an installed adapter loop prompt and runs `ldgr loop run --agent agentctl --until-empty --summary-agent agentctl`, launching one fresh worker agent per LDGR work item and one separate fresh summarizer call per completed cycle until no pending work remains or the loop blocks.\n\n\
-If your agent harness is not Pi or does not load project-local Pi extensions, point the agent at this document and ask it to adapt the installed extension for its harness. The extension is optional; core `ldgr ...` commands continue to work from the shell.\n",
+ldgr installs one skill, `ldgr`, into your harness's global skill directory. It routes an agent to the CLI; the CLI describes itself from there.\n\n\
+If the skill is not installed, run `ldgr install` (interactive, human-operated) and select your harness. If your harness is not listed, copy the skill directory into whatever global skill path it reads, or point the agent at the CLI directly — `ldgr` works from any shell without a skill.\n\n\
+An agent that has not been given the skill should start with `ldgr status` (or `ldgr init` if no `.ldgr/ldgr.db` exists) and then run `ldgr workflow`.\n",
     )?;
-    println!("installed Pi extension .pi/extensions/ldgr-context.ts");
-    println!("wrote fallback harness notes .ldgr/harness-setup.md");
+    println!("wrote harness notes .ldgr/harness-setup.md");
     Ok(())
 }
 

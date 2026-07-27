@@ -146,13 +146,26 @@ fn adapter_namespace_aliases_are_explicit_and_typos_never_execute() -> anyhow::R
 
     let mut typo = isolated_command(project.path())?;
     typo.env("LDGR_ADAPTER_PATH", &adapter).arg("fxture");
-    typo.assert().failure();
+    typo.assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "Unknown adapter namespace `fxture`. Did you mean `fixture`?",
+        ))
+        .stderr(predicate::str::contains(
+            "Suggested rerun (not executed):\n  ldgr fixture",
+        ));
 
     let mut exact_help = isolated_command(project.path())?;
     exact_help
         .env("LDGR_ADAPTER_PATH", &adapter)
         .args(["fixture", "--help"]);
     exact_help.assert().success();
+
+    let mut case_variant = isolated_command(project.path())?;
+    case_variant
+        .env("LDGR_ADAPTER_PATH", &adapter)
+        .args(["FIXTURE", "--help"]);
+    case_variant.assert().success();
     Ok(())
 }
 
@@ -745,6 +758,156 @@ fn invalid_command_input_prints_last_parsable_help() -> anyhow::Result<()> {
         .stdout(predicate::str::contains("ldgr work create fix-login").and(
             predicate::str::contains("ldgr work status set fix-login held"),
         ));
+
+    let mut command = isolated_command(project.path())?;
+    command.args([
+        "work",
+        "crate",
+        "fix-login",
+        "--title",
+        "Fix login",
+        "--description",
+        "Repair login.",
+    ]);
+    command.assert().failure().stderr(predicate::str::contains(
+        "Suggested rerun (not executed):\n  ldgr work create fix-login --title 'Fix login' --description 'Repair login.'",
+    ));
+    Ok(())
+}
+
+#[test]
+fn rerun_executes_the_saved_correction_once() -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    let db_path = project.path().join(".ldgr/ldgr.db");
+    let artifact_root = project.path().join(".ldgr/artifacts");
+    let receipt = project.path().join(".ldgr/last-rerun.json");
+    run(project.path(), &db_path, &artifact_root, ["init"])?;
+
+    command(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        [
+            "work",
+            "crate",
+            "rerun-created",
+            "--title",
+            "Rerun created",
+            "--description",
+            "Created from preserved parser intent.",
+            "--priority",
+            "high",
+        ],
+    )?
+    .assert()
+    .failure()
+    .stderr(predicate::str::contains(
+        "Use `ldgr rerun` to execute this command.",
+    ));
+    assert!(receipt.is_file());
+
+    command(project.path(), &db_path, &artifact_root, ["rerun"])?
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("rerunning: ldgr"))
+        .stdout(predicate::str::contains(
+            "created work item 1 rerun-created",
+        ));
+    assert!(!receipt.exists());
+
+    command(project.path(), &db_path, &artifact_root, ["rerun"])?
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no saved rerun command"));
+    Ok(())
+}
+
+#[test]
+fn destructive_corrections_are_displayed_but_not_saved_for_rerun() -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    let db_path = project.path().join(".ldgr/ldgr.db");
+    let artifact_root = project.path().join(".ldgr/artifacts");
+    run(project.path(), &db_path, &artifact_root, ["init"])?;
+
+    command(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        ["work", "delet", "anything"],
+    )?
+    .assert()
+    .failure()
+    .stderr(predicate::str::contains("Suggested rerun (not executed):"))
+    .stderr(predicate::str::contains(
+        "This correction is destructive and was not saved for `ldgr rerun`.",
+    ))
+    .stderr(predicate::str::contains("Use `ldgr rerun`").not());
+    assert!(!project.path().join(".ldgr/last-rerun.json").exists());
+
+    command(project.path(), &db_path, &artifact_root, ["wrk"])?
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "This correction is incomplete and was not saved for `ldgr rerun`.",
+        ))
+        .stderr(predicate::str::contains("Use `ldgr rerun`").not());
+    Ok(())
+}
+
+#[test]
+fn explicit_cli_syntax_variants_canonicalize_without_interaction() -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    let db_path = project.path().join(".ldgr/ldgr.db");
+    let artifact_root = project.path().join(".ldgr/artifacts");
+    run(project.path(), &db_path, &artifact_root, ["INIT"])?;
+    run(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        [
+            "WORK-ITEMS",
+            "CREATE",
+            "case-friendly",
+            "--title",
+            "Case friendly",
+            "--description",
+            "Canonicalized command tokens.",
+            "--priority",
+            "HIGH",
+            "--acceptance_criteria",
+            "Agent spelling variants are accepted.",
+        ],
+    )?;
+    run(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        ["RUNS", "START", "case-friendly"],
+    )?;
+    command(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        [
+            "VALIDATIONS",
+            "RECORD",
+            "case-friendly",
+            "--outcome",
+            "PASS",
+        ],
+    )?
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("outcome: pass"));
+    command(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        ["OBSERVATIONS", "LIST", "--limit", "0", "--json"],
+    )?
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("[]"));
     Ok(())
 }
 
@@ -4325,6 +4488,70 @@ fn structured_dependencies_gate_readiness_and_reject_cycles() -> anyhow::Result<
 }
 
 #[test]
+fn priority_accepts_agent_friendly_labels_and_orders_common_values() -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    let db_path = project.path().join(".ldgr/ldgr.db");
+    let artifact_root = project.path().join(".ldgr/artifacts");
+    run(project.path(), &db_path, &artifact_root, ["init"])?;
+
+    for (slug, priority) in [
+        ("low-item", "LOW"),
+        ("medium-item", "medium"),
+        ("high-item", "high"),
+        ("custom-item", "release-blocker"),
+    ] {
+        run(
+            project.path(),
+            &db_path,
+            &artifact_root,
+            [
+                "work",
+                "create",
+                slug,
+                "--title",
+                slug,
+                "--description",
+                "Agent-created work.",
+                "--priority",
+                priority,
+            ],
+        )?;
+    }
+
+    command(project.path(), &db_path, &artifact_root, ["next"])?
+        .assert()
+        .success()
+        .stdout(predicate::str::starts_with("high-item "));
+    command(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        ["work", "list", "--priority", "HIGH", "--json"],
+    )?
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("\"slug\": \"high-item\""))
+    .stdout(predicate::str::contains("\"priority\": \"high\""));
+
+    run(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        ["work", "edit", "custom-item", "--priority", "p7"],
+    )?;
+    command(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        ["work", "show", "custom-item", "--json"],
+    )?
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("\"priority\": \"P7\""));
+    Ok(())
+}
+
+#[test]
 fn schedule_import_export_round_trips_structured_queue() -> anyhow::Result<()> {
     let project = TempDir::new()?;
     let db_path = project.path().join(".ldgr/ldgr.db");
@@ -4336,9 +4563,9 @@ fn schedule_import_export_round_trips_structured_queue() -> anyhow::Result<()> {
         r#"{
   "format": "ldgr.schedule.v1",
   "work_items": [
-    {"slug":"base","title":"Base","description":"Base work","priority":"P0","program":"audit"},
-    {"slug":"follow","title":"Follow","description":"Follow-up","priority":"P1","program":"audit","group":"registry","acceptance_criteria":"Evidence recorded","dependencies":["base"]},
-    {"slug":"external","title":"External","description":"Await validation","status":"held","hold_kind":"external-validation","hold_reason":"Lab review"}
+    {"slug":"base","title":"Base","description":"Base work","status":"QUEUED","priority":"HIGH","program":" Audit "},
+    {"slug":"follow","title":"Follow","description":"Follow-up","priority":"medium","program":"audit","group":"registry","acceptance_criteria":"Evidence recorded","dependencies":[" base ",""]},
+    {"slug":"external","title":"External","description":"Await validation","status":"BLOCKED","hold_kind":"external_validation","hold_reason":"Lab review"}
   ]
 }"#,
     )?;
@@ -4368,6 +4595,8 @@ fn schedule_import_export_round_trips_structured_queue() -> anyhow::Result<()> {
     assert_eq!(backup["work_items"].as_array().unwrap().len(), 3);
     assert_eq!(backup["work_items"][1]["dependencies"][0], "base");
     assert_eq!(backup["work_items"][2]["hold_kind"], "external-validation");
+    assert_eq!(backup["work_items"][0]["priority"], "high");
+    assert_eq!(backup["work_items"][1]["priority"], "medium");
     Ok(())
 }
 

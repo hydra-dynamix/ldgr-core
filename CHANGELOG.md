@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Add one-shot `ldgr rerun` recovery for complete, non-destructive parser corrections, backed by a project-local restricted receipt.
+
+### Changed
+
+- Accept arbitrary non-empty priority labels, with stable ordering for common named priorities and continued canonical `P<number>` support.
+- Canonicalize harmless command, option, enum, schedule, label, and dependency syntax variants for non-interactive agent use.
+- Preserve complete parser intent in corrected command output while keeping fuzzy and destructive corrections from executing silently.
+
 ## [0.1.12] - 2026-07-16
 
 ### Added

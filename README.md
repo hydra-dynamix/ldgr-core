@@ -84,12 +84,18 @@ recommended closure path for active runs because it records the terminal run
 status and work decision together.
 
 Use `ldgr --help` or `ldgr <command> --help` to explore the command surface.
+CLI inputs are normalized conservatively for agent use; see
+[`docs/cli-input-and-error-policy.md`](docs/cli-input-and-error-policy.md).
+When a non-destructive parse error has one plausible correction, LDGR prints
+the corrected invocation and saves it for a one-shot `ldgr rerun`.
 
 ## Structured queues and portable schedules
 
 Work items can carry priority, program, group, acceptance criteria, and enforced
 dependencies. Dependencies form an acyclic graph: an item is not ready and
-cannot be started until every prerequisite is done.
+cannot be started until every prerequisite is done. Priority is a non-empty
+label: `P0`, `P1`, and similar values retain numeric ordering, while common
+labels such as `critical`, `high`, `medium`, and `low` are also ordered.
 
 ```sh
 ldgr work create registry --title "Registry" --description "Build it." \
