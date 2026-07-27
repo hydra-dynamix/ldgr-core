@@ -205,4 +205,5 @@ pub(crate) fn print_context(context: &StoreContext) {
             println!("  payload: {}", event.payload_json);
         }
     }
+    println!("workflow: ldgr workflow to understand this project's workflow");
 }

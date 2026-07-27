@@ -6,8 +6,8 @@ use serde::Serialize;
 use crate::store::{
     last_completed_work_item, list_decisions, list_observations_for_work,
     list_validation_records_for_work, list_work_item_views_filtered, list_work_items_filtered,
-    next_ready_work_item, work_readiness, DecisionSummary, ObservationSummary, StoreContext,
-    ValidationSummary, WorkItem, WorkItemStatus, WorkItemView,
+    next_ready_work_item, normalize_priority, work_readiness, DecisionSummary, ObservationSummary,
+    StoreContext, ValidationSummary, WorkItem, WorkItemStatus, WorkItemView,
 };
 
 use super::brief_context::{
@@ -38,6 +38,7 @@ pub(crate) struct StatusSummary {
     pub queue: Option<Vec<WorkItemView>>,
     pub brief_context_command: String,
     pub full_context_command: String,
+    pub workflow_command: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub global_history: Option<StatusGlobalHistory>,
 }
@@ -90,6 +91,8 @@ pub(crate) fn build_status_summary(
     width: usize,
     full: bool,
 ) -> anyhow::Result<StatusSummary> {
+    let normalized_program = program.map(|value| value.trim().to_ascii_lowercase());
+    let normalized_priority = normalize_priority(priority)?;
     let work_items = list_work_items_filtered(connection, None, program, priority)?;
     let counts = work_counts(&work_items);
     let ready_item = next_ready_work_item(connection, program, priority)?;
@@ -188,8 +191,8 @@ pub(crate) fn build_status_summary(
     Ok(StatusSummary {
         state,
         filters: StatusFilters {
-            program: program.map(str::to_owned),
-            priority: priority.map(|value| value.to_ascii_uppercase()),
+            program: normalized_program,
+            priority: normalized_priority,
         },
         work_items: counts,
         next,
@@ -213,6 +216,7 @@ pub(crate) fn build_status_summary(
         queue,
         brief_context_command: brief.brief_context_command.clone(),
         full_context_command: brief.full_context_command.clone(),
+        workflow_command: brief.workflow_command.clone(),
         global_history,
     })
 }
@@ -596,4 +600,8 @@ fn print_operational_handoff(summary: &StatusSummary) {
     }
     println!("brief_context: {}", summary.brief_context_command);
     println!("full_context: {}", summary.full_context_command);
+    println!(
+        "workflow: {} to understand this project's workflow",
+        summary.workflow_command
+    );
 }

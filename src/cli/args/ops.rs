@@ -7,12 +7,15 @@ pub enum HarnessKind {
     Pi,
     Codex,
     Claude,
+    #[value(alias = "open-claw", alias = "open_claw")]
     Openclaw,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum TelemetryInstallChoice {
+    #[value(alias = "enabled", alias = "on")]
     Enable,
+    #[value(alias = "disabled", alias = "off")]
     Disable,
 }
 
@@ -25,7 +28,7 @@ pub struct InstallArgs {
     pub command: Option<InstallCommand>,
 
     /// Harness to install LDGR integration into. Repeatable.
-    #[arg(long, value_enum)]
+    #[arg(long, value_enum, ignore_case = true)]
     pub harness: Vec<HarnessKind>,
 
     /// Accept defaults and do not prompt. Defaults to Pi when --harness is omitted.
@@ -33,12 +36,16 @@ pub struct InstallArgs {
     pub yes: bool,
 
     /// Explicitly enable or disable numerical state-sequence collection.
-    #[arg(long, value_enum)]
+    #[arg(long, value_enum, ignore_case = true)]
     pub telemetry: Option<TelemetryInstallChoice>,
 
     /// Do not install agentctl even if it is missing from PATH.
     #[arg(long)]
     pub no_agentctl: bool,
+
+    /// How deep a requirements interview the agent should run: high, medium, low, or none.
+    #[arg(long, value_name = "LEVEL")]
+    pub interview_depth: Option<String>,
 
     /// Adapter bundle to install after harness setup. Repeatable.
     #[arg(long)]
@@ -115,7 +122,7 @@ pub struct StatusArgs {
     #[arg(long)]
     pub program: Option<String>,
 
-    /// Limit queue and next-item selection to one priority (for example P0).
+    /// Limit queue and next-item selection to one priority label (for example P0 or high).
     #[arg(long)]
     pub priority: Option<String>,
 
@@ -153,6 +160,46 @@ pub struct SchemaDoctorArgs {
 pub struct MigrateArgs {
     #[arg(long)]
     pub json: bool,
+}
+
+#[derive(Debug, Args)]
+#[command(
+    after_help = "Examples:\n  ldgr workflow\n  ldgr workflow --json\n\nPrints the workflow this project expects an agent to follow. Installed adapters expose their own workflow through `ldgr <adapter> workflow`."
+)]
+pub struct WorkflowArgs {
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+#[command(
+    after_help = "Examples:\n  ldgr config show\n  ldgr config set interview-depth low\n\nReads and writes ~/.ldgr/config.json. Unknown keys in that file are preserved."
+)]
+pub struct ConfigArgs {
+    #[command(subcommand)]
+    pub command: ConfigCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ConfigCommand {
+    /// Print the resolved LDGR configuration.
+    Show(ConfigShowArgs),
+    /// Set one configuration value.
+    Set(ConfigSetArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ConfigShowArgs {
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ConfigSetArgs {
+    /// Configuration key. Currently: interview-depth.
+    pub key: String,
+    /// Value to set.
+    pub value: String,
 }
 
 #[derive(Debug, Args)]
@@ -212,7 +259,7 @@ pub struct LoopRunArgs {
     pub prompt_role: Option<String>,
 
     /// Built-in agent preset. Values: agentctl. Use --agent-argv for custom commands.
-    #[arg(long, value_enum)]
+    #[arg(long, value_enum, ignore_case = true)]
     pub agent: Option<CliLoopAgent>,
 
     /// Agent command argv as JSON array. The rendered prompt is written to stdin.
@@ -224,7 +271,7 @@ pub struct LoopRunArgs {
     pub audit_argv: Option<String>,
 
     /// Built-in post-run summarizer preset. Values: agentctl. Runs once after each completed worker cycle.
-    #[arg(long, value_enum)]
+    #[arg(long, value_enum, ignore_case = true)]
     pub summary_agent: Option<CliLoopAgent>,
 
     /// Post-run summarizer command argv as JSON array. The summary prompt is written to stdin.
@@ -262,5 +309,6 @@ pub struct LoopRunArgs {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum CliLoopAgent {
+    #[value(alias = "agent-ctl", alias = "agent_ctl")]
     Agentctl,
 }

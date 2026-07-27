@@ -19,12 +19,67 @@ pub fn parse_harness_config(text: &str) -> anyhow::Result<HarnessConfig> {
     Ok(config)
 }
 
+/// How much the agent interrogates the operator before writing a spec.
+///
+/// Requirements elicitation is the one part of the core workflow that depends
+/// on operator preference rather than project state, so it is configuration
+/// rather than something the agent should infer per session.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum InterviewDepth {
+    /// Full interview, one question at a time, transcript stored as an artifact.
+    High,
+    /// Up to ten questions, answers stored as an artifact.
+    #[default]
+    Medium,
+    /// The five most important questions, answers stored as observations.
+    Low,
+    /// Ask nothing; infer requirements and record the assumptions made.
+    None,
+}
+
+impl InterviewDepth {
+    pub const VALUES: [Self; 4] = [Self::High, Self::Medium, Self::Low, Self::None];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::High => "high",
+            Self::Medium => "medium",
+            Self::Low => "low",
+            Self::None => "none",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "high" => Some(Self::High),
+            "medium" => Some(Self::Medium),
+            "low" => Some(Self::Low),
+            "none" => Some(Self::None),
+            _ => None,
+        }
+    }
+
+    /// One-line description used by the installer prompt and `ldgr workflow`.
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::High => "full interview, one question at a time, recorded as an artifact",
+            Self::Medium => "up to ten questions, answers recorded as an artifact",
+            Self::Low => "five key questions, answers recorded as observations",
+            Self::None => "ask nothing; infer requirements and record the assumptions",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct HarnessConfig {
     #[serde(default = "default_schema_version")]
     pub schema_version: u32,
     #[serde(default)]
     pub default_harness: Option<String>,
+    /// How deep a requirements interview the agent should conduct.
+    #[serde(default)]
+    pub interview_depth: InterviewDepth,
     #[serde(default)]
     pub selected_harnesses: Vec<String>,
     #[serde(default)]

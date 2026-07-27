@@ -28,6 +28,7 @@ pub(crate) struct BriefContext {
     pub next_commands: Vec<String>,
     pub brief_context_command: String,
     pub full_context_command: String,
+    pub workflow_command: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -211,6 +212,7 @@ pub(crate) fn brief_context(context: &StoreContext, options: BriefContextOptions
         next_commands: next_commands_with_registry(context, &handoff, &registry),
         brief_context_command: "ldgr status".to_owned(),
         full_context_command: "ldgr context".to_owned(),
+        workflow_command: "ldgr workflow".to_owned(),
     }
 }
 
@@ -248,6 +250,10 @@ pub(crate) fn print_brief_context(context: &BriefContext) {
     print_next_commands(&context.next_commands);
     println!("brief_context: {}", context.brief_context_command);
     println!("full_context: {}", context.full_context_command);
+    println!(
+        "workflow: {} to understand this project's workflow",
+        context.workflow_command
+    );
 }
 
 fn brief_handoff(context: &StoreContext) -> BriefHandoff {
