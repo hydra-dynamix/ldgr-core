@@ -15,12 +15,14 @@ if (-not [Environment]::Is64BitOperatingSystem) {
 }
 
 if (-not $Version) {
-    $releases = @(Invoke-RestMethod `
-        -Uri "https://api.github.com/repos/$Repository/releases" `
+    # Windows PowerShell 5.1 can preserve a multi-item REST response as one
+    # nested object, so ask GitHub for exactly one release.
+    $release = Invoke-RestMethod `
+        -Uri "https://api.github.com/repos/$Repository/releases?per_page=1" `
         -Headers @{ Accept = "application/vnd.github+json" }
-    )
-    if ($releases.Count -gt 0) {
-        $Version = $releases[0].tag_name -replace "^v", ""
+    $tagName = @($release.tag_name)[0]
+    if ($tagName) {
+        $Version = $tagName -replace "^v", ""
     }
 }
 

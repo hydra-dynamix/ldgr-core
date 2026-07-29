@@ -27,6 +27,12 @@ See `docs/ldgr-loop-philosophy.html` for the longer explanation of the loop.
 curl -fsSL https://raw.githubusercontent.com/hydra-dynamix/ldgr-core/main/scripts/install.sh | sh
 ```
 
+On native Windows, run this from PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/hydra-dynamix/ldgr-core/main/scripts/install.ps1 | iex
+```
+
 The installer detects the current OS/CPU, downloads the matching release archive,
 verifies its SHA-256 checksum when checksum tooling is available, and installs
 `ldgr` to `~/.local/bin` by default. Override with:
