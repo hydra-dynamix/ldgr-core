@@ -534,9 +534,9 @@ impl PreparedProcessTree {
     fn new() -> anyhow::Result<Self> {
         #[cfg(windows)]
         {
-            return Ok(Self {
+            Ok(Self {
                 job: WindowsJob::new()?,
-            });
+            })
         }
         #[cfg(not(windows))]
         {
@@ -548,7 +548,7 @@ impl PreparedProcessTree {
         #[cfg(windows)]
         {
             self.job.assign(child)?;
-            return Ok(ProcessTree { job: self.job });
+            Ok(ProcessTree { job: self.job })
         }
         #[cfg(not(windows))]
         {

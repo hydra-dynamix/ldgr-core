@@ -89,9 +89,16 @@ jobs:
       RELEASE_NAME: ldgr-core
       AGENTCTL_VERSION: 0.1.2
       AGENTCTL_REPOSITORY: hydra-dynamix/agentctl
-      GH_TOKEN: ${{ github.token }}
+      AGENTCTL_REF: aa5c007fd2335ad507f1f24e3460d8f531f863f3
     steps:
       - uses: actions/checkout@v4
+
+      - name: Checkout paired agentctl source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.AGENTCTL_REPOSITORY }}
+          ref: ${{ env.AGENTCTL_REF }}
+          path: agentctl-source
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -107,18 +114,16 @@ jobs:
         run: "target/release/${BINARY}${{ matrix.binary_ext }} --version"
         shell: bash
 
-      - name: Download paired agentctl release
+      - name: Build paired agentctl dependency
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p agentctl-dist
-          gh release download "v${AGENTCTL_VERSION}" \
-            --repo "${AGENTCTL_REPOSITORY}" \
-            --pattern "agentctl-${AGENTCTL_VERSION}-${{ matrix.platform }}.tar.gz" \
-            --dir agentctl-dist
-          tar -xzf "agentctl-dist/agentctl-${AGENTCTL_VERSION}-${{ matrix.platform }}.tar.gz" \
-            -C agentctl-dist
-          "agentctl-dist/agentctl-${AGENTCTL_VERSION}/${{ matrix.platform }}/agentctl${{ matrix.binary_ext }}" --version
+          test "$(git -C agentctl-source rev-parse HEAD)" = "$AGENTCTL_REF"
+          cargo build --locked --release \
+            --manifest-path agentctl-source/Cargo.toml \
+            --target-dir target/release-agentctl
+          agentctl_binary="target/release-agentctl/release/agentctl${{ matrix.binary_ext }}"
+          test "$("$agentctl_binary" --version)" = "agentctl ${AGENTCTL_VERSION}"
 
       - name: Package archive
         shell: bash
@@ -132,8 +137,7 @@ jobs:
           archive="dist/${RELEASE_NAME}-${version}-${platform}.tar.gz"
           mkdir -p "$staging"
           cp "target/release/${binary_file}" "$staging/${binary_file}"
-          cp "agentctl-dist/agentctl-${AGENTCTL_VERSION}/${platform}/${agentctl_file}" \
-            "$staging/${agentctl_file}"
+          cp "target/release-agentctl/release/${agentctl_file}" "$staging/${agentctl_file}"
           chmod +x "$staging/${binary_file}" || true
           chmod +x "$staging/${agentctl_file}" || true
           cp README.md LICENSE "dist/${RELEASE_NAME}-${version}/"
@@ -145,6 +149,8 @@ jobs:
             "binary": "${BINARY}",
             "version": "${version}",
             "agentctl_version": "${AGENTCTL_VERSION}",
+            "agentctl_repository": "${AGENTCTL_REPOSITORY}",
+            "agentctl_commit": "$(git -C agentctl-source rev-parse HEAD)",
             "launcher_compatibility_schema": "ldgr.launcher-compatibility.v1",
             "error_recovery_schema": 1,
             "platform": "${platform}",
