@@ -18,6 +18,7 @@ use crate::store::{
     LoopInterventionAction, RunStatus,
 };
 use crate::tool_runner::render_command;
+use crate::recovery::ExecutionAttempt;
 use serde::Serialize;
 
 const LOOP_PROCESS_OUTPUT_PREVIEW_BYTES: usize = 64 * 1024;
@@ -36,6 +37,7 @@ pub struct LoopRuntimeOptions {
     pub dry_run: bool,
     pub stream_agent_output: bool,
     pub agent_timeout: Duration,
+    pub attempt: ExecutionAttempt,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,4 +88,3 @@ pub enum LoopRuntimeOutcome {
     BlockedByIncompleteCycle { work_slug: String },
     NoPendingWork,
 }
-

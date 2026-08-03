@@ -18,6 +18,12 @@ pub enum BufferedTransition {
     Dropped,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum QueuedTerminalSequence {
+    Queued,
+    Dropped,
+}
+
 /// A privacy-bounded sequence for one local unit of work.
 ///
 /// Incomplete states exist only in memory. The buffer writes one unlabelled
@@ -91,6 +97,21 @@ fn collection_is_eligible(ldgr_home: &Path) -> bool {
     load_telemetry_consent(ldgr_home)
         .map(|consent| consent.collection_enabled())
         .unwrap_or(false)
+}
+
+pub(crate) fn queue_committed_terminal_sequence(
+    ldgr_home: impl Into<PathBuf>,
+    protocol: &NumericalProtocol,
+    states: &[StateCode],
+) -> anyhow::Result<QueuedTerminalSequence> {
+    let ldgr_home = ldgr_home.into();
+    if !collection_is_eligible(&ldgr_home) {
+        return Ok(QueuedTerminalSequence::Dropped);
+    }
+    match queue_terminal_sequence(&ldgr_home, protocol, states) {
+        Ok(()) => Ok(QueuedTerminalSequence::Queued),
+        Err(_) => Ok(QueuedTerminalSequence::Dropped),
+    }
 }
 
 fn queue_terminal_sequence(
@@ -178,7 +199,8 @@ fn sync_directory(_path: &Path) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use crate::telemetry::transition::{
-        COMPLETED_NEGATIVE, COMPLETED_POSITIVE, CORE_WORK_V1, RUNNING,
+        CANCELLED, COMPLETED_INCONCLUSIVE, COMPLETED_NEGATIVE, COMPLETED_POSITIVE, CORE_WORK_V1,
+        OPERATIONAL_FAILURE, PENDING, RUNNING,
     };
     use crate::telemetry::{
         save_telemetry_consent, telemetry_environment_lock, TelemetryConsent,
@@ -194,7 +216,11 @@ mod tests {
     }
 
     fn pending_files(home: &Path) -> anyhow::Result<Vec<PathBuf>> {
-        let route = home.join(TELEMETRY_PENDING_DIRECTORY).join("core-work/v1");
+        pending_files_for(home, "core-work/v1")
+    }
+
+    fn pending_files_for(home: &Path, route: &str) -> anyhow::Result<Vec<PathBuf>> {
+        let route = home.join(TELEMETRY_PENDING_DIRECTORY).join(route);
         if !route.exists() {
             return Ok(Vec::new());
         }
@@ -202,6 +228,25 @@ mod tests {
             .map(|entry| entry.map(|entry| entry.path()))
             .collect::<Result<Vec<_>, _>>()?)
     }
+
+    const ADAPTER_STATES: &[StateCode] = &[
+        PENDING,
+        RUNNING,
+        COMPLETED_POSITIVE,
+        COMPLETED_NEGATIVE,
+        COMPLETED_INCONCLUSIVE,
+        OPERATIONAL_FAILURE,
+        CANCELLED,
+    ];
+    const ADAPTER_TRANSITIONS: &[(StateCode, StateCode)] =
+        &[(PENDING, RUNNING), (RUNNING, COMPLETED_POSITIVE)];
+    const ADAPTER_V1: NumericalProtocol = NumericalProtocol::new(
+        "/sequences/example-adapter-work/v1",
+        PENDING,
+        ADAPTER_STATES,
+        ADAPTER_TRANSITIONS,
+        8,
+    );
 
     #[test]
     fn undecided_and_disabled_consent_create_no_buffer_or_files() -> anyhow::Result<()> {
@@ -213,6 +258,41 @@ mod tests {
         )?;
         assert!(LocalSequenceBuffer::begin_after_commit(home.path(), &CORE_WORK_V1)?.is_none());
         assert!(!home.path().join(TELEMETRY_PENDING_DIRECTORY).exists());
+        Ok(())
+    }
+
+    #[test]
+    fn adapter_protocol_queueing_inherits_core_consent() -> anyhow::Result<()> {
+        let _guard = telemetry_environment_lock()
+            .lock()
+            .expect("environment lock poisoned");
+        let home = tempfile::tempdir()?;
+        let adapter_path = [PENDING, RUNNING, COMPLETED_POSITIVE];
+
+        assert_eq!(
+            queue_committed_terminal_sequence(home.path(), &ADAPTER_V1, &adapter_path)?,
+            QueuedTerminalSequence::Dropped
+        );
+        assert!(pending_files_for(home.path(), "example-adapter-work/v1")?.is_empty());
+
+        save_telemetry_consent(
+            home.path(),
+            &TelemetryConsent::current(TelemetryConsentDecision::Disabled),
+        )?;
+        assert_eq!(
+            queue_committed_terminal_sequence(home.path(), &ADAPTER_V1, &adapter_path)?,
+            QueuedTerminalSequence::Dropped
+        );
+        assert!(pending_files_for(home.path(), "example-adapter-work/v1")?.is_empty());
+
+        enable(home.path())?;
+        assert_eq!(
+            queue_committed_terminal_sequence(home.path(), &ADAPTER_V1, &adapter_path)?,
+            QueuedTerminalSequence::Queued
+        );
+        let files = pending_files_for(home.path(), "example-adapter-work/v1")?;
+        assert_eq!(files.len(), 1);
+        assert_eq!(fs::read(&files[0])?, b"[0,1,3]");
         Ok(())
     }
 

@@ -163,6 +163,44 @@ pub const CORE_WORK_V1: NumericalProtocol = NumericalProtocol::new(
     256,
 );
 
+const RESEARCH_WORKFLOW_STATES: &[StateCode] = &[
+    PENDING,
+    RUNNING,
+    COMPLETED_POSITIVE,
+    COMPLETED_NEGATIVE,
+    COMPLETED_INCONCLUSIVE,
+    OPERATIONAL_FAILURE,
+    CANCELLED,
+];
+
+const RESEARCH_WORKFLOW_TRANSITIONS: &[(StateCode, StateCode)] = &[
+    (PENDING, RUNNING),
+    (PENDING, OPERATIONAL_FAILURE),
+    (PENDING, CANCELLED),
+    (RUNNING, COMPLETED_POSITIVE),
+    (RUNNING, COMPLETED_NEGATIVE),
+    (RUNNING, COMPLETED_INCONCLUSIVE),
+    (RUNNING, OPERATIONAL_FAILURE),
+    (RUNNING, CANCELLED),
+];
+
+/// Released Research adapter numerical experiment workflow protocol.
+///
+/// Adapters still own their local emission point and must pass the Core adapter
+/// conformance harness. Core keeps this released declaration so product-level
+/// preview, transmission, and collector validation can verify Research payloads
+/// before upload.
+pub const RESEARCH_WORKFLOW_V1: NumericalProtocol = NumericalProtocol::new(
+    "/sequences/research-workflow/v1",
+    PENDING,
+    RESEARCH_WORKFLOW_STATES,
+    RESEARCH_WORKFLOW_TRANSITIONS,
+    32,
+);
+
+pub const RELEASED_NUMERICAL_PROTOCOLS_V1: &[&NumericalProtocol] =
+    &[&CORE_WORK_V1, &RESEARCH_WORKFLOW_V1];
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TransitionAcceptance {
     Intermediate,

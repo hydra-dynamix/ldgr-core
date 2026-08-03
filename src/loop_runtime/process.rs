@@ -1,6 +1,7 @@
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessCapture {
     pub exit_code: Option<i32>,
+    pub signal: Option<i32>,
     pub duration_ms: u128,
     pub stdout: String,
     pub stderr: String,
@@ -23,6 +24,7 @@ impl ProcessCapture {
             stdout_bytes: stdout.len().try_into().unwrap_or(u64::MAX),
             stderr_bytes: stderr.len().try_into().unwrap_or(u64::MAX),
             exit_code,
+            signal: None,
             duration_ms,
             stdout,
             stderr,
@@ -74,7 +76,7 @@ fn enrich_agentctl_failure_output(mut capture: ProcessCapture) -> ProcessCapture
         return capture;
     }
     let task = std::env::var("LDGR_AGENTCTL_TASK").unwrap_or_else(|_| "ldgr-loop".to_owned());
-    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+    let Some(home) = process_home_dir() else {
         return capture;
     };
     let Some(log_path) = latest_agentctl_log_path(&home, &task) else {
@@ -91,6 +93,34 @@ fn enrich_agentctl_failure_output(mut capture: ProcessCapture) -> ProcessCapture
     ));
     capture.stderr_bytes = capture.stderr.len().try_into().unwrap_or(u64::MAX);
     capture
+}
+
+fn process_home_dir() -> Option<PathBuf> {
+    nonempty_environment_value("HOME")
+        .or_else(|| {
+            #[cfg(windows)]
+            {
+                nonempty_environment_value("USERPROFILE")
+            }
+            #[cfg(not(windows))]
+            {
+                None
+            }
+        })
+        .map(PathBuf::from)
+}
+
+fn nonempty_environment_value(name: &str) -> Option<std::ffi::OsString> {
+    std::env::var_os(name).filter(|value| !value.is_empty())
+}
+
+pub(crate) fn configure_child_home(command: &mut Command) {
+    #[cfg(windows)]
+    if nonempty_environment_value("HOME").is_none() {
+        if let Some(profile) = nonempty_environment_value("USERPROFILE") {
+            command.env("HOME", profile);
+        }
+    }
 }
 
 fn latest_agentctl_log_path(home: &Path, task: &str) -> Option<PathBuf> {
@@ -348,6 +378,7 @@ fn run_process_with_stdin_timeouts(
         .stdin(Stdio::from(stdin_file))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    configure_child_home(&mut command);
     configure_process_group(&mut command);
     let mut child = command
         .spawn()
@@ -360,6 +391,7 @@ fn run_process_with_stdin_timeouts(
             return Err(error);
         }
     };
+    crate::fault_injection::crash_if("loop-after-spawn");
     let stdout = child.stdout.take().context("failed to open child stdout")?;
     let stderr = child.stderr.take().context("failed to open child stderr")?;
     let stdout_reader = read_process_stream(
@@ -374,6 +406,7 @@ fn run_process_with_stdin_timeouts(
         "stderr",
         output_paths.stderr.clone(),
     );
+    crate::fault_injection::crash_if("loop-mid-command");
     let status_result =
         wait_child_with_timeout(&mut child, &process_tree, process_timeout, &command_text);
     let (stdout, stderr) = collect_process_streams(
@@ -396,6 +429,7 @@ fn run_process_with_stdin_timeouts(
     };
     Ok(ProcessCapture {
         exit_code: status.code(),
+        signal: exit_signal(&status),
         duration_ms: started.elapsed().as_millis(),
         stdout: String::from_utf8_lossy(&stdout.preview).into_owned(),
         stderr: String::from_utf8_lossy(&stderr.preview).into_owned(),
@@ -406,6 +440,19 @@ fn run_process_with_stdin_timeouts(
         stdout_artifact_path: Some(stdout.artifact_path),
         stderr_artifact_path: Some(stderr.artifact_path),
     })
+}
+
+fn exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        status.signal()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = status;
+        None
+    }
 }
 
 fn collect_process_streams(
@@ -689,4 +736,3 @@ fn signal_process_group(child_id: u32, signal: TerminationSignal) {
 
 #[cfg(all(not(unix), not(windows)))]
 fn signal_process_group(_child_id: u32, _signal: TerminationSignal) {}
-

@@ -13,11 +13,11 @@ pub struct AdapterArgs {
 pub enum AdapterCommand {
     /// Install an adapter or list adapters available to install.
     Install(AdapterInstallArgs),
-    /// Check for or install the latest compatible adapter release.
+    /// Check/update a signed release, or check/reinstall a tracked local source adapter.
     Update(AdapterUpdateArgs),
     /// Remove an installed adapter and its receipt-owned files.
     Uninstall(AdapterUninstallArgs),
-    /// Reconcile installed adapter resources with current harness selections.
+    /// Reconcile receipt-owned adapter resources with current harness selections.
     Reconcile(AdapterReconcileArgs),
     /// List installed adapters.
     List(ListAdapterArgs),
@@ -46,11 +46,11 @@ pub struct AdapterUninstallArgs {
 pub struct AdapterUpdateArgs {
     pub name: String,
 
-    /// Report update availability without changing the installation.
+    /// Report release availability or local source drift without changing the installation.
     #[arg(long)]
     pub check: bool,
 
-    /// Allow prerelease versions during resolution.
+    /// Allow prerelease versions during signed-release resolution.
     #[arg(long)]
     pub prerelease: bool,
 }
@@ -60,7 +60,7 @@ pub struct AdapterInstallArgs {
     /// Adapter slug to install, `list` to show available adapters, or omit for the selection menu.
     pub name: Option<String>,
 
-    /// Source checkout root containing adapter crates. Optional override for local source installs.
+    /// Monorepo root containing the adapter crate, or the adapter crate root itself.
     #[arg(long)]
     pub source_root: Option<std::path::PathBuf>,
 

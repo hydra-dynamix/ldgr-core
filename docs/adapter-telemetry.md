@@ -12,7 +12,10 @@ An adapter publishes a fixed `NumericalProtocol` containing only:
 - its sequence-length bound.
 
 The request body never contains the endpoint. It selects the state machine
-locally and Core later sends only the validated bare integer array.
+locally and Core later sends only the validated bare integer array. Product
+preview and transmission currently process the released `core-work/v1` and
+`research-workflow/v1` protocols; a new adapter protocol must be registered in
+Core and the collector before it is eligible for upload.
 
 Start `CommittedSequence` only after the initial state commits to the adapter's
 local ledger. Call `submit_committed` only after each corresponding state change
@@ -41,7 +44,25 @@ counterexample. It must use `4`, never operational-failure (`6`).
 Adapters must not read the Core consent file, open a telemetry connection,
 serialize an upload, add payload fields or headers, or make normal operation
 conditional on collection. Core may discard any submitted transition when
-consent is absent, the kill switch is active, or validation fails.
+consent is absent, the kill switch is active, or validation fails. Users inspect
+and control all pending adapter payloads through `ldgr telemetry status`,
+`ldgr telemetry preview`, `ldgr telemetry transmit`, `ldgr telemetry enable`,
+and `ldgr telemetry disable`.
+
+Do not promise per-user or per-install deletion of accepted collector records.
+Already-ingested sequences cannot be individually located for deletion because
+the collector intentionally stores no user, installation, request, timestamp, or
+join identifier with the bare numerical array. Disabling telemetry prevents
+future collection and removes unsent local adapter payloads only.
+
+Adapter crates that publish a numerical protocol should add a unit test with
+`ldgr::telemetry::adapter_conformance::verify_adapter_telemetry_conformance`.
+The fixture takes the adapter's `NumericalProtocol` plus one committed state
+path for each normalized terminal. It exercises Core transition submission,
+checks that completed-negative remains terminal code `4`, and verifies that Core
+serialization accepts only a bare integer array while rejecting adapter envelopes,
+routing fields, and string labels. The fixture exposes no URL, header, request,
+or transport hook, so passing tests stay inside Core-owned telemetry plumbing.
 
 Minimal Core-work example:
 

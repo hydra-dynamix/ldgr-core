@@ -9,12 +9,20 @@ use dialoguer::{theme::ColorfulTheme, Confirm, MultiSelect, Select};
 
 use crate::adapter_registry::AdapterRegistry;
 use crate::loop_runtime::{
-    run_loop_once, LoopAgent, LoopPromptSource, LoopRuntimeOptions, LoopRuntimeOutcome,
-    LoopRuntimeResult,
+    configure_child_home, run_loop_once, LoopAgent, LoopPromptSource, LoopRuntimeOptions,
+    LoopRuntimeOutcome, LoopRuntimeResult,
+};
+use crate::recovery::{
+    print_startup_recovery_report, project_root_for_db, reconcile_startup, ExecutionAttempt,
+    FailureKind,
 };
 use crate::store::{
     doctor_schema, init_store_with_migration_info, open_store_with_migration_info, read_context,
     MigrationBackupInfo,
+};
+use crate::telemetry::transition::RELEASED_NUMERICAL_PROTOCOLS_V1;
+use crate::telemetry::transmission::{
+    preview_pending_sequences, TransmissionClient, TransmissionReport,
 };
 use crate::telemetry::{
     clear_unsent_telemetry, load_telemetry_consent, save_telemetry_consent,
@@ -25,11 +33,11 @@ use crate::tool_runner::parse_argv_json;
 use crate::web::{generate_control_token, serve, WebOptions};
 
 use super::super::args::{
-    AdapterReconcileArgs, AdapterUninstallArgs, AdapterUpdateArgs, CliLoopAgent, ContextArgs,
-    HarnessKind, InstallAdapterArgs, InstallArgs, InstallCommand, LoopArgs, LoopCommand,
-    ConfigArgs, ConfigCommand, LoopRunArgs, MigrateArgs, SchemaArgs, SchemaCommand, StatusArgs,
-    TelemetryArgs, WorkflowArgs,
-    TelemetryCommand, TelemetryInstallChoice, WebArgs,
+    AdapterReconcileArgs, AdapterUninstallArgs, AdapterUpdateArgs, CliLoopAgent, ConfigArgs,
+    ConfigCommand, ContextArgs, HarnessKind, InstallAdapterArgs, InstallArgs, InstallCommand,
+    LoopArgs, LoopCommand, LoopRunArgs, MigrateArgs, SchemaArgs, SchemaCommand, StatusArgs,
+    TelemetryArgs, TelemetryCommand, TelemetryInstallChoice, TelemetryTransmitArgs, WebArgs,
+    WorkflowArgs,
 };
 use super::super::render::brief_context::{
     brief_context, print_brief_context, BriefContextOptions,
@@ -39,13 +47,60 @@ use super::super::render::emit;
 use super::super::render::status::{build_status_summary, print_status_summary};
 use super::super::render::text::print_loop_result;
 use super::super::{CLI_DEFAULT_HELP_SECTIONS, INIT_PROJECT_SETUP_PROMPT};
-use crate::harness_config::InterviewDepth;
+use crate::harness_config::{HarnessConfig, InterviewDepth};
 
 const LDGR_CORE_LOOP_PROMPT: &str = include_str!("../../../prompts/loop-prompt.md");
 const LDGR_CORE_LOOP_PROMPT_FILE: &str = "ldgr-core-loop.md";
 const LDGR_RELEASE_KEYRING: &str = include_str!("../../../release-keyring.json");
 const LDGR_RELEASE_KEYRING_FILE: &str = "release-keyring.json";
 const AGENTCTL_REPO: &str = "https://github.com/hydra-dynamix/agentctl";
+const AGENTCTL_VERSION: &str = "0.1.2";
+const AGENTCTL_REQUIREMENT: &str = ">=0.1.2, <0.2.0";
+const LAUNCHER_COMPATIBILITY_SCHEMA: &str = "ldgr.launcher-compatibility.v1";
+const ERROR_RECOVERY_SCHEMA_VERSION: u32 = 1;
+const CORE_OPERATOR_ERROR_GUIDE: &str = include_str!("../../../guidance/operator-errors.md");
+const CORE_AGENT_ERROR_GUIDE: &str = include_str!("../../../guidance/agent-errors.md");
+
+pub fn handle_compatibility(agentctl_version: &str, json_output: bool) -> anyhow::Result<()> {
+    let version = semver::Version::parse(agentctl_version)
+        .context("--agentctl-version must be a semantic version")?;
+    let requirement =
+        semver::VersionReq::parse(AGENTCTL_REQUIREMENT).expect("valid agentctl requirement");
+    let compatible = requirement.matches(&version);
+    let executable =
+        std::env::current_exe().context("failed to resolve current ldgr executable")?;
+    let report = serde_json::json!({
+        "schema": LAUNCHER_COMPATIBILITY_SCHEMA,
+        "compatible": compatible,
+        "core_version": env!("CARGO_PKG_VERSION"),
+        "core_executable": executable,
+        "agentctl_version": agentctl_version,
+        "agentctl_requirement": AGENTCTL_REQUIREMENT,
+        "error_recovery_schema": ERROR_RECOVERY_SCHEMA_VERSION,
+    });
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!(
+            "LDGR Core {} is {} with agentctl {} (required {}).",
+            env!("CARGO_PKG_VERSION"),
+            if compatible {
+                "compatible"
+            } else {
+                "incompatible"
+            },
+            agentctl_version,
+            AGENTCTL_REQUIREMENT
+        );
+    }
+    if !compatible {
+        bail!(
+            "agentctl {agentctl_version} is incompatible with LDGR Core {}; install the paired release bundle or use agentctl {AGENTCTL_REQUIREMENT}",
+            env!("CARGO_PKG_VERSION")
+        );
+    }
+    Ok(())
+}
 
 pub fn handle_init(db: &Path, artifact_root: &Path) -> anyhow::Result<()> {
     let existing_database = db.exists();
@@ -56,6 +111,9 @@ pub fn handle_init(db: &Path, artifact_root: &Path) -> anyhow::Result<()> {
     } else {
         println!("initialized {}", db.display());
     }
+    let connection = crate::store::open_store(db)?;
+    let recovery = reconcile_startup(&connection, &project_root_for_db(db))?;
+    print_startup_recovery_report(&recovery);
     install_core_harness_resources()?;
     print_init_project_setup_prompt();
     print_cli_hierarchy();
@@ -72,7 +130,7 @@ pub fn handle_install(args: InstallArgs) -> anyhow::Result<()> {
     print_installer_header();
     let home = home_dir()?;
     let ldgr_home = home.join(".ldgr");
-    resolve_install_telemetry_consent(&args, &ldgr_home)?;
+    let telemetry_consent = resolve_install_telemetry_consent(&args, &ldgr_home)?;
     let harnesses = select_harnesses(&args)?;
     if harnesses.is_empty() {
         return Ok(());
@@ -113,6 +171,13 @@ pub fn handle_install(args: InstallArgs) -> anyhow::Result<()> {
         "interview_depth": interview_depth.as_str(),
         "installed": installed,
         "agentctl": agentctl,
+        "compatibility": {
+            "core_version": env!("CARGO_PKG_VERSION"),
+            "agentctl_version": AGENTCTL_VERSION,
+            "agentctl_requirement": AGENTCTL_REQUIREMENT,
+            "launcher_schema": LAUNCHER_COMPATIBILITY_SCHEMA,
+            "error_recovery_schema": ERROR_RECOVERY_SCHEMA_VERSION
+        },
         "agentctl_config": agentctl_config,
         "core_loop_prompt": core_loop_prompt,
         "adapter_release_keyring": release_keyring,
@@ -122,15 +187,21 @@ pub fn handle_install(args: InstallArgs) -> anyhow::Result<()> {
         },
         "notes": "Adapters should read this file, validate their own license when applicable, install adapter bundle files under ~/.ldgr/adapters/<adapter> by default, then install adapter-owned prompts, skills, commands, and extensions into paths declared by the configured harness entries."
     });
-    let config_path = ldgr_home.join("config.json");
-    fs::write(
-        &config_path,
-        format!("{}\n", serde_json::to_string_pretty(&config)?),
-    )?;
+    let harness_config: HarnessConfig = serde_json::from_value(config)?;
+    let (config_path, legacy_config_path) = write_harness_config_files(&home, &harness_config)?;
     println!("├─ Wrote config {}", config_path.display());
+    println!(
+        "├─ Wrote legacy compatibility config {}",
+        legacy_config_path.display()
+    );
     reconcile_installed_adapters(&home, None)?;
     println!("│");
     println!("√ LDGR install complete");
+    write_sequence_collection_status_summary(
+        &mut io::stdout().lock(),
+        "│  ",
+        sequence_collection_status(&telemetry_consent),
+    )?;
     println!("│");
     println!("◇ Next steps");
     println!("│  Run `ldgr workflow` to understand this project's workflow.");
@@ -174,6 +245,8 @@ pub fn handle_telemetry(args: TelemetryArgs) -> anyhow::Result<()> {
     let ldgr_home = home_dir()?.join(".ldgr");
     match args.command {
         TelemetryCommand::Status => print_telemetry_status(&ldgr_home),
+        TelemetryCommand::Preview => print_telemetry_preview(&ldgr_home),
+        TelemetryCommand::Transmit(transmit_args) => transmit_telemetry(&ldgr_home, transmit_args),
         TelemetryCommand::Enable => {
             let stdout = io::stdout();
             let mut output = stdout.lock();
@@ -226,6 +299,140 @@ fn print_telemetry_status(ldgr_home: &Path) -> anyhow::Result<()> {
     );
     println!("disable: ldgr telemetry disable");
     Ok(())
+}
+
+fn print_telemetry_preview(ldgr_home: &Path) -> anyhow::Result<()> {
+    let mut previews = Vec::new();
+    let mut invalid = 0;
+    let mut unreadable = 0;
+    for protocol in RELEASED_NUMERICAL_PROTOCOLS_V1 {
+        let report = preview_pending_sequences(ldgr_home, protocol)?;
+        previews.extend(report.payloads);
+        invalid += report.invalid;
+        unreadable += report.unreadable;
+    }
+    previews.sort_by(|left, right| {
+        left.protocol_endpoint
+            .cmp(right.protocol_endpoint)
+            .then_with(|| left.raw_array.cmp(&right.raw_array))
+    });
+
+    println!("pending telemetry payloads: {}", previews.len());
+    for preview in previews {
+        let raw_array = std::str::from_utf8(&preview.raw_array)
+            .context("validated telemetry payload was not utf-8")?;
+        println!("- destination protocol: {}", preview.protocol_endpoint);
+        println!("  raw array: {raw_array}");
+    }
+    if invalid > 0 {
+        println!("invalid pending payloads: {invalid} (not shown; transmission will drop them)");
+    }
+    if unreadable > 0 {
+        println!(
+            "unreadable pending payloads: {unreadable} (not shown; transmission will retain them)"
+        );
+    }
+    Ok(())
+}
+
+fn transmit_telemetry(ldgr_home: &Path, args: TelemetryTransmitArgs) -> anyhow::Result<()> {
+    let collector = args
+        .collector
+        .or_else(|| std::env::var("LDGR_TELEMETRY_COLLECTOR").ok())
+        .context(
+            "telemetry collector required; pass --collector https://host or set LDGR_TELEMETRY_COLLECTOR",
+        )?;
+    let mut client = TransmissionClient::new(&collector)?
+        .with_max_delay(Duration::from_millis(args.max_delay_ms))
+        .with_timeout(Duration::from_millis(args.timeout_ms));
+    for path in &args.root_ca_pem {
+        let certificate = fs::read(path)
+            .with_context(|| format!("failed to read root CA PEM {}", path.display()))?;
+        client = client
+            .with_root_certificate_pem(&certificate)
+            .with_context(|| format!("failed to parse root CA PEM {}", path.display()))?;
+    }
+
+    let mut total = TransmissionReport::default();
+    for protocol in RELEASED_NUMERICAL_PROTOCOLS_V1 {
+        let report = client.transmit_pending(ldgr_home, protocol);
+        println!(
+            "protocol {}: attempted={} accepted={} retained={} invalid_dropped={} disabled={}",
+            protocol.endpoint(),
+            report.attempted,
+            report.accepted,
+            report.retained,
+            report.invalid_dropped,
+            report.disabled
+        );
+        total.disabled |= report.disabled;
+        total.attempted += report.attempted;
+        total.accepted += report.accepted;
+        total.retained += report.retained;
+        total.invalid_dropped += report.invalid_dropped;
+    }
+
+    println!(
+        "telemetry transmission: attempted={} accepted={} retained={} invalid_dropped={}",
+        total.attempted, total.accepted, total.retained, total.invalid_dropped
+    );
+    if total.disabled {
+        println!("effective collection: disabled; no further telemetry was attempted");
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SequenceCollectionStatus {
+    Enabled,
+    Disabled,
+}
+
+impl SequenceCollectionStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Enabled => "enabled",
+            Self::Disabled => "disabled",
+        }
+    }
+}
+
+fn sequence_collection_status(consent: &TelemetryConsent) -> SequenceCollectionStatus {
+    if consent.collection_enabled() && !telemetry_kill_switch_active() {
+        SequenceCollectionStatus::Enabled
+    } else {
+        SequenceCollectionStatus::Disabled
+    }
+}
+
+fn current_sequence_collection_status() -> SequenceCollectionStatus {
+    home_dir()
+        .ok()
+        .map(|home| home.join(".ldgr"))
+        .and_then(|ldgr_home| load_telemetry_consent(&ldgr_home).ok())
+        .as_ref()
+        .map(sequence_collection_status)
+        .unwrap_or(SequenceCollectionStatus::Disabled)
+}
+
+fn write_sequence_collection_status_summary(
+    output: &mut impl Write,
+    prefix: &str,
+    status: SequenceCollectionStatus,
+) -> anyhow::Result<()> {
+    writeln!(output, "{prefix}sequence collection: {}", status.as_str())?;
+    if status == SequenceCollectionStatus::Enabled {
+        writeln!(output, "{prefix}disable: ldgr telemetry disable")?;
+    }
+    Ok(())
+}
+
+pub(crate) fn print_current_sequence_collection_status_summary(prefix: &str) -> anyhow::Result<()> {
+    write_sequence_collection_status_summary(
+        &mut io::stdout().lock(),
+        prefix,
+        current_sequence_collection_status(),
+    )
 }
 
 pub(crate) fn handle_interactive_adapter_install(
@@ -312,18 +519,25 @@ fn install_adapter_from_catalog(args: &InstallAdapterArgs) -> anyhow::Result<()>
     println!("◇ Installing LDGR adapter `{adapter}`");
     println!("├─ Install root {}", install_root.display());
     if let Some(source_root) = &args.source_root {
-        install_adapter_from_source_root(entry, source_root, &install_root)?;
+        install_adapter_from_source_root(entry, source_root, &install_root, &home)?;
     } else if let Some(release) = entry.release {
         install_adapter_from_release(entry, release, &install_root, &home)?;
+        install_adapter_harness_assets(&adapter, &install_root, &home)?;
     } else if let Some(git) = entry.git {
         install_adapter_from_git(entry, git, &install_root)?;
+        install_adapter_harness_assets(&adapter, &install_root, &home)?;
     } else if let Some(package) = entry.workspace_package {
         let source_root = find_source_root(std::env::current_dir()?)?;
-        install_adapter_from_source_root_with_package(package, &source_root, &install_root)?;
+        install_adapter_from_source_root_with_package(
+            &adapter,
+            package,
+            &source_root,
+            &install_root,
+            &home,
+        )?;
     } else {
         bail!("adapter `{adapter}` has no release or source installer configured yet");
     }
-    install_adapter_harness_assets(&adapter, &install_root, &home)?;
     println!("└─ Installed adapter `{adapter}`. Try `ldgr {adapter} --help` or `ldgr adapter show {adapter}`.");
     Ok(())
 }
@@ -335,15 +549,53 @@ pub(crate) fn handle_update_adapter(args: &AdapterUpdateArgs) -> anyhow::Result<
     let installed = registry
         .find(&args.name)
         .with_context(|| format!("adapter `{}` is not installed", args.name))?;
-    let receipt = installed
+    let receipt_value = installed
         .installation_receipt
         .as_ref()
-        .context("installed adapter has no verified installation receipt; reinstall it first")?;
-    let current_text = receipt
-        .get("version")
-        .and_then(serde_json::Value::as_str)
-        .context("installation receipt has no version")?;
-    let current = Version::parse(current_text).context("installed receipt version is invalid")?;
+        .context("installed adapter has no tracked installation receipt; reinstall it first")?;
+    let receipt = parse_adapter_installation_receipt(receipt_value.clone())?;
+    if let AdapterInstallationReceipt::Source(receipt) = receipt {
+        if args.prerelease {
+            bail!(
+                "--prerelease applies only to signed release adapters, not local source installs"
+            );
+        }
+        let home = home_dir()?;
+        let drift = source_receipt_drift(&installed.root_path, &home, &receipt)?;
+        if !drift.is_empty() {
+            bail!(
+                "refusing to update modified source adapter-owned files:\n{}\nRestore them or run `ldgr adapter uninstall {} --force` before reinstalling.",
+                format_drift_paths(&drift),
+                installed.slug
+            );
+        }
+        let source = resolve_adapter_source_package(
+            &receipt.source.package,
+            Path::new(&receipt.source.bundle_root),
+        )?;
+        verify_source_identity_paths(&receipt, &source)?;
+        let current_source_sha256 = digest_source_bundle(&source.bundle_root)?;
+        let source_changed = current_source_sha256 != receipt.source.bundle_sha256;
+        println!(
+            "adapter={} install_kind=local_source source_changed={} verified_release=false",
+            installed.slug, source_changed
+        );
+        if args.check {
+            return Ok(());
+        }
+        return install_adapter_from_source_root_with_package(
+            &installed.slug,
+            &receipt.source.package,
+            &source.bundle_root,
+            &installed.root_path,
+            &home,
+        );
+    }
+    let AdapterInstallationReceipt::Release(receipt) = receipt else {
+        unreachable!()
+    };
+    let current_text = receipt.version;
+    let current = Version::parse(&current_text).context("installed receipt version is invalid")?;
     let index = crate::release_index::load_configured_release_index()?;
     let core = Version::parse(env!("CARGO_PKG_VERSION"))?;
     let platform = platform_tag()?;
@@ -386,10 +638,32 @@ pub(crate) fn handle_uninstall_adapter(args: &AdapterUninstallArgs) -> anyhow::R
         .find(&args.name)
         .with_context(|| format!("adapter `{}` is not installed", args.name))?;
     let receipt_value = installed.installation_receipt.clone().context(
-        "installed adapter has no verified installation receipt; refusing untracked removal",
+        "installed adapter has no tracked installation receipt; refusing untracked removal",
     )?;
-    let receipt: crate::release_index::InstallationReceipt =
-        serde_json::from_value(receipt_value).context("installation receipt is invalid")?;
+    let receipt = parse_adapter_installation_receipt(receipt_value)?;
+    if let AdapterInstallationReceipt::Source(receipt) = receipt {
+        let home = home_dir()?;
+        let modified = source_receipt_drift(&installed.root_path, &home, &receipt)?;
+        if !modified.is_empty() && !args.force {
+            bail!(
+                "refusing to remove modified source adapter-owned files:\n{}\nRe-run with --force to remove them.",
+                format_drift_paths(&modified)
+            );
+        }
+        for resource in &receipt.owned_resources {
+            remove_path_if_exists(Path::new(&resource.path))?;
+        }
+        remove_path_if_exists(&installed.root_path)?;
+        remove_path_if_exists(Path::new(&receipt.ownership.marker_path))?;
+        println!(
+            "uninstalled adapter={} install_kind=local_source source_checkout_preserved=true",
+            installed.slug
+        );
+        return Ok(());
+    }
+    let AdapterInstallationReceipt::Release(receipt) = receipt else {
+        unreachable!()
+    };
     let mut modified = Vec::new();
     if digest_bundle(&installed.root_path)? != receipt.bundle_sha256 {
         modified.push(installed.root_path.clone());
@@ -453,8 +727,14 @@ fn reconcile_installed_adapters(home: &Path, requested: Option<&str>) -> anyhow:
         let Some(value) = adapter.installation_receipt.clone() else {
             continue;
         };
-        let mut receipt: crate::release_index::InstallationReceipt =
-            serde_json::from_value(value).context("installation receipt is invalid")?;
+        let receipt = parse_adapter_installation_receipt(value)?;
+        if let AdapterInstallationReceipt::Source(receipt) = receipt {
+            reconcile_source_adapter(adapter, home, receipt)?;
+            continue;
+        }
+        let AdapterInstallationReceipt::Release(mut receipt) = receipt else {
+            unreachable!()
+        };
         let desired_plan =
             typed_harness_resource_plan(&adapter.root_path, home, &receipt.resource_manifest)?;
         let desired_targets = desired_plan
@@ -511,6 +791,378 @@ fn reconcile_installed_adapters(home: &Path, requested: Option<&str>) -> anyhow:
         );
     }
     Ok(())
+}
+
+enum AdapterInstallationReceipt {
+    Release(crate::release_index::InstallationReceipt),
+    Source(crate::release_index::SourceInstallationReceipt),
+}
+
+fn parse_adapter_installation_receipt(
+    value: serde_json::Value,
+) -> anyhow::Result<AdapterInstallationReceipt> {
+    if value
+        .get("install_kind")
+        .and_then(serde_json::Value::as_str)
+        == Some("local_source")
+    {
+        let receipt: crate::release_index::SourceInstallationReceipt =
+            serde_json::from_value(value).context("source installation receipt is invalid")?;
+        validate_source_receipt_shape(&receipt)?;
+        Ok(AdapterInstallationReceipt::Source(receipt))
+    } else {
+        Ok(AdapterInstallationReceipt::Release(
+            serde_json::from_value(value).context("release installation receipt is invalid")?,
+        ))
+    }
+}
+
+fn validate_source_receipt_shape(
+    receipt: &crate::release_index::SourceInstallationReceipt,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        receipt.schema_version == 1,
+        "unsupported source installation receipt schema {}; expected 1",
+        receipt.schema_version
+    );
+    anyhow::ensure!(
+        receipt.install_kind == "local_source",
+        "source installation receipt kind must be `local_source`"
+    );
+    anyhow::ensure!(
+        !receipt.verified_release,
+        "local source receipt must not claim verified release provenance"
+    );
+    anyhow::ensure!(
+        !receipt.ownership.source_checkout_owned,
+        "local source receipt must not claim ownership of the source checkout"
+    );
+    anyhow::ensure!(
+        receipt.ownership.generated_paths == ["source-target"],
+        "source receipt generated paths must be exactly `source-target`"
+    );
+    let namespace = receipt
+        .source
+        .package
+        .strip_prefix("ldgr-")
+        .unwrap_or(&receipt.source.package)
+        .strip_suffix("-adapter")
+        .unwrap_or_else(|| {
+            receipt
+                .source
+                .package
+                .strip_prefix("ldgr-")
+                .unwrap_or(&receipt.source.package)
+        });
+    anyhow::ensure!(
+        namespace == receipt.domain,
+        "source receipt package `{}` does not own adapter `{}`",
+        receipt.source.package,
+        receipt.domain
+    );
+    let installed_manifest = receipt
+        .installed_files
+        .iter()
+        .find(|file| file.path == "adapter.toml")
+        .context("source receipt must track installed adapter.toml")?;
+    anyhow::ensure!(
+        installed_manifest.sha256 == receipt.manifest_digests.installed_adapter_manifest_sha256,
+        "source receipt installed adapter manifest digests disagree"
+    );
+    if let Some(expected) = &receipt.manifest_digests.installed_resource_manifest_sha256 {
+        let installed_resource_manifest = receipt
+            .installed_files
+            .iter()
+            .find(|file| file.path == "adapter-resources.json")
+            .context("source receipt resource digest has no installed resource manifest file")?;
+        anyhow::ensure!(
+            &installed_resource_manifest.sha256 == expected,
+            "source receipt installed resource manifest digests disagree"
+        );
+    }
+    Ok(())
+}
+
+fn reconcile_source_adapter(
+    adapter: &crate::adapter_registry::DiscoveredAdapter,
+    home: &Path,
+    mut receipt: crate::release_index::SourceInstallationReceipt,
+) -> anyhow::Result<()> {
+    let drift = source_receipt_drift(&adapter.root_path, home, &receipt)?;
+    if !drift.is_empty() {
+        bail!(
+            "refusing to reconcile modified source adapter-owned files:\n{}",
+            format_drift_paths(&drift)
+        );
+    }
+    let plan = source_harness_resource_plan(&adapter.root_path, home)?;
+    let old_targets = receipt
+        .owned_resources
+        .iter()
+        .map(|resource| PathBuf::from(&resource.path))
+        .collect::<Vec<_>>();
+    for resource in &plan {
+        if resource.target.exists() && !old_targets.iter().any(|path| path == &resource.target) {
+            bail!(
+                "refusing to overwrite unowned harness resource {}",
+                resource.target.display()
+            );
+        }
+    }
+    let temp = std::env::temp_dir().join(format!(
+        "ldgr-adapter-source-reconcile-{}-{}",
+        adapter.slug,
+        std::process::id()
+    ));
+    remove_path_if_exists(&temp)?;
+    let mut transaction = InstallTransaction::new(temp.join("rollback"))?;
+    transaction.snapshot(&adapter.root_path)?;
+    for path in &old_targets {
+        transaction.snapshot(path)?;
+    }
+    for resource in &plan {
+        transaction.snapshot(&resource.target)?;
+    }
+    for old in &old_targets {
+        if !plan.iter().any(|resource| &resource.target == old) {
+            remove_path_if_exists(old)?;
+        }
+    }
+    install_source_harness_resources(&plan)?;
+    receipt.owned_resources = source_owned_resources(&plan)?;
+    receipt.ownership.external_resource_roots = source_resource_roots(&plan)?;
+    write_source_receipt_file(&adapter.root_path, &receipt)?;
+    transaction.commit()?;
+    remove_path_if_exists(&temp)?;
+    println!(
+        "reconciled adapter={} install_kind=local_source resources={}",
+        adapter.slug,
+        receipt.owned_resources.len()
+    );
+    Ok(())
+}
+
+fn prepare_source_reinstall(
+    adapter: &str,
+    install_root: &Path,
+    home: &Path,
+) -> anyhow::Result<Option<crate::release_index::SourceInstallationReceipt>> {
+    if !install_root.exists() {
+        return Ok(None);
+    }
+    anyhow::ensure!(
+        install_root.is_dir(),
+        "adapter install root {} is not a directory",
+        install_root.display()
+    );
+    if fs::read_dir(install_root)?.next().is_none() {
+        return Ok(None);
+    }
+    let path = install_root.join("installation-receipt.json");
+    let text = fs::read_to_string(&path).with_context(|| {
+        format!(
+            "refusing to overwrite untracked adapter install at {}; uninstall or move it first",
+            install_root.display()
+        )
+    })?;
+    let parsed = parse_adapter_installation_receipt(
+        serde_json::from_str(&text).context("installation receipt is invalid JSON")?,
+    )?;
+    let AdapterInstallationReceipt::Source(receipt) = parsed else {
+        bail!(
+            "refusing to replace a signed release installation with local source; run `ldgr adapter uninstall {adapter}` first"
+        );
+    };
+    anyhow::ensure!(
+        receipt.domain == adapter,
+        "source receipt domain `{}` does not match requested adapter `{adapter}`",
+        receipt.domain
+    );
+    let drift = source_receipt_drift(install_root, home, &receipt)?;
+    if !drift.is_empty() {
+        bail!(
+            "refusing to reinstall over modified source adapter-owned files:\n{}\nRestore them or run `ldgr adapter uninstall {adapter} --force` first.",
+            format_drift_paths(&drift)
+        );
+    }
+    Ok(Some(receipt))
+}
+
+fn source_receipt_drift(
+    install_root: &Path,
+    home: &Path,
+    receipt: &crate::release_index::SourceInstallationReceipt,
+) -> anyhow::Result<Vec<PathBuf>> {
+    verify_source_receipt_boundaries(install_root, home, receipt)?;
+    let mut drift = Vec::new();
+    let expected_files = receipt
+        .installed_files
+        .iter()
+        .map(|file| file.path.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    for file in &receipt.installed_files {
+        let path = install_root.join(&file.path);
+        if !path.is_file() || digest_path(&path)? != file.sha256 {
+            drift.push(path);
+        }
+    }
+    let actual_files = source_installed_file_paths(install_root)?
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    for unexpected in actual_files.difference(&expected_files) {
+        drift.push(install_root.join(unexpected));
+    }
+    for missing in expected_files.difference(&actual_files) {
+        let path = install_root.join(missing);
+        if !drift.iter().any(|existing| existing == &path) {
+            drift.push(path);
+        }
+    }
+    for resource in &receipt.owned_resources {
+        let path = PathBuf::from(&resource.path);
+        if !path.exists() || digest_path(&path)? != resource.sha256 {
+            drift.push(path);
+        }
+    }
+    let marker = PathBuf::from(&receipt.ownership.marker_path);
+    let expected_marker = format!(
+        "install_root={}\ninstall_kind=local_source\n",
+        receipt.ownership.install_root
+    );
+    if fs::read_to_string(&marker).ok().as_deref() != Some(expected_marker.as_str()) {
+        drift.push(marker);
+    }
+    drift.sort();
+    drift.dedup();
+    Ok(drift)
+}
+
+fn verify_source_receipt_boundaries(
+    install_root: &Path,
+    home: &Path,
+    receipt: &crate::release_index::SourceInstallationReceipt,
+) -> anyhow::Result<()> {
+    validate_source_receipt_shape(receipt)?;
+    anyhow::ensure!(
+        Path::new(&receipt.ownership.install_root).is_absolute()
+            && Path::new(&receipt.ownership.marker_path).is_absolute()
+            && Path::new(&receipt.source.bundle_root).is_absolute()
+            && Path::new(&receipt.source.cargo_manifest).is_absolute(),
+        "source receipt identity and ownership paths must be absolute"
+    );
+    anyhow::ensure!(
+        !paths_overlap(
+            Path::new(&receipt.ownership.install_root),
+            Path::new(&receipt.source.bundle_root)
+        )?,
+        "source receipt install root overlaps its preserved source checkout"
+    );
+    anyhow::ensure!(
+        paths_match(install_root, Path::new(&receipt.ownership.install_root))?,
+        "source receipt install-root boundary does not match discovered adapter root"
+    );
+    let expected_marker = home.join(".ldgr/installed-adapters").join(&receipt.domain);
+    anyhow::ensure!(
+        paths_match(&expected_marker, Path::new(&receipt.ownership.marker_path))?,
+        "source receipt marker boundary is outside the adapter marker path"
+    );
+    let allowed_roots = source_allowed_resource_roots(home)?;
+    let mut recorded_roots = Vec::new();
+    for recorded_root in &receipt.ownership.external_resource_roots {
+        anyhow::ensure!(
+            Path::new(recorded_root).is_absolute(),
+            "source receipt resource roots must be absolute"
+        );
+        let recorded_root = absolute_path(Path::new(recorded_root))?;
+        anyhow::ensure!(
+            allowed_roots
+                .iter()
+                .any(|allowed| paths_match(allowed, &recorded_root).unwrap_or(false)),
+            "source receipt resource root {} is not a currently configured harness boundary",
+            recorded_root.display()
+        );
+        recorded_roots.push(recorded_root);
+    }
+    for resource in &receipt.owned_resources {
+        anyhow::ensure!(
+            Path::new(&resource.path).is_absolute(),
+            "source receipt resource paths must be absolute"
+        );
+        let path = absolute_path(Path::new(&resource.path))?;
+        anyhow::ensure!(
+            allowed_roots
+                .iter()
+                .any(|root| path != *root && path.starts_with(root)),
+            "source receipt resource {} is outside configured harness boundaries",
+            path.display()
+        );
+        anyhow::ensure!(
+            recorded_roots
+                .iter()
+                .any(|root| path != *root && path.starts_with(root)),
+            "source receipt resource {} is outside its recorded ownership roots",
+            path.display()
+        );
+    }
+    for file in &receipt.installed_files {
+        validate_source_relative_path(&file.path)?;
+    }
+    Ok(())
+}
+
+fn validate_source_relative_path(path: &str) -> anyhow::Result<()> {
+    let path = Path::new(path);
+    anyhow::ensure!(
+        !path.is_absolute()
+            && path
+                .components()
+                .all(|part| matches!(part, std::path::Component::Normal(_))),
+        "source receipt installed-file path must be relative: {}",
+        path.display()
+    );
+    anyhow::ensure!(
+        path != Path::new("installation-receipt.json") && !path.starts_with("source-target"),
+        "source receipt installed-file path crosses a generated or receipt boundary: {}",
+        path.display()
+    );
+    Ok(())
+}
+
+fn format_drift_paths(paths: &[PathBuf]) -> String {
+    paths
+        .iter()
+        .map(|path| format!("  {}", path.display()))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn paths_match(left: &Path, right: &Path) -> anyhow::Result<bool> {
+    Ok(absolute_path(left)? == absolute_path(right)?)
+}
+
+fn paths_overlap(left: &Path, right: &Path) -> anyhow::Result<bool> {
+    let left = absolute_path(left)?;
+    let right = absolute_path(right)?;
+    Ok(left.starts_with(&right) || right.starts_with(&left))
+}
+
+fn absolute_path(path: &Path) -> anyhow::Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    #[cfg(windows)]
+    {
+        let text = absolute.to_string_lossy();
+        if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+            return Ok(PathBuf::from(format!(r"\\{rest}")));
+        }
+        if let Some(rest) = text.strip_prefix(r"\\?\") {
+            return Ok(PathBuf::from(rest));
+        }
+    }
+    Ok(absolute)
 }
 
 fn install_adapter_from_configured_index(args: &InstallAdapterArgs) -> anyhow::Result<()> {
@@ -1327,6 +1979,7 @@ fn install_adapter_from_source_root(
     entry: &AvailableAdapter,
     source_root: &Path,
     install_root: &Path,
+    home: &Path,
 ) -> anyhow::Result<()> {
     let Some(package) = entry.workspace_package else {
         bail!(
@@ -1334,23 +1987,66 @@ fn install_adapter_from_source_root(
             entry.slug
         );
     };
-    install_adapter_from_source_root_with_package(package, source_root, install_root)
+    install_adapter_from_source_root_with_package(
+        entry.slug,
+        package,
+        source_root,
+        install_root,
+        home,
+    )
 }
 
-fn install_adapter_from_source_root_with_package(
+#[derive(Debug, PartialEq, Eq)]
+struct AdapterSourcePackage {
+    bundle_root: PathBuf,
+    cargo_manifest: PathBuf,
+}
+
+fn resolve_adapter_source_package(
     package: &str,
     source_root: &Path,
-    install_root: &Path,
-) -> anyhow::Result<()> {
-    let source_bundle = source_root.join(package);
-    if source_bundle.join("adapter.toml").is_file() {
-        let namespace = package.strip_prefix("ldgr-").unwrap_or(package);
-        let namespace = namespace.strip_suffix("-adapter").unwrap_or(namespace);
-        validate_adapter_bundle_contract(&source_bundle, namespace)?;
+) -> anyhow::Result<AdapterSourcePackage> {
+    let source_root = source_root
+        .canonicalize()
+        .with_context(|| format!("failed to resolve source root {}", source_root.display()))?;
+    let candidates = [source_root.join(package), source_root.clone()];
+
+    for bundle_root in candidates {
+        let adapter_manifest = bundle_root.join("adapter.toml");
+        let cargo_manifest = bundle_root.join("Cargo.toml");
+        if !adapter_manifest.is_file() || !cargo_manifest.is_file() {
+            continue;
+        }
+        let cargo: toml::Value = toml::from_str(&fs::read_to_string(&cargo_manifest)?)
+            .with_context(|| format!("failed to parse {}", cargo_manifest.display()))?;
+        let cargo_package = cargo
+            .get("package")
+            .and_then(|value| value.get("name"))
+            .and_then(toml::Value::as_str);
+        if cargo_package == Some(package) {
+            return Ok(AdapterSourcePackage {
+                bundle_root,
+                cargo_manifest,
+            });
+        }
     }
-    println!("├─ Source checkout {}", source_root.display());
-    let status = Command::new("cargo")
+
+    bail!(
+        "source root {} does not contain adapter package `{package}`; expected adapter.toml and Cargo.toml in the source root or its {package}/ child",
+        source_root.display()
+    )
+}
+
+fn source_adapter_install_command(
+    package: &str,
+    source: &AdapterSourcePackage,
+    install_root: &Path,
+) -> Command {
+    let mut command = Command::new("cargo");
+    command
         .arg("run")
+        .arg("--manifest-path")
+        .arg(&source.cargo_manifest)
         .arg("-p")
         .arg(package)
         .arg("--")
@@ -1359,12 +2055,459 @@ fn install_adapter_from_source_root_with_package(
         .arg("--install-root")
         .arg(install_root)
         .arg("--print-path")
-        .current_dir(source_root)
-        .status()?;
+        .current_dir(&source.bundle_root);
+    command
+}
+
+fn install_adapter_from_source_root_with_package(
+    adapter: &str,
+    package: &str,
+    source_root: &Path,
+    install_root: &Path,
+    home: &Path,
+) -> anyhow::Result<()> {
+    let source = resolve_adapter_source_package(package, source_root)?;
+    let namespace = package.strip_prefix("ldgr-").unwrap_or(package);
+    let namespace = namespace.strip_suffix("-adapter").unwrap_or(namespace);
+    anyhow::ensure!(
+        namespace == adapter,
+        "source package `{package}` resolves namespace `{namespace}`, not requested adapter `{adapter}`"
+    );
+    anyhow::ensure!(
+        !paths_overlap(&source.bundle_root, install_root)?,
+        "source bundle and install root must not overlap; choose an install root outside {}",
+        source.bundle_root.display()
+    );
+    validate_adapter_bundle_contract(&source.bundle_root, namespace)?;
+    let previous_receipt = prepare_source_reinstall(adapter, install_root, home)?;
+    let temp = std::env::temp_dir().join(format!(
+        "ldgr-adapter-source-install-{adapter}-{}",
+        std::process::id()
+    ));
+    remove_path_if_exists(&temp)?;
+    let mut transaction = InstallTransaction::new(temp.join("rollback"))?;
+    transaction.snapshot(install_root)?;
+    let marker = home.join(".ldgr/installed-adapters").join(adapter);
+    transaction.snapshot(&marker)?;
+    if let Some(previous) = &previous_receipt {
+        for resource in &previous.owned_resources {
+            transaction.snapshot(Path::new(&resource.path))?;
+        }
+    }
+    let anticipated_resources = source_harness_resource_plan(&source.bundle_root, home)?;
+    let previously_owned = previous_receipt
+        .as_ref()
+        .map(|receipt| {
+            receipt
+                .owned_resources
+                .iter()
+                .map(|resource| PathBuf::from(&resource.path))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    for resource in &anticipated_resources {
+        if resource.target.exists()
+            && !previously_owned
+                .iter()
+                .any(|owned| owned == &resource.target)
+        {
+            bail!(
+                "refusing to overwrite unowned harness resource {}; remove it or choose a different harness resource path",
+                resource.target.display()
+            );
+        }
+        transaction.snapshot(&resource.target)?;
+    }
+    println!("├─ Source checkout {}", source_root.display());
+    println!("├─ Adapter manifest {}", source.cargo_manifest.display());
+    let status = source_adapter_install_command(package, &source, install_root).status()?;
     if !status.success() {
         bail!("adapter installer failed for package `{package}` with status {status}");
     }
-    patch_adapter_argv_to_source_runner(install_root, package, source_root)?;
+    patch_adapter_argv_to_source_runner(install_root, package, &source.cargo_manifest)?;
+    let resource_plan = source_harness_resource_plan(install_root, home)?;
+    for resource in &resource_plan {
+        anyhow::ensure!(
+            anticipated_resources
+                .iter()
+                .any(|anticipated| anticipated.target == resource.target),
+            "adapter installer introduced an unanticipated harness resource {}",
+            resource.target.display()
+        );
+        transaction.snapshot(&resource.target)?;
+    }
+    if let Some(previous) = &previous_receipt {
+        for resource in &previous.owned_resources {
+            let path = PathBuf::from(&resource.path);
+            if !resource_plan.iter().any(|desired| desired.target == path) {
+                remove_path_if_exists(&path)?;
+            }
+        }
+    }
+    install_source_harness_resources(&resource_plan)?;
+    let normalized_install_root = absolute_path(install_root)?;
+    write_file(
+        &marker,
+        &format!(
+            "install_root={}\ninstall_kind=local_source\n",
+            normalized_install_root.display()
+        ),
+    )?;
+    write_source_installation_receipt(
+        adapter,
+        package,
+        &source,
+        install_root,
+        &marker,
+        &resource_plan,
+    )?;
+    transaction.commit()?;
+    remove_path_if_exists(&temp)?;
+    Ok(())
+}
+
+#[derive(Debug)]
+struct SourceHarnessResource {
+    source: PathBuf,
+    target: PathBuf,
+    root: PathBuf,
+}
+
+fn source_harness_resource_plan(
+    install_root: &Path,
+    home: &Path,
+) -> anyhow::Result<Vec<SourceHarnessResource>> {
+    let config = read_ldgr_harness_config(home);
+    let mut plan = Vec::new();
+    append_source_resource_children(
+        &mut plan,
+        &install_root.join("prompts"),
+        configured_prompt_dirs(home, &config),
+    )?;
+    append_source_resource_children(
+        &mut plan,
+        &install_root.join("skills"),
+        configured_skill_dirs(home, &config),
+    )?;
+    append_source_resource_children(
+        &mut plan,
+        &install_root.join("extensions"),
+        configured_extension_dirs(home, &config),
+    )?;
+    let mut targets = std::collections::BTreeSet::new();
+    for resource in &plan {
+        anyhow::ensure!(
+            targets.insert(resource.target.clone()),
+            "source adapter harness resource collision at {}",
+            resource.target.display()
+        );
+    }
+    Ok(plan)
+}
+
+fn append_source_resource_children(
+    plan: &mut Vec<SourceHarnessResource>,
+    source_root: &Path,
+    target_roots: Vec<PathBuf>,
+) -> anyhow::Result<()> {
+    if !source_root.is_dir() {
+        return Ok(());
+    }
+    let mut children = fs::read_dir(source_root)?.collect::<Result<Vec<_>, _>>()?;
+    children.sort_by_key(|entry| entry.file_name());
+    for root in target_roots {
+        let root = absolute_path(&root)?;
+        for child in &children {
+            plan.push(SourceHarnessResource {
+                source: child.path(),
+                target: root.join(child.file_name()),
+                root: root.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn install_source_harness_resources(plan: &[SourceHarnessResource]) -> anyhow::Result<()> {
+    for resource in plan {
+        if resource.source.is_dir() {
+            copy_dir_recursive(&resource.source, &resource.target)?;
+        } else {
+            if let Some(parent) = resource.target.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::copy(&resource.source, &resource.target)?;
+        }
+        println!(
+            "\u{251c}\u{2500} Harness resource {}",
+            resource.target.display()
+        );
+    }
+    Ok(())
+}
+
+fn source_allowed_resource_roots(home: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let config = read_ldgr_harness_config(home);
+    let mut roots = configured_prompt_dirs(home, &config);
+    roots.extend(configured_skill_dirs(home, &config));
+    roots.extend(configured_extension_dirs(home, &config));
+    roots.extend([
+        home.join(".ldgr/prompts"),
+        home.join(".pi/agent/skills"),
+        home.join(".pi/agent/extensions"),
+    ]);
+    let mut normalized = Vec::new();
+    for root in roots {
+        let root = absolute_path(&root)?;
+        if !normalized.iter().any(|existing| existing == &root) {
+            normalized.push(root);
+        }
+    }
+    Ok(normalized)
+}
+
+fn source_owned_resources(
+    plan: &[SourceHarnessResource],
+) -> anyhow::Result<Vec<crate::release_index::OwnedResource>> {
+    plan.iter()
+        .map(|resource| {
+            Ok(crate::release_index::OwnedResource {
+                path: absolute_path(&resource.target)?.display().to_string(),
+                sha256: digest_path(&resource.target)?,
+            })
+        })
+        .collect()
+}
+
+fn source_resource_roots(plan: &[SourceHarnessResource]) -> anyhow::Result<Vec<String>> {
+    let mut roots = Vec::new();
+    for resource in plan {
+        let root = absolute_path(&resource.root)?.display().to_string();
+        if !roots.iter().any(|existing| existing == &root) {
+            roots.push(root);
+        }
+    }
+    Ok(roots)
+}
+
+fn write_source_installation_receipt(
+    adapter: &str,
+    package: &str,
+    source: &AdapterSourcePackage,
+    install_root: &Path,
+    marker: &Path,
+    resources: &[SourceHarnessResource],
+) -> anyhow::Result<()> {
+    let installed_at_unix_seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("system clock is before Unix epoch")?
+        .as_secs();
+    let source_adapter_manifest = source.bundle_root.join("adapter.toml");
+    let installed_adapter_manifest = install_root.join("adapter.toml");
+    let source_resource_manifest = source.bundle_root.join("adapter-resources.json");
+    let installed_resource_manifest = install_root.join("adapter-resources.json");
+    let receipt = crate::release_index::SourceInstallationReceipt {
+        schema_version: 1,
+        install_kind: "local_source".to_owned(),
+        domain: adapter.to_owned(),
+        installed_at_unix_seconds,
+        source: crate::release_index::SourceInstallIdentity {
+            package: package.to_owned(),
+            bundle_root: absolute_path(&source.bundle_root)?.display().to_string(),
+            cargo_manifest: absolute_path(&source.cargo_manifest)?.display().to_string(),
+            bundle_sha256: digest_source_bundle(&source.bundle_root)?,
+        },
+        manifest_digests: crate::release_index::SourceManifestDigests {
+            source_adapter_manifest_sha256: digest_path(&source_adapter_manifest)?,
+            source_cargo_manifest_sha256: digest_path(&source.cargo_manifest)?,
+            installed_adapter_manifest_sha256: digest_path(&installed_adapter_manifest)?,
+            source_resource_manifest_sha256: source_resource_manifest
+                .is_file()
+                .then(|| digest_path(&source_resource_manifest))
+                .transpose()?,
+            installed_resource_manifest_sha256: installed_resource_manifest
+                .is_file()
+                .then(|| digest_path(&installed_resource_manifest))
+                .transpose()?,
+        },
+        installer_invocation: source_adapter_installer_argv(package, source, install_root),
+        executable_invocations: source_executable_invocations(&installed_adapter_manifest)?,
+        installed_files: source_installed_files(install_root)?,
+        owned_resources: source_owned_resources(resources)?,
+        ownership: crate::release_index::SourceOwnershipBoundaries {
+            install_root: absolute_path(install_root)?.display().to_string(),
+            marker_path: absolute_path(marker)?.display().to_string(),
+            source_checkout_owned: false,
+            generated_paths: vec!["source-target".to_owned()],
+            external_resource_roots: source_resource_roots(resources)?,
+        },
+        verified_release: false,
+    };
+    write_source_receipt_file(install_root, &receipt)
+}
+
+fn write_source_receipt_file(
+    install_root: &Path,
+    receipt: &crate::release_index::SourceInstallationReceipt,
+) -> anyhow::Result<()> {
+    fs::write(
+        install_root.join("installation-receipt.json"),
+        format!("{}\n", serde_json::to_string_pretty(receipt)?),
+    )?;
+    Ok(())
+}
+
+fn source_adapter_installer_argv(
+    package: &str,
+    source: &AdapterSourcePackage,
+    install_root: &Path,
+) -> Vec<String> {
+    vec![
+        "cargo".to_owned(),
+        "run".to_owned(),
+        "--manifest-path".to_owned(),
+        source.cargo_manifest.display().to_string(),
+        "-p".to_owned(),
+        package.to_owned(),
+        "--".to_owned(),
+        "adapter".to_owned(),
+        "install".to_owned(),
+        "--install-root".to_owned(),
+        install_root.display().to_string(),
+        "--print-path".to_owned(),
+    ]
+}
+
+fn source_executable_invocations(
+    manifest_path: &Path,
+) -> anyhow::Result<Vec<crate::release_index::SourceExecutableInvocation>> {
+    let manifest: toml::Value = toml::from_str(&fs::read_to_string(manifest_path)?)
+        .with_context(|| format!("failed to parse {}", manifest_path.display()))?;
+    let mut invocations = Vec::new();
+    for (table, kind, name_field) in [
+        ("commands", "namespace", "namespace"),
+        ("tools", "tool", "name"),
+    ] {
+        for entry in manifest
+            .get(table)
+            .and_then(toml::Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let name = entry
+                .get(name_field)
+                .and_then(toml::Value::as_str)
+                .with_context(|| format!("installed adapter {kind} has no {name_field}"))?
+                .to_owned();
+            let argv = entry
+                .get("argv")
+                .and_then(toml::Value::as_array)
+                .with_context(|| format!("installed adapter {kind} has no argv"))?
+                .iter()
+                .map(|value| {
+                    value.as_str().map(str::to_owned).with_context(|| {
+                        format!("installed adapter {kind} argv must contain strings")
+                    })
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            invocations.push(crate::release_index::SourceExecutableInvocation {
+                kind: kind.to_owned(),
+                name,
+                argv,
+            });
+        }
+    }
+    Ok(invocations)
+}
+
+fn source_installed_files(
+    install_root: &Path,
+) -> anyhow::Result<Vec<crate::release_index::OwnedResource>> {
+    source_installed_file_paths(install_root)?
+        .into_iter()
+        .map(|relative| {
+            let path = install_root.join(&relative);
+            Ok(crate::release_index::OwnedResource {
+                path: relative,
+                sha256: digest_path(&path)?,
+            })
+        })
+        .collect()
+}
+
+fn source_installed_file_paths(install_root: &Path) -> anyhow::Result<Vec<String>> {
+    let mut files = Vec::new();
+    collect_digest_files(install_root, install_root, &mut files)?;
+    let mut paths = files
+        .into_iter()
+        .map(|(relative, _)| relative)
+        .filter(|relative| {
+            relative != "installation-receipt.json"
+                && relative != "source-target"
+                && !relative.starts_with("source-target/")
+        })
+        .collect::<Vec<_>>();
+    paths.sort();
+    Ok(paths)
+}
+
+fn digest_source_bundle(source_root: &Path) -> anyhow::Result<String> {
+    use sha2::{Digest, Sha256};
+
+    let mut files = Vec::new();
+    collect_source_identity_files(source_root, source_root, &mut files)?;
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut hasher = Sha256::new();
+    for (relative, bytes) in files {
+        hasher.update(relative.as_bytes());
+        hasher.update([0]);
+        hasher.update(bytes);
+        hasher.update([0]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn collect_source_identity_files(
+    root: &Path,
+    current: &Path,
+    files: &mut Vec<(String, Vec<u8>)>,
+) -> anyhow::Result<()> {
+    for entry in fs::read_dir(current)? {
+        let entry = entry?;
+        let path = entry.path();
+        let name = entry.file_name();
+        if path.is_dir() && (name == ".git" || name == "target" || name == "source-target") {
+            continue;
+        }
+        if path.is_dir() {
+            collect_source_identity_files(root, &path, files)?;
+        } else if path.is_file() && name != ".git" {
+            files.push((
+                path.strip_prefix(root)?
+                    .to_string_lossy()
+                    .replace('\\', "/"),
+                fs::read(path)?,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn verify_source_identity_paths(
+    receipt: &crate::release_index::SourceInstallationReceipt,
+    source: &AdapterSourcePackage,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        paths_match(Path::new(&receipt.source.bundle_root), &source.bundle_root)?,
+        "recorded source bundle root no longer resolves to the adapter package"
+    );
+    anyhow::ensure!(
+        paths_match(
+            Path::new(&receipt.source.cargo_manifest),
+            &source.cargo_manifest
+        )?,
+        "recorded Cargo manifest no longer resolves to the adapter package"
+    );
     Ok(())
 }
 
@@ -1586,13 +2729,12 @@ fn adapter_manifest_references_binary(install_root: &Path, binary: &str) -> anyh
 fn patch_adapter_argv_to_source_runner(
     install_root: &Path,
     package: &str,
-    source_root: &Path,
+    cargo_manifest: &Path,
 ) -> anyhow::Result<()> {
     let manifest = install_root.join("adapter.toml");
     if !manifest.is_file() {
         return Ok(());
     }
-    let cargo_manifest = source_root.join("Cargo.toml");
     let target_dir = install_root.join("source-target");
     let source_runner = [
         "cargo".to_string(),
@@ -1732,8 +2874,31 @@ fn install_adapter_harness_assets(
 }
 
 fn read_ldgr_harness_config(home: &Path) -> Option<crate::harness_config::HarnessConfig> {
+    let toml_path = home.join(".ldgr/config.toml");
+    if let Ok(text) = fs::read_to_string(&toml_path) {
+        if let Ok(config) = crate::harness_config::parse_harness_config_toml(&text) {
+            return Some(config);
+        }
+    }
     let text = fs::read_to_string(home.join(".ldgr/config.json")).ok()?;
-    crate::harness_config::parse_harness_config(&text).ok()
+    crate::harness_config::parse_harness_config_json(&text).ok()
+}
+
+fn write_harness_config_files(
+    home: &Path,
+    config: &HarnessConfig,
+) -> anyhow::Result<(PathBuf, PathBuf)> {
+    let config_path = home.join(".ldgr/config.toml");
+    let legacy_config_path = home.join(".ldgr/config.json");
+    write_file(
+        &config_path,
+        &format!("{}\n", toml::to_string_pretty(config)?),
+    )?;
+    write_file(
+        &legacy_config_path,
+        &format!("{}\n", serde_json::to_string_pretty(config)?),
+    )?;
+    Ok((config_path, legacy_config_path))
 }
 
 fn configured_prompt_dirs(
@@ -1869,6 +3034,27 @@ fn resolve_install_telemetry_consent(
     args: &InstallArgs,
     ldgr_home: &Path,
 ) -> anyhow::Result<TelemetryConsent> {
+    let stdin_is_interactive = stdin_is_terminal();
+    let stdin = io::stdin();
+    let mut input = stdin.lock();
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    resolve_install_telemetry_consent_with_io(
+        args,
+        ldgr_home,
+        stdin_is_interactive,
+        &mut input,
+        &mut output,
+    )
+}
+
+fn resolve_install_telemetry_consent_with_io(
+    args: &InstallArgs,
+    ldgr_home: &Path,
+    stdin_is_interactive: bool,
+    input: &mut impl BufRead,
+    output: &mut impl Write,
+) -> anyhow::Result<TelemetryConsent> {
     let existing = load_telemetry_consent(ldgr_home)?;
     if let Some(choice) = args.telemetry {
         let decision = match choice {
@@ -1882,17 +3068,13 @@ fn resolve_install_telemetry_consent(
     if existing.decision != TelemetryConsentDecision::Undecided {
         return Ok(existing);
     }
-    if args.yes || !stdin_is_terminal() {
+    if args.yes || !stdin_is_interactive {
         bail!(
             "telemetry choice required for the first non-interactive install; pass `--telemetry enable` or `--telemetry disable` (`--yes` is not telemetry consent)"
         );
     }
 
-    let stdin = io::stdin();
-    let mut input = stdin.lock();
-    let stdout = io::stdout();
-    let mut output = stdout.lock();
-    let decision = prompt_telemetry_consent(&mut input, &mut output)?;
+    let decision = prompt_telemetry_consent(input, output)?;
     let consent = TelemetryConsent::current(decision);
     save_telemetry_consent(ldgr_home, &consent)?;
     Ok(consent)
@@ -1988,7 +3170,9 @@ fn select_harnesses(args: &InstallArgs) -> anyhow::Result<Vec<HarnessKind>> {
 fn select_interview_depth(args: &InstallArgs) -> anyhow::Result<InterviewDepth> {
     if let Some(raw) = &args.interview_depth {
         let depth = InterviewDepth::parse(raw).ok_or_else(|| {
-            anyhow::anyhow!("unknown --interview-depth `{raw}`; expected high, medium, low, or none")
+            anyhow::anyhow!(
+                "unknown --interview-depth `{raw}`; expected high, medium, low, or none"
+            )
         })?;
         println!("◇ Requirements interview: {}", depth.as_str());
         return Ok(depth);
@@ -2068,30 +3252,41 @@ fn ensure_agentctl_dependency(skip: bool) -> anyhow::Result<serde_json::Value> {
             "required": true,
             "installed_by_ldgr": false,
             "status": "skipped",
-            "install_hint": format!("cargo install --git {AGENTCTL_REPO}")
+            "install_hint": format!("cargo install --git {AGENTCTL_REPO} --tag v{AGENTCTL_VERSION} --locked --force"),
+            "required_version": AGENTCTL_VERSION
         }));
     }
-    if command_on_path("agentctl") {
-        println!("├─ agentctl already available on PATH");
+    if installed_agentctl_is_compatible()? {
+        println!("├─ compatible agentctl {AGENTCTL_VERSION} already available on PATH");
         return Ok(serde_json::json!({
             "required": true,
             "installed_by_ldgr": false,
             "status": "already_on_path",
-            "command": "agentctl"
+            "command": "agentctl",
+            "version": AGENTCTL_VERSION
         }));
     }
 
-    println!("├─ Installing agentctl from {AGENTCTL_REPO}");
+    println!("├─ Installing agentctl {AGENTCTL_VERSION} from {AGENTCTL_REPO}");
     let status = Command::new("cargo")
         .arg("install")
         .arg("--git")
         .arg(AGENTCTL_REPO)
+        .arg("--tag")
+        .arg(format!("v{AGENTCTL_VERSION}"))
+        .arg("--locked")
+        .arg("--force")
         .stdin(Stdio::null())
         .status()
         .map_err(|error| anyhow::anyhow!("failed to start cargo install for agentctl: {error}"))?;
     if !status.success() {
         bail!(
-            "agentctl install failed with status {status}; install it with `cargo install --git {AGENTCTL_REPO}` or rerun `ldgr install --no-agentctl` to manage it yourself"
+            "agentctl install failed with status {status}; install it with `cargo install --git {AGENTCTL_REPO} --tag v{AGENTCTL_VERSION} --locked --force` or rerun `ldgr install --no-agentctl` to manage it yourself"
+        );
+    }
+    if !installed_agentctl_is_compatible()? {
+        bail!(
+            "agentctl {AGENTCTL_VERSION} was installed but `agentctl` on PATH still resolves to a different version; update the resolved binary directory or install the paired LDGR Core release bundle"
         );
     }
     Ok(serde_json::json!({
@@ -2099,8 +3294,33 @@ fn ensure_agentctl_dependency(skip: bool) -> anyhow::Result<serde_json::Value> {
         "installed_by_ldgr": true,
         "status": "installed",
         "command": "agentctl",
-        "source": AGENTCTL_REPO
+        "source": AGENTCTL_REPO,
+        "version": AGENTCTL_VERSION
     }))
+}
+
+fn installed_agentctl_is_compatible() -> anyhow::Result<bool> {
+    if !command_on_path("agentctl") {
+        return Ok(false);
+    }
+    let output = Command::new("agentctl")
+        .arg("--version")
+        .stdin(Stdio::null())
+        .output()
+        .context("failed to inspect agentctl on PATH")?;
+    if !output.status.success() {
+        return Ok(false);
+    }
+    let text = String::from_utf8(output.stdout).context("agentctl --version was not UTF-8")?;
+    let Some(version) = text.split_whitespace().nth(1) else {
+        return Ok(false);
+    };
+    let Ok(version) = semver::Version::parse(version) else {
+        return Ok(false);
+    };
+    let requirement =
+        semver::VersionReq::parse(AGENTCTL_REQUIREMENT).expect("valid agentctl requirement");
+    Ok(requirement.matches(&version))
 }
 
 fn install_agentctl_config(
@@ -2369,9 +3589,7 @@ const CORE_WORKFLOW: &str = include_str!("../../../workflows/core.md");
 fn configured_interview_depth() -> InterviewDepth {
     home_dir()
         .ok()
-        .map(|home| home.join(".ldgr/config.json"))
-        .and_then(|path| fs::read_to_string(path).ok())
-        .and_then(|text| crate::harness_config::parse_harness_config(&text).ok())
+        .and_then(|home| read_ldgr_harness_config(&home))
         .map(|config| config.interview_depth)
         .unwrap_or_default()
 }
@@ -2403,7 +3621,9 @@ pub fn handle_workflow(args: WorkflowArgs) -> anyhow::Result<()> {
 }
 
 pub fn handle_config(args: ConfigArgs) -> anyhow::Result<()> {
-    let config_path = home_dir()?.join(".ldgr/config.json");
+    let home = home_dir()?;
+    let config_path = home.join(".ldgr/config.toml");
+    let legacy_config_path = home.join(".ldgr/config.json");
     match args.command {
         ConfigCommand::Show(show) => {
             let depth = configured_interview_depth();
@@ -2412,6 +3632,7 @@ pub fn handle_config(args: ConfigArgs) -> anyhow::Result<()> {
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
                         "config_path": config_path,
+                        "legacy_config_path": legacy_config_path,
                         "exists": config_path.is_file(),
                         "interview_depth": depth.as_str(),
                     }))?
@@ -2436,26 +3657,21 @@ pub fn handle_config(args: ConfigArgs) -> anyhow::Result<()> {
                     set.value
                 )
             })?;
-            // Preserve every other key in the file, including ones this build
-            // does not know about.
-            let mut document: serde_json::Value = if config_path.is_file() {
-                serde_json::from_str(&fs::read_to_string(&config_path)?)?
-            } else {
-                serde_json::json!({ "schema_version": 1 })
-            };
-            let object = document
-                .as_object_mut()
-                .ok_or_else(|| anyhow::anyhow!("{} is not a JSON object", config_path.display()))?;
-            object.insert(
-                "interview_depth".to_owned(),
-                serde_json::Value::String(depth.as_str().to_owned()),
-            );
-            write_file(
-                &config_path,
-                &format!("{}\n", serde_json::to_string_pretty(&document)?),
-            )?;
+            // Preserve every known field and unknown extension while writing
+            // canonical TOML plus the legacy JSON compatibility mirror.
+            let mut config = read_ldgr_harness_config(&home).unwrap_or_else(|| HarnessConfig {
+                schema_version: crate::harness_config::HARNESS_CONFIG_SCHEMA_VERSION,
+                default_harness: None,
+                interview_depth: InterviewDepth::default(),
+                selected_harnesses: Vec::new(),
+                installed: Vec::new(),
+                extensions: std::collections::BTreeMap::new(),
+            });
+            config.interview_depth = depth;
+            let (config_path, legacy_config_path) = write_harness_config_files(&home, &config)?;
             println!("interview_depth: {} — {}", depth.as_str(), depth.describe());
             println!("wrote {}", config_path.display());
+            println!("wrote {}", legacy_config_path.display());
             Ok(())
         }
     }
@@ -2677,30 +3893,91 @@ pub fn handle_web(db: &Path, artifact_root: &Path, args: WebArgs) -> anyhow::Res
     Ok(())
 }
 
-pub fn handle_loop(
+pub fn handle_loop_entry(db: &Path, artifact_root: &Path, args: LoopArgs) -> anyhow::Result<()> {
+    let project_root = project_root_for_db(db);
+    let attempt = ExecutionAttempt::begin_or_adopt(&project_root)?;
+    let connection = match crate::store::open_store(db) {
+        Ok(connection) => connection,
+        Err(error) => {
+            attempt.record_durable(None, FailureKind::CoreUnavailable, None)?;
+            return Err(error);
+        }
+    };
+    let recovery = reconcile_startup(&connection, &project_root)?;
+    print_startup_recovery_report(&recovery);
+    if recovery.requires_disposition() {
+        attempt.complete();
+        bail!(
+            "startup reconciliation restored interrupted work with blocking error(s) {}; record a disposition before continuing",
+            recovery
+                .blocking_error_ids
+                .iter()
+                .map(i64::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    let detached = matches!(&args.command, LoopCommand::Run(run) if run.detach);
+    let result = handle_loop(&connection, artifact_root, args, attempt.clone());
+    match result {
+        Ok(()) => {
+            if !detached {
+                attempt.complete();
+            }
+            Ok(())
+        }
+        Err(error) => {
+            let failure = classify_launcher_error(&error);
+            attempt.record_durable(Some(&connection), failure, None)?;
+            Err(error)
+        }
+    }
+}
+
+fn classify_launcher_error(error: &anyhow::Error) -> FailureKind {
+    let text = format!("{error:#}");
+    if text.contains("failed to spawn") || text.contains("failed to start detached loop") {
+        FailureKind::Spawn
+    } else if text.contains("failed to wait") || text.contains("reader stopped") {
+        FailureKind::UnexpectedDisappearance
+    } else {
+        FailureKind::Initialization
+    }
+}
+
+fn handle_loop(
     connection: &rusqlite::Connection,
     artifact_root: &Path,
     args: LoopArgs,
+    attempt: ExecutionAttempt,
 ) -> anyhow::Result<()> {
     match args.command {
         LoopCommand::Run(args) => {
             let agent = resolve_loop_agent(&args)?;
             let summary_agent = resolve_summary_agent(&args)?;
             let prompt = resolve_loop_prompt(connection, &args)?;
+            let audit_argv = args
+                .audit_argv
+                .as_deref()
+                .map(parse_argv_json)
+                .transpose()?;
+            if args.project_complete_requested && audit_argv.is_none() {
+                bail!("--audit-argv is required when --project-complete-requested is supplied");
+            }
+            if args.detach {
+                return spawn_detached_loop(artifact_root, &attempt);
+            }
             let options = LoopRuntimeOptions {
                 prompt,
                 agent,
-                audit_argv: args
-                    .audit_argv
-                    .as_deref()
-                    .map(parse_argv_json)
-                    .transpose()?,
+                audit_argv,
                 summary_agent,
                 summary_log: args.summary_log.clone(),
                 project_complete_requested: args.project_complete_requested,
                 dry_run: args.dry_run,
                 stream_agent_output: args.stream_agent_output,
                 agent_timeout: Duration::from_secs(args.agent_timeout_seconds),
+                attempt: attempt.clone(),
             };
             let mut completed_iterations = 0_u32;
             let max_iterations = if args.until_empty {
@@ -2759,16 +4036,83 @@ pub fn handle_loop(
     Ok(())
 }
 
+fn spawn_detached_loop(artifact_root: &Path, attempt: &ExecutionAttempt) -> anyhow::Result<()> {
+    let executable =
+        std::env::current_exe().context("failed to resolve current ldgr executable")?;
+    let child_args = std::env::args_os()
+        .skip(1)
+        .filter(|argument| argument != "--detach")
+        .collect::<Vec<_>>();
+    let logs_root = artifact_root
+        .parent()
+        .unwrap_or_else(|| Path::new(".ldgr"))
+        .join("logs");
+    fs::create_dir_all(&logs_root).with_context(|| {
+        format!(
+            "failed to create detached loop log directory {}",
+            logs_root.display()
+        )
+    })?;
+    let suffix = format!("{}-{}", std::process::id(), timestamp_nanos());
+    let stdout_path = logs_root.join(format!("loop-detached-{suffix}.stdout.log"));
+    let stderr_path = logs_root.join(format!("loop-detached-{suffix}.stderr.log"));
+    let stdout = fs::File::create(&stdout_path)
+        .with_context(|| format!("failed to create {}", stdout_path.display()))?;
+    let stderr = fs::File::create(&stderr_path)
+        .with_context(|| format!("failed to create {}", stderr_path.display()))?;
+
+    let mut command = Command::new(&executable);
+    command
+        .args(child_args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr));
+    configure_child_home(&mut command);
+    attempt.configure_child(&mut command);
+    configure_detached_process(&mut command);
+    let child = command
+        .spawn()
+        .with_context(|| format!("failed to start detached loop via {}", executable.display()))?;
+
+    println!("detached loop pid={}", child.id());
+    println!("stdout: {}", stdout_path.display());
+    println!("stderr: {}", stderr_path.display());
+    println!("status: ldgr context");
+    Ok(())
+}
+
+#[cfg(windows)]
+fn configure_detached_process(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+}
+
+#[cfg(unix)]
+fn configure_detached_process(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    command.process_group(0);
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn configure_detached_process(_command: &mut Command) {}
+
 fn install_core_harness_resources() -> anyhow::Result<()> {
     fs::create_dir_all(".ldgr")?;
+    fs::write(".ldgr/operator-errors.md", CORE_OPERATOR_ERROR_GUIDE)?;
+    fs::write(".ldgr/agent-errors.md", CORE_AGENT_ERROR_GUIDE)?;
     fs::write(
         ".ldgr/harness-setup.md",
         "# LDGR harness setup\n\n\
 ldgr installs one skill, `ldgr`, into your harness's global skill directory. It routes an agent to the CLI; the CLI describes itself from there.\n\n\
 If the skill is not installed, run `ldgr install` (interactive, human-operated) and select your harness. If your harness is not listed, copy the skill directory into whatever global skill path it reads, or point the agent at the CLI directly — `ldgr` works from any shell without a skill.\n\n\
-An agent that has not been given the skill should start with `ldgr status` (or `ldgr init` if no `.ldgr/ldgr.db` exists) and then run `ldgr workflow`.\n",
+An agent that has not been given the skill should start with `ldgr status` (or `ldgr init` if no `.ldgr/ldgr.db` exists) and then run `ldgr workflow`.\n\n\
+LDGR-owned profiles require the paired agentctl/Core release. Run `agentctl discover --json`; if Core compatibility is false, install or roll back both binaries together before starting a loop.\n\n\
+Read `.ldgr/operator-errors.md` for the operator policy and `.ldgr/agent-errors.md` for the agent checkpoint requirements.\n",
     )?;
     println!("wrote harness notes .ldgr/harness-setup.md");
+    println!("wrote error guidance .ldgr/operator-errors.md .ldgr/agent-errors.md");
     Ok(())
 }
 
@@ -2927,6 +4271,21 @@ fn loop_result_failed(result: &LoopRuntimeResult, options: &LoopRuntimeOptions) 
 mod tests {
     use super::*;
 
+    fn install_args_for_telemetry(
+        yes: bool,
+        telemetry: Option<TelemetryInstallChoice>,
+    ) -> InstallArgs {
+        InstallArgs {
+            command: None,
+            harness: Vec::new(),
+            yes,
+            telemetry,
+            no_agentctl: true,
+            interview_depth: None,
+            adapter: Vec::new(),
+        }
+    }
+
     #[test]
     fn telemetry_prompt_requires_an_explicit_yes_or_no() -> anyhow::Result<()> {
         let mut input = std::io::Cursor::new(b"\nmaybe\nNo\n");
@@ -2950,6 +4309,133 @@ mod tests {
             prompt_telemetry_consent(&mut input, &mut output)?,
             TelemetryConsentDecision::Enabled
         );
+        Ok(())
+    }
+
+    #[test]
+    fn telemetry_prompt_can_disable_collection_explicitly() -> anyhow::Result<()> {
+        let mut input = std::io::Cursor::new(b"No\n");
+        let mut output = Vec::new();
+        assert_eq!(
+            prompt_telemetry_consent(&mut input, &mut output)?,
+            TelemetryConsentDecision::Disabled
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn first_interactive_install_records_yes_and_skips_later_prompt() -> anyhow::Result<()> {
+        let ldgr_home = tempfile::tempdir()?;
+        let args = install_args_for_telemetry(false, None);
+        let mut input = std::io::Cursor::new(b"Yes\n");
+        let mut output = Vec::new();
+
+        let consent = resolve_install_telemetry_consent_with_io(
+            &args,
+            ldgr_home.path(),
+            true,
+            &mut input,
+            &mut output,
+        )?;
+
+        assert_eq!(consent.decision, TelemetryConsentDecision::Enabled);
+        assert_eq!(
+            load_telemetry_consent(ldgr_home.path())?.decision,
+            TelemetryConsentDecision::Enabled
+        );
+        let output = String::from_utf8(output)?;
+        assert!(output.contains("Share these sequences? Type Yes or No: "));
+
+        let mut later_input = std::io::Cursor::new(b"");
+        let mut later_output = Vec::new();
+        let later = resolve_install_telemetry_consent_with_io(
+            &args,
+            ldgr_home.path(),
+            true,
+            &mut later_input,
+            &mut later_output,
+        )?;
+
+        assert_eq!(later.decision, TelemetryConsentDecision::Enabled);
+        assert!(String::from_utf8(later_output)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn first_interactive_install_records_no_after_blank_reprompt() -> anyhow::Result<()> {
+        let ldgr_home = tempfile::tempdir()?;
+        let args = install_args_for_telemetry(false, None);
+        let mut input = std::io::Cursor::new(b"\nNo\n");
+        let mut output = Vec::new();
+
+        let consent = resolve_install_telemetry_consent_with_io(
+            &args,
+            ldgr_home.path(),
+            true,
+            &mut input,
+            &mut output,
+        )?;
+
+        assert_eq!(consent.decision, TelemetryConsentDecision::Disabled);
+        assert_eq!(
+            load_telemetry_consent(ldgr_home.path())?.decision,
+            TelemetryConsentDecision::Disabled
+        );
+        let output = String::from_utf8(output)?;
+        assert!(output.contains("Please enter Yes or No. No option is preselected."));
+        assert_eq!(output.matches("Share these sequences?").count(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn non_interactive_install_requires_telemetry_flag_and_yes_is_not_consent() -> anyhow::Result<()>
+    {
+        let ldgr_home = tempfile::tempdir()?;
+        let mut input = std::io::Cursor::new(b"Yes\n");
+        let mut output = Vec::new();
+        let yes_without_telemetry = install_args_for_telemetry(true, None);
+
+        let error = resolve_install_telemetry_consent_with_io(
+            &yes_without_telemetry,
+            ldgr_home.path(),
+            false,
+            &mut input,
+            &mut output,
+        )
+        .expect_err("--yes must not provide telemetry consent");
+
+        let message = format!("{error:#}");
+        assert!(message.contains("telemetry choice required"));
+        assert!(message.contains("--yes` is not telemetry consent"));
+        assert!(!ldgr_home.path().join("telemetry-consent.json").exists());
+
+        let explicit_disable =
+            install_args_for_telemetry(false, Some(TelemetryInstallChoice::Disable));
+        let mut flag_input = std::io::Cursor::new(b"");
+        let mut flag_output = Vec::new();
+        let disabled = resolve_install_telemetry_consent_with_io(
+            &explicit_disable,
+            ldgr_home.path(),
+            false,
+            &mut flag_input,
+            &mut flag_output,
+        )?;
+        assert_eq!(disabled.decision, TelemetryConsentDecision::Disabled);
+        assert!(String::from_utf8(flag_output)?.is_empty());
+
+        let explicit_enable =
+            install_args_for_telemetry(true, Some(TelemetryInstallChoice::Enable));
+        let mut enable_input = std::io::Cursor::new(b"");
+        let mut enable_output = Vec::new();
+        let enabled = resolve_install_telemetry_consent_with_io(
+            &explicit_enable,
+            ldgr_home.path(),
+            false,
+            &mut enable_input,
+            &mut enable_output,
+        )?;
+        assert_eq!(enabled.decision, TelemetryConsentDecision::Enabled);
+        assert!(String::from_utf8(enable_output)?.is_empty());
         Ok(())
     }
 
@@ -3153,7 +4639,8 @@ prompt_stdin = true
     fn source_root_install_patches_adapter_argv_to_cargo_runner() -> anyhow::Result<()> {
         let install_root = tempfile::tempdir()?;
         let source_root = tempfile::tempdir()?;
-        std::fs::write(source_root.path().join("Cargo.toml"), "[workspace]\n")?;
+        let cargo_manifest = source_root.path().join("Cargo.toml");
+        std::fs::write(&cargo_manifest, "[workspace]\n")?;
         std::fs::write(
             install_root.path().join("adapter.toml"),
             r#"[adapter]
@@ -3169,25 +4656,305 @@ argv = ["ldgr-conduct", "status"]
 "#,
         )?;
 
-        patch_adapter_argv_to_source_runner(
-            install_root.path(),
-            "ldgr-conduct",
-            source_root.path(),
-        )?;
+        patch_adapter_argv_to_source_runner(install_root.path(), "ldgr-conduct", &cargo_manifest)?;
         let manifest = std::fs::read_to_string(install_root.path().join("adapter.toml"))?;
         assert!(manifest.contains("argv = [\"cargo\", \"run\", \"--quiet\", \"--manifest-path\""));
-        assert!(manifest.contains(&format!(
-            "\"{}\"",
-            source_root.path().join("Cargo.toml").display()
-        )));
         assert!(manifest.contains("\"--target-dir\""));
-        assert!(manifest.contains(&format!(
-            "\"{}\"",
-            install_root.path().join("source-target").display()
-        )));
         assert!(manifest.contains("\"-p\", \"ldgr-conduct\", \"--\"]"));
         assert!(manifest.contains("\"--\", \"status\"]"));
-        toml::from_str::<toml::Value>(&manifest).expect("patched manifest should parse as TOML");
+        let parsed: toml::Value =
+            toml::from_str(&manifest).expect("patched manifest should parse as TOML");
+        let commands = parsed["commands"]
+            .as_array()
+            .expect("commands should be an array");
+        let argv = commands[0]["argv"]
+            .as_array()
+            .expect("argv should be an array")
+            .iter()
+            .map(|value| value.as_str().expect("argv entries should be strings"))
+            .collect::<Vec<_>>();
+        assert_eq!(argv[4], cargo_manifest.to_string_lossy());
+        assert_eq!(
+            argv[6],
+            install_root.path().join("source-target").to_string_lossy()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn source_install_receipt_tracks_identity_files_invocations_and_boundaries(
+    ) -> anyhow::Result<()> {
+        let source_root = tempfile::tempdir()?;
+        let install_root = tempfile::tempdir()?;
+        let home = tempfile::tempdir()?;
+        let source_manifest = r#"[adapter]
+slug = "example"
+
+[[commands]]
+namespace = "example"
+argv = ["ldgr-example-adapter"]
+
+[[tools]]
+name = "example-summary"
+argv = ["ldgr-example-adapter", "manifest-summary"]
+"#;
+        std::fs::write(source_root.path().join("adapter.toml"), source_manifest)?;
+        std::fs::write(
+            source_root.path().join("Cargo.toml"),
+            "[package]\nname = \"ldgr-example-adapter\"\nversion = \"0.0.0\"\n",
+        )?;
+        std::fs::write(
+            source_root.path().join("adapter-resources.json"),
+            "{\"schema_version\":1,\"resources\":[]}",
+        )?;
+        std::fs::create_dir_all(install_root.path().join("prompts"))?;
+        std::fs::write(install_root.path().join("adapter.toml"), source_manifest)?;
+        std::fs::write(
+            install_root.path().join("adapter-resources.json"),
+            "{\"schema_version\":1,\"resources\":[]}",
+        )?;
+        std::fs::write(
+            install_root.path().join("prompts/example.md"),
+            "tracked prompt",
+        )?;
+        let source = AdapterSourcePackage {
+            bundle_root: source_root.path().canonicalize()?,
+            cargo_manifest: source_root.path().canonicalize()?.join("Cargo.toml"),
+        };
+        patch_adapter_argv_to_source_runner(
+            install_root.path(),
+            "ldgr-example-adapter",
+            &source.cargo_manifest,
+        )?;
+        let plan = source_harness_resource_plan(install_root.path(), home.path())?;
+        install_source_harness_resources(&plan)?;
+        let marker = home.path().join(".ldgr/installed-adapters/example");
+        write_file(
+            &marker,
+            &format!(
+                "install_root={}\ninstall_kind=local_source\n",
+                install_root.path().display()
+            ),
+        )?;
+        write_source_installation_receipt(
+            "example",
+            "ldgr-example-adapter",
+            &source,
+            install_root.path(),
+            &marker,
+            &plan,
+        )?;
+
+        let value: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(
+            install_root.path().join("installation-receipt.json"),
+        )?)?;
+        let AdapterInstallationReceipt::Source(receipt) =
+            parse_adapter_installation_receipt(value)?
+        else {
+            panic!("expected a local source receipt");
+        };
+        assert_eq!(receipt.install_kind, "local_source");
+        assert!(!receipt.verified_release);
+        assert!(!receipt.ownership.source_checkout_owned);
+        assert_eq!(receipt.ownership.generated_paths, ["source-target"]);
+        assert_eq!(receipt.source.package, "ldgr-example-adapter");
+        assert_eq!(receipt.executable_invocations.len(), 2);
+        assert_eq!(receipt.executable_invocations[0].kind, "namespace");
+        assert_eq!(receipt.executable_invocations[0].name, "example");
+        assert_eq!(receipt.executable_invocations[0].argv[0], "cargo");
+        assert_eq!(receipt.executable_invocations[1].kind, "tool");
+        assert_eq!(receipt.executable_invocations[1].name, "example-summary");
+        assert!(receipt
+            .manifest_digests
+            .source_resource_manifest_sha256
+            .is_some());
+        assert!(receipt
+            .manifest_digests
+            .installed_resource_manifest_sha256
+            .is_some());
+        assert!(receipt
+            .installed_files
+            .iter()
+            .any(|file| file.path == "adapter.toml"));
+        assert!(receipt
+            .installed_files
+            .iter()
+            .any(|file| file.path == "prompts/example.md"));
+        assert_eq!(receipt.owned_resources.len(), 1);
+        assert!(source_receipt_drift(install_root.path(), home.path(), &receipt)?.is_empty());
+
+        std::fs::create_dir_all(install_root.path().join("source-target/debug"))?;
+        std::fs::write(
+            install_root.path().join("source-target/debug/cache"),
+            "generated",
+        )?;
+        assert!(source_receipt_drift(install_root.path(), home.path(), &receipt)?.is_empty());
+
+        std::fs::write(
+            install_root.path().join("prompts/example.md"),
+            "locally modified",
+        )?;
+        let drift = source_receipt_drift(install_root.path(), home.path(), &receipt)?;
+        assert!(drift
+            .iter()
+            .any(|path| path.ends_with("prompts/example.md")));
+        Ok(())
+    }
+
+    #[test]
+    fn source_receipt_never_authorizes_external_removal_outside_harness_roots() -> anyhow::Result<()>
+    {
+        let install_root = tempfile::tempdir()?;
+        let source_root = tempfile::tempdir()?;
+        let home = tempfile::tempdir()?;
+        std::fs::write(install_root.path().join("adapter.toml"), "[adapter]\n")?;
+        let outside = tempfile::NamedTempFile::new()?;
+        let receipt = crate::release_index::SourceInstallationReceipt {
+            schema_version: 1,
+            install_kind: "local_source".to_owned(),
+            domain: "example".to_owned(),
+            installed_at_unix_seconds: 0,
+            source: crate::release_index::SourceInstallIdentity {
+                package: "ldgr-example-adapter".to_owned(),
+                bundle_root: source_root.path().display().to_string(),
+                cargo_manifest: source_root.path().join("Cargo.toml").display().to_string(),
+                bundle_sha256: "digest".to_owned(),
+            },
+            manifest_digests: crate::release_index::SourceManifestDigests {
+                source_adapter_manifest_sha256: "digest".to_owned(),
+                source_cargo_manifest_sha256: "digest".to_owned(),
+                installed_adapter_manifest_sha256: digest_path(
+                    &install_root.path().join("adapter.toml"),
+                )?,
+                source_resource_manifest_sha256: None,
+                installed_resource_manifest_sha256: None,
+            },
+            installer_invocation: vec!["cargo".to_owned()],
+            executable_invocations: Vec::new(),
+            installed_files: vec![crate::release_index::OwnedResource {
+                path: "adapter.toml".to_owned(),
+                sha256: digest_path(&install_root.path().join("adapter.toml"))?,
+            }],
+            owned_resources: vec![crate::release_index::OwnedResource {
+                path: outside.path().display().to_string(),
+                sha256: digest_path(outside.path())?,
+            }],
+            ownership: crate::release_index::SourceOwnershipBoundaries {
+                install_root: install_root.path().canonicalize()?.display().to_string(),
+                marker_path: home
+                    .path()
+                    .join(".ldgr/installed-adapters/example")
+                    .display()
+                    .to_string(),
+                source_checkout_owned: false,
+                generated_paths: vec!["source-target".to_owned()],
+                external_resource_roots: vec![outside
+                    .path()
+                    .parent()
+                    .expect("temporary file parent")
+                    .display()
+                    .to_string()],
+            },
+            verified_release: false,
+        };
+
+        let error = verify_source_receipt_boundaries(install_root.path(), home.path(), &receipt)
+            .expect_err("outside resource must be rejected");
+        assert!(error
+            .to_string()
+            .contains("not a currently configured harness boundary"));
+        assert!(outside.path().is_file());
+        Ok(())
+    }
+
+    #[test]
+    fn source_identity_digest_ignores_build_caches_but_tracks_source_changes() -> anyhow::Result<()>
+    {
+        let source = tempfile::tempdir()?;
+        std::fs::write(source.path().join("Cargo.toml"), "[package]\nname='demo'\n")?;
+        std::fs::create_dir_all(source.path().join("src"))?;
+        std::fs::write(source.path().join("src/main.rs"), "fn main() {}\n")?;
+        let original = digest_source_bundle(source.path())?;
+
+        std::fs::create_dir_all(source.path().join("target/debug"))?;
+        std::fs::write(source.path().join("target/debug/cache"), "generated")?;
+        assert_eq!(digest_source_bundle(source.path())?, original);
+
+        std::fs::write(
+            source.path().join("src/main.rs"),
+            "fn main() { println!(); }\n",
+        )?;
+        assert_ne!(digest_source_bundle(source.path())?, original);
+        Ok(())
+    }
+
+    #[test]
+    fn source_root_resolves_nested_standalone_adapter_workspace() -> anyhow::Result<()> {
+        let checkout = tempfile::tempdir()?;
+        let adapter_root = checkout.path().join("ldgr-example-adapter");
+        std::fs::create_dir(&adapter_root)?;
+        std::fs::write(
+            adapter_root.join("adapter.toml"),
+            "[adapter]\nslug = \"example\"\n",
+        )?;
+        std::fs::write(
+            adapter_root.join("Cargo.toml"),
+            "[package]\nname = \"ldgr-example-adapter\"\nversion = \"0.0.0\"\n\n[workspace]\n",
+        )?;
+
+        let resolved = resolve_adapter_source_package("ldgr-example-adapter", checkout.path())?;
+
+        assert_eq!(resolved.bundle_root, adapter_root.canonicalize()?);
+        assert_eq!(
+            resolved.cargo_manifest,
+            adapter_root.canonicalize()?.join("Cargo.toml")
+        );
+        let install_root = checkout.path().join("installed");
+        let command =
+            source_adapter_install_command("ldgr-example-adapter", &resolved, &install_root);
+        let args = command.get_args().collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            [
+                "run".as_ref(),
+                "--manifest-path".as_ref(),
+                resolved.cargo_manifest.as_os_str(),
+                "-p".as_ref(),
+                "ldgr-example-adapter".as_ref(),
+                "--".as_ref(),
+                "adapter".as_ref(),
+                "install".as_ref(),
+                "--install-root".as_ref(),
+                install_root.as_os_str(),
+                "--print-path".as_ref(),
+            ]
+        );
+        assert_eq!(
+            command.get_current_dir(),
+            Some(resolved.bundle_root.as_path())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn source_root_accepts_standalone_adapter_checkout() -> anyhow::Result<()> {
+        let checkout = tempfile::tempdir()?;
+        std::fs::write(
+            checkout.path().join("adapter.toml"),
+            "[adapter]\nslug = \"example\"\n",
+        )?;
+        std::fs::write(
+            checkout.path().join("Cargo.toml"),
+            "[package]\nname = \"ldgr-example-adapter\"\nversion = \"0.0.0\"\n\n[workspace]\n",
+        )?;
+
+        let resolved = resolve_adapter_source_package("ldgr-example-adapter", checkout.path())?;
+
+        assert_eq!(resolved.bundle_root, checkout.path().canonicalize()?);
+        assert_eq!(
+            resolved.cargo_manifest,
+            checkout.path().canonicalize()?.join("Cargo.toml")
+        );
         Ok(())
     }
 

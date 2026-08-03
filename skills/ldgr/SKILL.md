@@ -29,6 +29,11 @@ ldgr context
 Then run `ldgr workflow` to learn how to work this project, and
 `ldgr <adapter> workflow` for an installed adapter.
 
+Read `.ldgr/agent-errors.md` when present. Errors are first-class causal
+records: checkpoint after unexpected behavior, user corrections, process
+handoff, and before exit. Record accepted-operation failures before retrying;
+repeated errors require prior context and an explicit disposition.
+
 ## Do not run these
 
 `ldgr install` and `ldgr adapter install` are interactive and intended for the

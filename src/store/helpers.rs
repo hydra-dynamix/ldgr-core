@@ -1,4 +1,7 @@
 use super::*;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static MIGRATION_BACKUP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MigrationBackupInfo {
@@ -46,11 +49,35 @@ pub fn open_store_with_migration_info(
             );
         }
     }
+    if db_path.is_file() {
+        let inspection =
+            Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .with_context(|| {
+                    format!(
+                        "failed to inspect SQLite database {} without mutation",
+                        db_path.display()
+                    )
+                })?;
+        preflight_schema_migration(&inspection).with_context(|| {
+            format!("read-only schema inspection rejected {}", db_path.display())
+        })?;
+    }
     let connection = open_configured_connection(db_path)?;
     let migration_origin = preflight_schema_migration(&connection)?;
-    let backup = migration_origin
-        .map(|origin| create_migration_backup(&connection, db_path, origin))
-        .transpose()?;
+    let backup = if migration_origin.is_some() {
+        in_migration_transaction(&connection, |connection| {
+            let Some(origin) = preflight_schema_migration(connection)? else {
+                return Ok(None);
+            };
+            let backup = create_migration_backup(connection, db_path, origin)?;
+            apply_pending_schema_migrations_in_locked_transaction(connection)?;
+            record_schema_migration_event(connection, &backup)?;
+            crate::fault_injection::crash_if("automatic-migration");
+            Ok(Some(backup))
+        })?
+    } else {
+        None
+    };
     if let Err(error) = ensure_schema(&connection) {
         if let Some(backup) = backup {
             return Err(error).with_context(|| {
@@ -64,6 +91,29 @@ pub fn open_store_with_migration_info(
     }
     verify_connection_integrity(&connection)?;
     Ok((connection, backup))
+}
+
+fn record_schema_migration_event(
+    connection: &Connection,
+    migration: &MigrationBackupInfo,
+) -> anyhow::Result<()> {
+    connection
+        .execute(
+            "INSERT INTO event_log (entity_type, entity_id, event_type, payload_json)
+             VALUES ('schema', ?1, 'migration', ?2)",
+            params![
+                migration.to_schema_version,
+                serde_json::to_string(&serde_json::json!({
+                    "from_schema_version": migration.from_schema_version,
+                    "to_schema_version": migration.to_schema_version,
+                    "contract_hash": migration.contract_hash,
+                    "verified_backup": migration.backup,
+                    "created_at_epoch_seconds": migration.created_at_epoch_seconds,
+                }))?
+            ],
+        )
+        .context("failed to record Core schema migration event")?;
+    Ok(())
 }
 
 pub fn open_store_for_adapter(
@@ -112,14 +162,40 @@ fn open_configured_connection(db_path: &Path) -> anyhow::Result<Connection> {
     connection
         .pragma_update(None, "busy_timeout", 5000)
         .context("failed to set SQLite busy timeout")?;
-    let _granted_mode: String = connection
-        .pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0))
-        .context("failed to negotiate SQLite journal mode")?;
+    negotiate_wal_mode(&connection)?;
     Ok(connection)
 }
 
-fn create_migration_backup(
-    connection: &Connection,
+fn negotiate_wal_mode(connection: &Connection) -> anyhow::Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match connection
+            .pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get::<_, String>(0))
+        {
+            Ok(mode) => {
+                anyhow::ensure!(
+                    mode.eq_ignore_ascii_case("wal"),
+                    "SQLite refused WAL journal mode and returned {mode}"
+                );
+                return Ok(());
+            }
+            Err(rusqlite::Error::SqliteFailure(sqlite, _))
+                if matches!(
+                    sqlite.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                ) && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Err(error) => {
+                return Err(error).context("failed to negotiate SQLite journal mode");
+            }
+        }
+    }
+}
+
+pub(crate) fn create_migration_backup(
+    _connection: &Connection,
     db_path: &Path,
     from_schema_version: i64,
 ) -> anyhow::Result<MigrationBackupInfo> {
@@ -136,46 +212,65 @@ fn create_migration_backup(
         .and_then(|name| name.to_str())
         .unwrap_or("ldgr.db");
     let backup = db_path.with_file_name(format!(
-        "{file_name}.backup-schema-v{from_schema_version}-to-v{}-{created_at_epoch_seconds}-{}.sqlite3",
+        "{file_name}.backup-schema-v{from_schema_version}-to-v{}-{created_at_epoch_seconds}-{}-{}.sqlite3",
         CURRENT_SCHEMA_VERSION,
-        std::process::id()
+        std::process::id(),
+        MIGRATION_BACKUP_SEQUENCE.fetch_add(1, Ordering::Relaxed),
     ));
-    let mut destination = Connection::open(&backup)
-        .with_context(|| format!("failed to create migration backup {}", backup.display()))?;
-    {
-        let backup_operation = rusqlite::backup::Backup::new(connection, &mut destination)
-            .context("failed to initialize SQLite migration backup")?;
-        backup_operation
-            .run_to_completion(128, std::time::Duration::from_millis(10), None)
-            .context("failed to copy SQLite migration backup")?;
-    }
-    verify_connection_integrity(&destination).with_context(|| {
-        format!(
-            "migration backup {} failed integrity validation",
-            backup.display()
-        )
-    })?;
-    let backed_up_version = current_schema_version(&destination)?;
-    anyhow::ensure!(
-        backed_up_version == from_schema_version,
-        "migration backup schema version {backed_up_version} does not match source {from_schema_version}"
-    );
-    let info = MigrationBackupInfo {
-        source: db_path.to_path_buf(),
-        backup: backup.clone(),
-        from_schema_version,
-        to_schema_version: CURRENT_SCHEMA_VERSION,
-        contract_hash: crate::database_contract::DATABASE_CONTRACT_HASH.to_string(),
-        created_at_epoch_seconds,
-    };
     let metadata_path = backup.with_extension("json");
-    fs::write(&metadata_path, serde_json::to_vec_pretty(&info)?).with_context(|| {
-        format!(
-            "failed to record migration backup {}",
-            metadata_path.display()
-        )
-    })?;
-    Ok(info)
+    let result = (|| {
+        // The migration connection already owns the exclusive write lock. Use
+        // a second read-only WAL snapshot so the lock remains held across
+        // backup verification and migration.
+        let source =
+            Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .with_context(|| {
+                    format!(
+                        "failed to open migration backup source {}",
+                        db_path.display()
+                    )
+                })?;
+        let mut destination = Connection::open(&backup)
+            .with_context(|| format!("failed to create migration backup {}", backup.display()))?;
+        {
+            let backup_operation = rusqlite::backup::Backup::new(&source, &mut destination)
+                .context("failed to initialize SQLite migration backup")?;
+            backup_operation
+                .run_to_completion(128, std::time::Duration::from_millis(10), None)
+                .context("failed to copy SQLite migration backup")?;
+        }
+        verify_connection_integrity(&destination).with_context(|| {
+            format!(
+                "migration backup {} failed integrity validation",
+                backup.display()
+            )
+        })?;
+        let backed_up_version = current_schema_version(&destination)?;
+        anyhow::ensure!(
+            backed_up_version == from_schema_version,
+            "migration backup schema version {backed_up_version} does not match source {from_schema_version}"
+        );
+        let info = MigrationBackupInfo {
+            source: db_path.to_path_buf(),
+            backup: backup.clone(),
+            from_schema_version,
+            to_schema_version: CURRENT_SCHEMA_VERSION,
+            contract_hash: crate::database_contract::DATABASE_CONTRACT_HASH.to_string(),
+            created_at_epoch_seconds,
+        };
+        fs::write(&metadata_path, serde_json::to_vec_pretty(&info)?).with_context(|| {
+            format!(
+                "failed to record migration backup {}",
+                metadata_path.display()
+            )
+        })?;
+        Ok(info)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&backup);
+        let _ = fs::remove_file(&metadata_path);
+    }
+    result
 }
 
 fn verify_connection_integrity(connection: &Connection) -> anyhow::Result<()> {

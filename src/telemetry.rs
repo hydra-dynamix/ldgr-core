@@ -6,6 +6,7 @@ use anyhow::{bail, Context};
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 
+pub mod adapter_conformance;
 pub mod buffer;
 pub mod serializer;
 pub mod transition;
@@ -15,7 +16,7 @@ pub const TELEMETRY_CONSENT_SCHEMA_VERSION: u32 = 1;
 pub const TELEMETRY_CONSENT_POLICY_VERSION: u32 = 1;
 pub const TELEMETRY_CONSENT_FILE: &str = "telemetry-consent.json";
 pub const TELEMETRY_PENDING_DIRECTORY: &str = "telemetry-pending";
-pub const NUMERICAL_SEQUENCE_PROTOCOLS_V1: &[&str] = &["core-work/v1"];
+pub const NUMERICAL_SEQUENCE_PROTOCOLS_V1: &[&str] = &["core-work/v1", "research-workflow/v1"];
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]

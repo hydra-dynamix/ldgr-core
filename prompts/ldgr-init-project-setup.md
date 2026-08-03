@@ -4,6 +4,11 @@
 
 Initialize LDGR around the smallest useful loop: one work item, one run, observations/artifacts from that run, and one decision about what happens next. Capture only enough context for the next agent or human to continue without guessing.
 
+LDGR-owned agent profiles require a paired launcher/Core release. Before
+starting a loop, `agentctl discover --json` should report
+`core_compatibility.compatible` as true. Agentctl 0.1.2 requires LDGR Core
+0.1.13; install or roll back both binaries together when negotiation fails.
+
 ## Required setup steps
 
 ### 1. Use the captured project context
@@ -25,6 +30,13 @@ Repository outline from `dev walk . --stdout --no-content`:
 Read additional files only when this outline is insufficient to choose the first bounded work item. Run `ldgr status` for the agent on-ramp; expand to `ldgr context` only when full cockpit detail is needed.
 
 `ldgr init` also installs `.pi/extensions/ldgr-context.ts` for Pi-compatible harnesses. Identify the current harness. If it is Pi, run `/reload` when appropriate and use `/ldgr <args>` to run LDGR CLI commands and pipe stdout/stderr into the conversation; `/ldgr` with no args and `/ldgr-context` both capture `ldgr context --brief`. If the harness cannot load Pi extensions, read `.ldgr/harness-setup.md`; extension commands will not work, but `ldgr ...` remains available from the shell.
+
+Read `.ldgr/operator-errors.md` and `.ldgr/agent-errors.md`. Errors are
+first-class causal records. Record failures, interruptions, validation errors,
+and other unexpected behavior after an operation was accepted. Checkpoint
+durable state after unexpected behavior, after a user correction, at process
+handoff, and before exit; repeated errors require surfaced prior context and an
+explicit disposition before an unchanged retry.
 
 ### 2. Identify the first loop
 

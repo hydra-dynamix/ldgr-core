@@ -1,0 +1,20 @@
+{
+  "format": "ldgr.schedule.v1",
+  "work_items": [
+    {
+      "slug": "imported-base",
+      "title": "Imported base",
+      "description": "Imported schedule base item.",
+      "priority": "P2",
+      "program": "e2e"
+    },
+    {
+      "slug": "imported-child",
+      "title": "Imported child",
+      "description": "Imported schedule dependent item.",
+      "priority": "P2",
+      "program": "e2e",
+      "dependencies": ["imported-base"]
+    }
+  ]
+}

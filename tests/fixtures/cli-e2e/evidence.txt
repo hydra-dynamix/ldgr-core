@@ -1,0 +1,1 @@
+This is a benign artifact fixture for the maintained LDGR CLI E2E matrix.

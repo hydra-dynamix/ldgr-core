@@ -16,38 +16,176 @@ use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 #[test]
-fn init_status_and_context_migrate_released_v1_databases_and_report_the_backup(
+fn init_status_and_context_migrate_every_supported_legacy_schema_to_the_error_schema(
 ) -> anyhow::Result<()> {
-    for entrypoint in [["status"], ["context"], ["init"]] {
+    for legacy_version in 1..=4 {
+        for entrypoint in [["status"], ["context"], ["init"]] {
+            let project = TempDir::new()?;
+            let db_path = project.path().join(".ldgr/ldgr.db");
+            let artifact_root = project.path().join(".ldgr/artifacts");
+            run(project.path(), &db_path, &artifact_root, ["init"])?;
+            let preserved_id = 4_500 + legacy_version;
+            let connection = Connection::open(&db_path)?;
+            connection.execute(
+                "INSERT INTO work_item (id, slug, title, description)
+                 VALUES (?1, ?2, ?3, 'Causal ID must survive automatic migration')",
+                (
+                    preserved_id,
+                    format!("preserved-v{legacy_version}"),
+                    format!("Preserved v{legacy_version} work"),
+                ),
+            )?;
+            downgrade_cli_fixture(&connection, legacy_version)?;
+            drop(connection);
+
+            command(project.path(), &db_path, &artifact_root, entrypoint)?
+                .assert()
+                .success()
+                .stderr(predicate::str::contains(format!(
+                    "migration: LDGR Core upgraded schema v{legacy_version} -> v5; verified backup:"
+                )));
+
+            let connection = Connection::open(&db_path)?;
+            let version: i64 = connection.query_row(
+                "SELECT version FROM schema_version WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )?;
+            assert_eq!(version, 5);
+            let migrated_id: i64 = connection.query_row(
+                "SELECT id FROM work_item WHERE slug=?1",
+                [format!("preserved-v{legacy_version}")],
+                |row| row.get(0),
+            )?;
+            assert_eq!(migrated_id, preserved_id);
+            let error_tables: i64 = connection.query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type='table'
+                   AND name IN ('error_record', 'error_occurrence', 'error_relation',
+                                'error_transition', 'error_disposition')",
+                [],
+                |row| row.get(0),
+            )?;
+            assert_eq!(error_tables, 5);
+            let migration_payload: String = connection.query_row(
+                "SELECT payload_json FROM event_log
+                 WHERE entity_type='schema' AND event_type='migration'
+                 ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )?;
+            let migration_payload: serde_json::Value = serde_json::from_str(&migration_payload)?;
+            assert_eq!(migration_payload["from_schema_version"], legacy_version);
+            assert_eq!(migration_payload["to_schema_version"], 5);
+            let backup_marker = format!("backup-schema-v{legacy_version}-to-v5");
+            assert!(migration_payload["verified_backup"]
+                .as_str()
+                .is_some_and(|path| path.contains(&backup_marker)));
+            assert!(fs::read_dir(db_path.parent().unwrap())?.any(|entry| {
+                entry
+                    .is_ok_and(|entry| entry.file_name().to_string_lossy().contains(&backup_marker))
+            }));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn init_status_and_context_reconcile_project_recovery_inbox() -> anyhow::Result<()> {
+    for (index, entrypoint) in ["init", "status", "context"].into_iter().enumerate() {
         let project = TempDir::new()?;
         let db_path = project.path().join(".ldgr/ldgr.db");
         let artifact_root = project.path().join(".ldgr/artifacts");
         run(project.path(), &db_path, &artifact_root, ["init"])?;
-        downgrade_cli_fixture_to_v1(&db_path)?;
+        let occurrence = format!("0198f100-0000-7000-8000-{index:012x}");
+        write_startup_recovery_fixture(
+            project.path(),
+            &db_path,
+            &occurrence,
+            serde_json::json!({}),
+        )?;
 
-        command(project.path(), &db_path, &artifact_root, entrypoint)?
+        command(project.path(), &db_path, &artifact_root, [entrypoint])?
             .assert()
             .success()
             .stderr(predicate::str::contains(
-                "migration: LDGR Core upgraded schema v1 -> v2; verified backup:",
+                "startup recovery: imported=1 replayed=0 archived=1",
             ));
 
         let connection = Connection::open(&db_path)?;
-        let version: i64 = connection.query_row(
-            "SELECT version FROM schema_version WHERE id = 1",
-            [],
+        let imported: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM error_occurrence WHERE occurrence_id=?1",
+            [&occurrence],
             |row| row.get(0),
         )?;
-        assert_eq!(version, 2);
-        assert!(fs::read_dir(db_path.parent().unwrap())?.any(|entry| {
-            entry.is_ok_and(|entry| {
-                entry
-                    .file_name()
-                    .to_string_lossy()
-                    .contains("backup-schema-v1-to-v2")
-            })
-        }));
+        assert_eq!(imported, 1, "{entrypoint} did not import recovery record");
+        assert!(project
+            .path()
+            .join(".ldgr/recovery/archive/spooled.json")
+            .is_file());
     }
+    Ok(())
+}
+
+#[test]
+fn loop_startup_imports_related_emergency_error_and_requires_disposition() -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    let db_path = project.path().join(".ldgr/ldgr.db");
+    let artifact_root = project.path().join(".ldgr/artifacts");
+    run(project.path(), &db_path, &artifact_root, ["init"])?;
+    run(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        [
+            "work",
+            "create",
+            "recovery-block",
+            "--title",
+            "Recovery block",
+            "--description",
+            "Do not launch a worker before disposition.",
+        ],
+    )?;
+    run(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        ["run", "start", "recovery-block", "--command", "agentctl"],
+    )?;
+    write_startup_recovery_fixture(
+        project.path(),
+        &db_path,
+        "0198f100-0000-7000-8000-000000000010",
+        serde_json::json!({"run_id": 1}),
+    )?;
+    let prompt_path = project.path().join("loop-prompt.md");
+    fs::write(&prompt_path, "{{ldgr_context}}")?;
+
+    command(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        [
+            "loop",
+            "run",
+            "--prompt",
+            prompt_path.to_str().expect("prompt path is UTF-8"),
+            "--agent-argv",
+            r#"["worker-must-not-start"]"#,
+        ],
+    )?
+    .assert()
+    .failure()
+    .stderr(predicate::str::contains(
+        "record a disposition before continuing",
+    ));
+    assert!(
+        fs::read_dir(project.path().join(".ldgr/recovery/inbox"))?
+            .filter_map(Result::ok)
+            .all(|entry| !entry.path().to_string_lossy().contains(".intent.json")),
+        "blocked loop startup must close its own preflight intent"
+    );
     Ok(())
 }
 
@@ -69,8 +207,8 @@ fn explicit_migrate_command_returns_machine_readable_result() -> anyhow::Result<
     .success()
     .stdout(predicate::str::contains("\"migrated\": true"))
     .stdout(predicate::str::contains("\"from_schema_version\": 1"))
-    .stdout(predicate::str::contains("\"to_schema_version\": 2"))
-    .stdout(predicate::str::contains("backup-schema-v1-to-v2"));
+    .stdout(predicate::str::contains("\"to_schema_version\": 5"))
+    .stdout(predicate::str::contains("backup-schema-v1-to-v5"));
     Ok(())
 }
 
@@ -210,16 +348,64 @@ fn first_install_requires_explicit_telemetry_choice_and_remembers_no() -> anyhow
         "--telemetry",
         "disable",
     ]);
-    decline.assert().success();
+    decline
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("sequence collection: disabled"))
+        .stdout(predicate::str::contains("Share these sequences?").not())
+        .stdout(predicate::str::contains("disable: ldgr telemetry disable").not());
     let consent: serde_json::Value = serde_json::from_str(&fs::read_to_string(&consent_path)?)?;
     assert_eq!(consent["decision"], "disabled");
     assert!(home.join(".ldgr/config.json").is_file());
+    assert!(home.join(".ldgr/config.toml").is_file());
 
     let mut reinstall = isolated_command(project.path())?;
     reinstall.args(["install", "--harness", "codex", "--yes", "--no-agentctl"]);
-    reinstall.assert().success();
+    reinstall
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Share these sequences?").not());
     let remembered: serde_json::Value = serde_json::from_str(&fs::read_to_string(&consent_path)?)?;
     assert_eq!(remembered["decision"], "disabled");
+    Ok(())
+}
+
+#[test]
+fn install_writes_canonical_toml_and_keeps_legacy_json_in_sync() -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    let home = project.path().join(".ldgr/test-empty-home");
+    let mut install = isolated_command(project.path())?;
+    install.args([
+        "install",
+        "--harness",
+        "codex",
+        "--harness",
+        "claude",
+        "--yes",
+        "--no-agentctl",
+        "--telemetry",
+        "disable",
+    ]);
+    install.assert().success();
+
+    let toml_path = home.join(".ldgr/config.toml");
+    let json_path = home.join(".ldgr/config.json");
+    let canonical: toml::Value = toml::from_str(&fs::read_to_string(&toml_path)?)?;
+    let legacy: serde_json::Value = serde_json::from_str(&fs::read_to_string(&json_path)?)?;
+    assert_eq!(canonical["default_harness"].as_str(), Some("codex"));
+    assert_eq!(canonical["selected_harnesses"][1].as_str(), Some("claude"));
+    assert_eq!(legacy["default_harness"], "codex");
+    assert_eq!(legacy["selected_harnesses"][1], "claude");
+
+    let mut update = isolated_command(project.path())?;
+    update.args(["config", "set", "interview-depth", "low"]);
+    update.assert().success();
+    let canonical: toml::Value = toml::from_str(&fs::read_to_string(&toml_path)?)?;
+    let legacy: serde_json::Value = serde_json::from_str(&fs::read_to_string(&json_path)?)?;
+    assert_eq!(canonical["interview_depth"].as_str(), Some("low"));
+    assert_eq!(legacy["interview_depth"], "low");
+    assert_eq!(canonical["selected_harnesses"][0].as_str(), Some("codex"));
+    assert_eq!(legacy["selected_harnesses"][0], "codex");
     Ok(())
 }
 
@@ -237,13 +423,70 @@ fn explicit_install_opt_in_records_enabled_consent() -> anyhow::Result<()> {
         "--telemetry",
         "enable",
     ]);
-    install.assert().success();
+    install
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("sequence collection: enabled"))
+        .stdout(predicate::str::contains("Share these sequences?").not())
+        .stdout(predicate::str::contains("disable: ldgr telemetry disable"));
     let consent: serde_json::Value = serde_json::from_str(&fs::read_to_string(
         home.join(".ldgr/telemetry-consent.json"),
     )?)?;
     assert_eq!(consent["schema_version"], 1);
     assert_eq!(consent["policy_version"], 1);
     assert_eq!(consent["decision"], "enabled");
+    Ok(())
+}
+
+#[test]
+fn non_interactive_install_accepts_explicit_telemetry_flag_without_yes() -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    let home = project.path().join(".ldgr/test-empty-home");
+    let mut install = isolated_command(project.path())?;
+    install.args(["install", "--no-agentctl", "--telemetry", "disable"]);
+
+    install
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Which harness would you like to configure? › pi",
+        ))
+        .stdout(predicate::str::contains("sequence collection: disabled"))
+        .stdout(predicate::str::contains("Share these sequences?").not())
+        .stdout(predicate::str::contains("disable: ldgr telemetry disable").not());
+
+    let consent: serde_json::Value = serde_json::from_str(&fs::read_to_string(
+        home.join(".ldgr/telemetry-consent.json"),
+    )?)?;
+    assert_eq!(consent["decision"], "disabled");
+    assert!(home.join(".ldgr/config.json").is_file());
+    assert!(home.join(".ldgr/config.toml").is_file());
+    Ok(())
+}
+
+#[test]
+fn no_argument_screen_reports_sequence_collection_without_prompting() -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+
+    let mut initial = isolated_command(project.path())?;
+    initial
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("sequence collection: disabled"))
+        .stdout(predicate::str::contains("Share these sequences?").not())
+        .stdout(predicate::str::contains("disable: ldgr telemetry disable").not());
+
+    let mut enable = isolated_command(project.path())?;
+    enable.args(["telemetry", "enable"]);
+    enable.assert().success();
+
+    let mut enabled = isolated_command(project.path())?;
+    enabled
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("sequence collection: enabled"))
+        .stdout(predicate::str::contains("disable: ldgr telemetry disable"))
+        .stdout(predicate::str::contains("Share these sequences?").not());
     Ok(())
 }
 
@@ -264,7 +507,7 @@ fn telemetry_controls_report_override_and_disable_without_network() -> anyhow::R
         ))
         .stdout(predicate::str::contains("effective collection: disabled"))
         .stdout(predicate::str::contains(
-            "eligible numerical protocols: core-work/v1",
+            "eligible numerical protocols: core-work/v1, research-workflow/v1",
         ));
     assert!(!consent_path.exists());
 
@@ -304,6 +547,116 @@ fn telemetry_controls_report_override_and_disable_without_network() -> anyhow::R
     assert!(!pending.exists());
     let consent: serde_json::Value = serde_json::from_str(&fs::read_to_string(consent_path)?)?;
     assert_eq!(consent["decision"], "disabled");
+    Ok(())
+}
+
+#[test]
+fn telemetry_preview_shows_exact_raw_arrays_and_protocol_without_network_or_cleanup(
+) -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    let home = project.path().join(".ldgr/test-empty-home");
+    let ldgr_home = home.join(".ldgr");
+    let route = ldgr_home.join("telemetry-pending/core-work/v1");
+    let research_route = ldgr_home.join("telemetry-pending/research-workflow/v1");
+    fs::create_dir_all(&route)?;
+    fs::create_dir_all(&research_route)?;
+    let valid = route.join("valid");
+    let research_valid = research_route.join("valid");
+    let invalid = route.join("invalid");
+    fs::write(&valid, "[0,1,3]")?;
+    fs::write(&research_valid, "[0,1,4]")?;
+    fs::write(&invalid, r#"{"project":"secret","sequence":[0,1,3]}"#)?;
+
+    let mut preview = isolated_command(project.path())?;
+    preview.args(["telemetry", "preview"]);
+    preview
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("pending telemetry payloads: 2"))
+        .stdout(predicate::str::contains(
+            "destination protocol: /sequences/core-work/v1",
+        ))
+        .stdout(predicate::str::contains(
+            "destination protocol: /sequences/research-workflow/v1",
+        ))
+        .stdout(predicate::str::contains("raw array: [0,1,3]"))
+        .stdout(predicate::str::contains("raw array: [0,1,4]"))
+        .stdout(predicate::str::contains("invalid pending payloads: 1"))
+        .stdout(predicate::str::contains("secret").not());
+
+    assert!(valid.exists());
+    assert!(research_valid.exists());
+    assert!(invalid.exists());
+    Ok(())
+}
+
+#[test]
+fn telemetry_transmit_is_best_effort_and_retains_core_and_adapter_payloads_when_offline(
+) -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    let home = project.path().join(".ldgr/test-empty-home");
+    let ldgr_home = home.join(".ldgr");
+    let core_route = ldgr_home.join("telemetry-pending/core-work/v1");
+    let research_route = ldgr_home.join("telemetry-pending/research-workflow/v1");
+    fs::create_dir_all(&core_route)?;
+    fs::create_dir_all(&research_route)?;
+    let core_payload = core_route.join("core");
+    let research_payload = research_route.join("research");
+    fs::write(&core_payload, "[0,1,4]")?;
+    fs::write(&research_payload, "[0,1,4]")?;
+
+    let mut enable = isolated_command(project.path())?;
+    enable.args(["telemetry", "enable"]);
+    enable.assert().success();
+
+    let mut transmit = isolated_command(project.path())?;
+    transmit.args([
+        "telemetry",
+        "transmit",
+        "--collector",
+        "https://127.0.0.1:9",
+        "--max-delay-ms",
+        "0",
+        "--timeout-ms",
+        "100",
+    ]);
+    transmit
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "protocol /sequences/core-work/v1: attempted=1 accepted=0 retained=1 invalid_dropped=0 disabled=false",
+        ))
+        .stdout(predicate::str::contains(
+            "protocol /sequences/research-workflow/v1: attempted=1 accepted=0 retained=1 invalid_dropped=0 disabled=false",
+        ))
+        .stdout(predicate::str::contains(
+            "telemetry transmission: attempted=2 accepted=0 retained=2 invalid_dropped=0",
+        ));
+    assert!(core_payload.exists());
+    assert!(research_payload.exists());
+
+    let mut killed = isolated_command(project.path())?;
+    killed.env("LDGR_TELEMETRY", "off").args([
+        "telemetry",
+        "transmit",
+        "--collector",
+        "https://127.0.0.1:9",
+        "--max-delay-ms",
+        "0",
+        "--timeout-ms",
+        "100",
+    ]);
+    killed
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "protocol /sequences/core-work/v1: attempted=0 accepted=0 retained=0 invalid_dropped=0 disabled=true",
+        ))
+        .stdout(predicate::str::contains(
+            "effective collection: disabled; no further telemetry was attempted",
+        ));
+    assert!(core_payload.exists());
+    assert!(research_payload.exists());
     Ok(())
 }
 
@@ -348,6 +701,11 @@ fn adapter_install_resolves_and_installs_fixture_from_index() -> anyhow::Result<
         .to_string(),
     )?;
     let all_harness_config = fs::read_to_string(isolated_home.join(".ldgr/config.json"))?;
+    let mut telemetry = isolated_command(project.path())?;
+    telemetry.args(["telemetry", "enable"]);
+    telemetry.assert().success();
+    let consent_path = isolated_home.join(".ldgr/telemetry-consent.json");
+    let original_consent = fs::read_to_string(&consent_path)?;
     let archive = project.path().join("fixture.tar.gz");
     let status = StdCommand::new("tar")
         .args(["-czf"])
@@ -437,7 +795,9 @@ fn adapter_install_resolves_and_installs_fixture_from_index() -> anyhow::Result<
     command
         .assert()
         .success()
-        .stdout(predicate::str::contains("Resolved version 1.2.3"));
+        .stdout(predicate::str::contains("Resolved version 1.2.3"))
+        .stdout(predicate::str::contains("Share these sequences?").not());
+    assert_eq!(fs::read_to_string(&consent_path)?, original_consent);
     assert!(install_root.join("adapter.toml").is_file());
     let receipt: serde_json::Value = serde_json::from_str(&fs::read_to_string(
         install_root.join("installation-receipt.json"),
@@ -476,7 +836,11 @@ fn adapter_install_resolves_and_installs_fixture_from_index() -> anyhow::Result<
     reconcile
         .env("LDGR_ADAPTER_PATH", &install_root)
         .args(["adapter", "reconcile", "fixture"]);
-    reconcile.assert().success();
+    reconcile
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Share these sequences?").not());
+    assert_eq!(fs::read_to_string(&consent_path)?, original_consent);
     assert!(!isolated_home.join("pi-prompts/fixture-loop.md").exists());
     assert!(isolated_home
         .join("codex-prompts/fixture-loop.md")
@@ -486,7 +850,11 @@ fn adapter_install_resolves_and_installs_fixture_from_index() -> anyhow::Result<
     reconcile_all
         .env("LDGR_ADAPTER_PATH", &install_root)
         .args(["adapter", "reconcile", "fixture"]);
-    reconcile_all.assert().success();
+    reconcile_all
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Share these sequences?").not());
+    assert_eq!(fs::read_to_string(&consent_path)?, original_consent);
     assert!(isolated_home.join("pi-prompts/fixture-loop.md").is_file());
     let mut update_index: serde_json::Value = serde_json::from_str(&fs::read_to_string(&index)?)?;
     let mut newer = update_index["adapters"][0]["releases"][0].clone();
@@ -514,7 +882,11 @@ fn adapter_install_resolves_and_installs_fixture_from_index() -> anyhow::Result<
         .env("LDGR_ADAPTER_INDEX", &index)
         .env("LDGR_ADAPTER_RELEASE_KEYRING", &keyring)
         .args(["adapter", "update", "fixture"]);
-    update.assert().success();
+    update
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Share these sequences?").not());
+    assert_eq!(fs::read_to_string(&consent_path)?, original_consent);
     let updated_receipt: serde_json::Value = serde_json::from_str(&fs::read_to_string(
         install_root.join("installation-receipt.json"),
     )?)?;
@@ -712,28 +1084,75 @@ fn adapter_install_without_name_shows_selection_fallback_not_help() -> anyhow::R
 }
 
 #[test]
-fn full_help_shows_core_command_tree_and_research_split() -> anyhow::Result<()> {
+fn full_help_is_derived_from_the_complete_clap_command_graph() -> anyhow::Result<()> {
     let project = TempDir::new()?;
     let mut command = isolated_command(project.path())?;
     command.arg("--full");
-    command.assert().success().stdout(
-        predicate::str::contains("Core command tree:")
-            .and(predicate::str::contains(
-                "  work\n    list\n    show\n    create\n    edit\n    import\n    export\n    status\n      set\n    delete",
-            ))
-            .and(predicate::str::contains(
-                "  notice\n    list\n    add\n    edit\n    clear",
-            ))
-            .and(predicate::str::contains(
-                "  prompt\n    create\n    import\n    update\n    activate",
-            ))
-            .and(predicate::str::contains("  bundle\n    create\n    seal"))
-            .and(predicate::str::contains(
-                "Research/readiness commands moved to `ldgr-research`",
-            ))
-            .and(predicate::str::contains("  failure\n    list").not())
-            .and(predicate::str::contains("    revalidation").not()),
-    );
+    let output = command.output()?;
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout)?;
+    let (rendered_map, footer) = stdout
+        .split_once("\n\nResearch/readiness commands moved to `ldgr-research`:")
+        .expect("full help keeps the research split after the generated command map");
+
+    fn collect_paths(command: &clap::Command, parent: &[&str], paths: &mut Vec<String>) {
+        for subcommand in command.get_subcommands() {
+            let mut path = parent.to_vec();
+            path.push(subcommand.get_name());
+            let aliases = subcommand.get_visible_aliases().collect::<Vec<_>>();
+            let alias_suffix = if aliases.is_empty() {
+                String::new()
+            } else {
+                format!(" [aliases: {}]", aliases.join(", "))
+            };
+            paths.push(format!("  {}{alias_suffix}", path.join(" ")));
+            collect_paths(subcommand, &path, paths);
+        }
+    }
+
+    let mut paths = Vec::new();
+    collect_paths(&ldgr_core::cli::command(), &[], &mut paths);
+    let expected_map = format!("Core command tree:\n{}", paths.join("\n"));
+    assert_eq!(rendered_map, expected_map);
+
+    for required_path in [
+        "  install",
+        "  install adapter",
+        "  schema",
+        "  schema doctor",
+        "  workflow",
+        "  config",
+        "  config show",
+        "  config set",
+        "  work dependency",
+        "  work dependency add",
+        "  work dependency remove",
+        "  work graph",
+        "  work audit",
+        "  adapter update",
+        "  adapter uninstall",
+        "  adapter reconcile",
+        "  error record",
+        "  error list",
+        "  error show",
+        "  error context",
+        "  error occurrence",
+        "  error occurrence list",
+        "  error occurrence show",
+        "  error disposition",
+        "  error retry-check",
+        "  error acknowledge",
+        "  error resolve",
+        "  error accept",
+        "  error link",
+    ] {
+        assert!(
+            paths.iter().any(|path| path == required_path),
+            "missing required command path {required_path}"
+        );
+    }
+    assert!(footer.contains("Effective workflow:"));
+    assert!(!stdout.lines().any(|line| line.trim() == "failure"));
     Ok(())
 }
 
@@ -1111,6 +1530,66 @@ fn adapter_namespace_dispatch_reports_failure_to_execute() -> anyhow::Result<()>
     Ok(())
 }
 
+#[cfg(windows)]
+#[test]
+fn source_adapter_dispatch_records_missing_toolchain_before_spawn() -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    let db_path = project.path().join(".ldgr/ldgr.db");
+    let artifact_root = project.path().join(".ldgr/artifacts");
+    let adapter_root = project.path().join("adapters");
+    run(project.path(), &db_path, &artifact_root, ["init"])?;
+    write_adapter_namespace_fixture(
+        &adapter_root.join("source"),
+        "source",
+        "source",
+        r#"["cargo", "run", "--manifest-path", "missing/Cargo.toml", "--target-dir", "missing-target", "--"]"#,
+    )?;
+
+    command(project.path(), &db_path, &artifact_root, ["source"])?
+        .env("LDGR_ADAPTER_PATH", &adapter_root)
+        .env_remove("PATH")
+        .env_remove("HOME")
+        .env_remove("USERPROFILE")
+        .env_remove("CARGO_HOME")
+        .env_remove("RUSTUP_HOME")
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("could not find cargo before source-adapter spawn")
+                .and(predicate::str::contains(
+                    "recorded first-class infrastructure error",
+                ))
+                .and(predicate::str::contains("add cargo.exe to PATH")),
+        );
+
+    let connection = Connection::open(&db_path)?;
+    let (class, domain, code, details, environment): (String, String, String, String, String) =
+        connection.query_row(
+            "SELECT error_record.class, error_record.domain, error_record.code,
+                error_occurrence.details_json, error_occurrence.environment_json
+         FROM error_record
+         JOIN error_occurrence ON error_occurrence.error_id=error_record.id
+         WHERE error_record.domain='ldgr.adapter.source-runtime'",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )?;
+    assert_eq!(class, "infrastructure-error");
+    assert_eq!(domain, "ldgr.adapter.source-runtime");
+    assert_eq!(code, "cargo-unavailable");
+    assert!(details.contains("add cargo.exe to PATH"));
+    assert!(!details.contains(&project.path().display().to_string()));
+    assert!(environment.contains(r#""HOME":"missing""#));
+    Ok(())
+}
+
 #[test]
 fn core_builtin_commands_take_precedence_over_adapter_namespaces() -> anyhow::Result<()> {
     let project = TempDir::new()?;
@@ -1413,7 +1892,24 @@ fn init_prints_setup_prompt_and_command_workflow() -> anyhow::Result<()> {
         .stdout(predicate::str::contains(
             "Use `ldgr <command> --help` for flags, or `ldgr --full` for the core command map.",
         ))
+        .stdout(predicate::str::contains(
+            "wrote error guidance .ldgr/operator-errors.md .ldgr/agent-errors.md",
+        ))
+        .stdout(predicate::str::contains("first-class causal records"))
         .stdout(predicate::str::contains("Core command tree:").not());
+
+    let operator_guidance = fs::read_to_string(project.path().join(".ldgr/operator-errors.md"))?;
+    assert!(operator_guidance.contains("Errors are first-class causal records"));
+    assert!(operator_guidance.contains("after unexpected behavior"));
+    assert!(operator_guidance.contains("after a user correction"));
+    assert!(operator_guidance.contains("at process handoff"));
+    assert!(operator_guidance.contains("before exit"));
+    let agent_guidance = fs::read_to_string(project.path().join(".ldgr/agent-errors.md"))?;
+    assert!(agent_guidance.contains("Treat errors as first-class causal records"));
+    assert!(agent_guidance.contains("after unexpected behavior"));
+    assert!(agent_guidance.contains("after a user correction"));
+    assert!(agent_guidance.contains("before handing work"));
+    assert!(agent_guidance.contains("before exiting"));
 
     command(project.path(), &db_path, &artifact_root, ["init"])?
         .assert()
@@ -3723,7 +4219,140 @@ fn autonomous_loop_runtime_marks_spawn_failure_failed() -> anyhow::Result<()> {
         .stdout(predicate::str::contains(
             "Loop runtime failed for spawn-fails",
         ));
+    command(project.path(), &db_path, &artifact_root, ["error", "list"])?
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "ldgr.loop.spawn/worker-spawn-failed",
+        ));
+    let inbox = project.path().join(".ldgr/recovery/inbox");
+    assert!(
+        fs::read_dir(inbox)?.next().is_none(),
+        "database-recorded spawn failure must not leave a duplicate recovery file"
+    );
 
+    Ok(())
+}
+
+#[test]
+fn autonomous_loop_runtime_records_nonzero_worker_exit() -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    let db_path = project.path().join(".ldgr/ldgr.db");
+    let artifact_root = project.path().join(".ldgr/artifacts");
+    let prompt_path = project.path().join("loop-prompt.md");
+    fs::write(&prompt_path, "{{ldgr_context}}")?;
+    run(project.path(), &db_path, &artifact_root, ["init"])?;
+    run(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        [
+            "work",
+            "create",
+            "exit-fails",
+            "--title",
+            "Exit fails",
+            "--description",
+            "Verify nonzero worker exit capture.",
+        ],
+    )?;
+
+    command(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        [
+            "loop",
+            "run",
+            "--prompt",
+            prompt_path.to_str().expect("prompt path is UTF-8"),
+            "--agent-argv",
+            nonzero_loop_agent_argv(),
+        ],
+    )?
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("agent_exit_code: 7"));
+    command(project.path(), &db_path, &artifact_root, ["error", "list"])?
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("ldgr.loop.worker/nonzero-exit"));
+    Ok(())
+}
+
+#[test]
+fn loop_bootstrap_spools_core_open_failure_atomically() -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    let db_path = project.path().join(".ldgr/ldgr.db");
+    let artifact_root = project.path().join(".ldgr/artifacts");
+    fs::create_dir_all(&db_path)?;
+    let prompt_path = project.path().join("loop-prompt.md");
+    fs::write(&prompt_path, "{{ldgr_context}}")?;
+
+    command(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        [
+            "loop",
+            "run",
+            "--prompt",
+            prompt_path.to_str().expect("prompt path is UTF-8"),
+            "--agent-argv",
+            r#"["worker-must-not-start"]"#,
+        ],
+    )?
+    .assert()
+    .failure();
+
+    let inbox = project.path().join(".ldgr/recovery/inbox");
+    let records = fs::read_dir(&inbox)?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert!(records[0].extension().is_some_and(|value| value == "json"));
+    let recovery: serde_json::Value = serde_json::from_str(&fs::read_to_string(&records[0])?)?;
+    assert_eq!(recovery["format"], "ldgr-error-recovery");
+    assert_eq!(recovery["error"]["code"], "core-unavailable");
+    assert!(recovery["error"]["details"].get("prompt").is_none());
+    Ok(())
+}
+
+#[test]
+fn loop_aborts_before_worker_when_every_recovery_sink_is_unwritable() -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    let blocked_state = project.path().join("blocked-state-root");
+    fs::write(project.path().join(".ldgr"), "not a directory")?;
+    fs::write(&blocked_state, "not a directory")?;
+    let marker = project.path().join("worker-started");
+    let db_path = project.path().join(".ldgr/ldgr.db");
+    let artifact_root = project.path().join(".ldgr/artifacts");
+    let mut command = isolated_command(project.path())?;
+    command
+        .env("LOCALAPPDATA", &blocked_state)
+        .env("XDG_STATE_HOME", &blocked_state)
+        .arg("--db")
+        .arg(&db_path)
+        .arg("--artifact-root")
+        .arg(&artifact_root)
+        .args([
+            "loop",
+            "run",
+            "--prompt",
+            "unused-prompt.md",
+            "--agent-argv",
+        ])
+        .arg(format!(
+            r#"["worker-must-not-start","{}"]"#,
+            marker.display()
+        ))
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "FATAL: no durable LDGR recovery sink is writable; worker execution was not started",
+        ));
+    assert!(!marker.exists(), "worker crossed the fail-closed boundary");
     Ok(())
 }
 
@@ -5128,31 +5757,163 @@ fn isolated_command(project: &Path) -> anyhow::Result<Command> {
             project.join(".ldgr/test-empty-adapters"),
         )
         .env("LDGR_HOME", project.join(".ldgr/test-empty-ldgr-home"))
+        .env("LOCALAPPDATA", project.join(".ldgr/test-state"))
+        .env("XDG_STATE_HOME", project.join(".ldgr/test-state"))
         .env("HOME", project.join(".ldgr/test-empty-home"));
     Ok(command)
 }
 
-fn downgrade_cli_fixture_to_v1(db_path: &Path) -> anyhow::Result<()> {
+fn write_startup_recovery_fixture(
+    project: &Path,
+    db_path: &Path,
+    occurrence_id: &str,
+    details: serde_json::Value,
+) -> anyhow::Result<()> {
     let connection = Connection::open(db_path)?;
-    connection.execute_batch(
-        r#"
-        DROP TABLE component_record;
-        DROP TABLE component_ingest;
-        DROP TABLE schema_component;
-        DROP TRIGGER IF EXISTS trg_work_dependency_no_cycle;
-        DROP INDEX IF EXISTS idx_work_dependency_depends_on;
-        DROP INDEX IF EXISTS idx_work_item_priority_program;
-        DROP TABLE work_dependency;
-        ALTER TABLE work_item DROP COLUMN hold_reason;
-        ALTER TABLE work_item DROP COLUMN hold_kind;
-        ALTER TABLE work_item DROP COLUMN acceptance_criteria;
-        ALTER TABLE work_item DROP COLUMN work_group;
-        ALTER TABLE work_item DROP COLUMN program;
-        ALTER TABLE work_item DROP COLUMN priority;
-        UPDATE schema_version SET version = 1 WHERE id = 1;
-        "#,
+    let project_id: String = connection.query_row(
+        "SELECT project_id FROM project_identity WHERE id=1",
+        [],
+        |row| row.get(0),
+    )?;
+    let inputs = serde_json::json!({
+        "class": "infrastructure-error",
+        "domain": "test.startup",
+        "code": "emergency-spool",
+        "boundary": "test",
+        "component": "cli-smoke",
+        "subject": "startup-reconciliation",
+    });
+    let fingerprint = format!("sha256:{:x}", Sha256::digest(serde_json::to_vec(&inputs)?));
+    let envelope = serde_json::json!({
+        "format": "ldgr-error-recovery",
+        "schema_version": 1,
+        "project": {
+            "project_id": project_id,
+            "locator": project.to_string_lossy().replace('\\', "/"),
+            "database_identity": null,
+        },
+        "producer": "cli-smoke",
+        "idempotency_key": format!("{occurrence_id}:emergency-spool"),
+        "operation_id": occurrence_id,
+        "attempt_id": occurrence_id,
+        "occurrence_id": occurrence_id,
+        "fingerprint": {
+            "version": "structured-v1",
+            "value": fingerprint,
+            "inputs": inputs,
+        },
+        "error": {
+            "class": "infrastructure-error",
+            "domain": "test.startup",
+            "code": "emergency-spool",
+            "severity": "error",
+            "retryability": "after-change",
+            "source": "cli-smoke:startup",
+            "summary": "A CLI smoke emergency record was spooled.",
+            "details": details,
+            "environment": {"os": std::env::consts::OS},
+        },
+        "observed_at": "2026-07-31T00:00:00Z",
+    });
+    let inbox = project.join(".ldgr/recovery/inbox");
+    fs::create_dir_all(&inbox)?;
+    fs::write(
+        inbox.join("spooled.json"),
+        serde_json::to_vec_pretty(&envelope)?,
     )?;
     Ok(())
+}
+
+#[cfg(windows)]
+fn nonzero_loop_agent_argv() -> &'static str {
+    r#"["cmd","/C","exit /b 7"]"#
+}
+
+#[cfg(unix)]
+fn nonzero_loop_agent_argv() -> &'static str {
+    r#"["sh","-c","exit 7"]"#
+}
+
+fn downgrade_cli_fixture(connection: &Connection, legacy_version: i64) -> anyhow::Result<()> {
+    match legacy_version {
+        1 => connection.execute_batch(
+            r#"
+            DROP TABLE component_record;
+            DROP TABLE component_ingest;
+            DROP TABLE schema_component;
+            DROP TABLE error_disposition;
+            DROP TABLE error_transition;
+            DROP TABLE error_relation;
+            DROP TABLE error_occurrence;
+            DROP TABLE error_record;
+            DROP TABLE project_identity;
+            DROP TRIGGER IF EXISTS trg_work_dependency_no_cycle;
+            DROP INDEX IF EXISTS idx_work_dependency_depends_on;
+            DROP INDEX IF EXISTS idx_work_item_priority_program;
+            DROP TABLE work_dependency;
+            ALTER TABLE work_item DROP COLUMN hold_reason;
+            ALTER TABLE work_item DROP COLUMN hold_kind;
+            ALTER TABLE work_item DROP COLUMN acceptance_criteria;
+            ALTER TABLE work_item DROP COLUMN work_group;
+            ALTER TABLE work_item DROP COLUMN program;
+            ALTER TABLE work_item DROP COLUMN priority;
+            UPDATE schema_version SET version = 1 WHERE id = 1;
+            "#,
+        )?,
+        2 => connection.execute_batch(
+            r#"
+            DROP TABLE component_record;
+            DROP TABLE component_ingest;
+            DROP TABLE schema_component;
+            DROP TABLE error_disposition;
+            DROP TABLE error_transition;
+            DROP TABLE error_relation;
+            DROP TABLE error_occurrence;
+            DROP TABLE error_record;
+            DROP TABLE project_identity;
+            UPDATE schema_version SET version = 2 WHERE id = 1;
+            "#,
+        )?,
+        3 => connection.execute_batch(
+            r#"
+            DROP TABLE error_disposition;
+            DROP TABLE error_transition;
+            DROP TABLE error_relation;
+            DROP TABLE error_occurrence;
+            DROP TABLE error_record;
+            DROP TABLE project_identity;
+            DROP TABLE component_record;
+            DROP TABLE component_ingest;
+            UPDATE schema_component
+               SET schema_version = CASE WHEN namespace = 'core' THEN 3 ELSE schema_version END,
+                   minimum_core_schema = 3,
+                   contract_hash = 'sha256:cli-smoke-v3';
+            UPDATE schema_version SET version = 3 WHERE id = 1;
+            "#,
+        )?,
+        4 => connection.execute_batch(
+            r#"
+            DROP TABLE error_disposition;
+            DROP TABLE error_transition;
+            DROP TABLE error_relation;
+            DROP TABLE error_occurrence;
+            DROP TABLE error_record;
+            DROP TABLE project_identity;
+            UPDATE schema_component
+               SET schema_version = CASE WHEN namespace = 'core' THEN 4 ELSE schema_version END,
+                   minimum_core_schema = 4,
+                   contract_hash = 'sha256:cli-smoke-v4';
+            UPDATE schema_version SET version = 4 WHERE id = 1;
+            "#,
+        )?,
+        other => anyhow::bail!("unsupported legacy fixture version {other}"),
+    }
+    Ok(())
+}
+
+fn downgrade_cli_fixture_to_v1(db_path: &Path) -> anyhow::Result<()> {
+    let connection = Connection::open(db_path)?;
+    downgrade_cli_fixture(&connection, 1)
 }
 
 fn write_adapter_fixture(dir: &Path, slug: &str, alias: &str) -> anyhow::Result<()> {

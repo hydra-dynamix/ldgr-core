@@ -87,6 +87,9 @@ jobs:
       PACKAGE: ldgr-core
       BINARY: ldgr
       RELEASE_NAME: ldgr-core
+      AGENTCTL_VERSION: 0.1.2
+      AGENTCTL_REPOSITORY: hydra-dynamix/agentctl
+      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
 
@@ -104,6 +107,19 @@ jobs:
         run: "target/release/${BINARY}${{ matrix.binary_ext }} --version"
         shell: bash
 
+      - name: Download paired agentctl release
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p agentctl-dist
+          gh release download "v${AGENTCTL_VERSION}" \
+            --repo "${AGENTCTL_REPOSITORY}" \
+            --pattern "agentctl-${AGENTCTL_VERSION}-${{ matrix.platform }}.tar.gz" \
+            --dir agentctl-dist
+          tar -xzf "agentctl-dist/agentctl-${AGENTCTL_VERSION}-${{ matrix.platform }}.tar.gz" \
+            -C agentctl-dist
+          "agentctl-dist/agentctl-${AGENTCTL_VERSION}/${{ matrix.platform }}/agentctl${{ matrix.binary_ext }}" --version
+
       - name: Package archive
         shell: bash
         run: |
@@ -111,11 +127,15 @@ jobs:
           version="${{ needs.metadata.outputs.version }}"
           platform="${{ matrix.platform }}"
           binary_file="${BINARY}${{ matrix.binary_ext }}"
+          agentctl_file="agentctl${{ matrix.binary_ext }}"
           staging="dist/${RELEASE_NAME}-${version}/${platform}"
           archive="dist/${RELEASE_NAME}-${version}-${platform}.tar.gz"
           mkdir -p "$staging"
           cp "target/release/${binary_file}" "$staging/${binary_file}"
+          cp "agentctl-dist/agentctl-${AGENTCTL_VERSION}/${platform}/${agentctl_file}" \
+            "$staging/${agentctl_file}"
           chmod +x "$staging/${binary_file}" || true
+          chmod +x "$staging/${agentctl_file}" || true
           cp README.md LICENSE "dist/${RELEASE_NAME}-${version}/"
           if [[ -f scripts/install.sh ]]; then mkdir -p "dist/${RELEASE_NAME}-${version}/scripts"; cp scripts/install.sh "dist/${RELEASE_NAME}-${version}/scripts/install.sh"; fi
           cat > "dist/${RELEASE_NAME}-${version}/RELEASE-METADATA.json" <<JSON
@@ -124,6 +144,9 @@ jobs:
             "package": "${PACKAGE}",
             "binary": "${BINARY}",
             "version": "${version}",
+            "agentctl_version": "${AGENTCTL_VERSION}",
+            "launcher_compatibility_schema": "ldgr.launcher-compatibility.v1",
+            "error_recovery_schema": 1,
             "platform": "${platform}",
             "commit": "${GITHUB_SHA}",
             "source_repository": "${GITHUB_REPOSITORY}"

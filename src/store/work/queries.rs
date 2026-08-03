@@ -23,6 +23,29 @@ pub fn next_ready_work_item(
                    WHERE dependency.work_item_id = work_item.id
                      AND prerequisite.status != 'done'
                )
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM error_record AS blocking_error
+                   JOIN error_relation AS relation
+                     ON relation.error_id = blocking_error.id
+                   LEFT JOIN run AS related_run
+                     ON relation.entity_type = 'run'
+                    AND CAST(relation.entity_id AS INTEGER) = related_run.id
+                   WHERE (
+                       blocking_error.disposition_pending = 1
+                       OR (
+                           blocking_error.state IN ('open', 'acknowledged')
+                           AND blocking_error.severity IN ('error', 'critical')
+                       )
+                   )
+                   AND (
+                       (
+                           relation.entity_type = 'work_item'
+                           AND CAST(relation.entity_id AS INTEGER) = work_item.id
+                       )
+                       OR related_run.work_item_id = work_item.id
+                   )
+               )
              ORDER BY
                CASE
                     WHEN priority GLOB 'P[0-9]*' THEN CAST(substr(priority, 2) AS INTEGER)
@@ -48,7 +71,12 @@ pub fn work_readiness(
 ) -> anyhow::Result<WorkReadiness> {
     let work_item = require_work_item_by_slug(connection, work_slug)?;
     let dependencies = dependency_slugs(connection, work_item.id, false)?;
-    let blocked_by = dependency_slugs(connection, work_item.id, true)?;
+    let mut blocked_by = dependency_slugs(connection, work_item.id, true)?;
+    blocked_by.extend(
+        blocking_errors_for_work_item(connection, work_item.id)?
+            .into_iter()
+            .map(|error| format!("error:{}:{}/{}", error.id, error.domain, error.code)),
+    );
     let unblocks = unblocked_slugs(connection, work_item.id)?;
     Ok(WorkReadiness {
         ready: work_item.status == WorkItemStatus::Pending && blocked_by.is_empty(),
@@ -75,6 +103,20 @@ pub fn work_item_view(
             )
         })
         .collect::<Vec<_>>();
+    blocker_reasons.extend(
+        blocking_errors_for_work_item(connection, work_item.id)?
+            .into_iter()
+            .map(|error| {
+                format!(
+                    "blocking error {} {}/{} state={} disposition_pending={}",
+                    error.id,
+                    error.domain,
+                    error.code,
+                    error.state,
+                    error.disposition_pending
+                )
+            }),
+    );
     if work_item.status != WorkItemStatus::Pending {
         blocker_reasons.insert(
             0,

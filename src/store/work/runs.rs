@@ -51,6 +51,36 @@ pub fn claim_next_pending_run(
                            WHERE dependency.work_item_id = work_item.id
                              AND prerequisite.status != 'done'
                        )
+                       AND NOT EXISTS (
+                           SELECT 1
+                           FROM error_record AS blocking_error
+                           JOIN error_relation AS relation
+                             ON relation.error_id=blocking_error.id
+                           LEFT JOIN run AS related_run
+                             ON relation.entity_type='run'
+                            AND CAST(relation.entity_id AS INTEGER)=related_run.id
+                           WHERE (
+                               blocking_error.disposition_pending=1
+                               OR (
+                                   blocking_error.state IN ('open', 'acknowledged')
+                                   AND blocking_error.severity IN ('error', 'critical')
+                                   AND NOT EXISTS (
+                                       SELECT 1
+                                       FROM error_disposition AS authorization
+                                       WHERE authorization.error_id=blocking_error.id
+                                         AND authorization.occurrence_id=blocking_error.latest_occurrence_id
+                                         AND authorization.disposition='retry'
+                                   )
+                               )
+                           )
+                           AND (
+                               (
+                                   relation.entity_type='work_item'
+                                   AND CAST(relation.entity_id AS INTEGER)=work_item.id
+                               )
+                               OR related_run.work_item_id=work_item.id
+                           )
+                       )
                      ORDER BY
                        CASE
                             WHEN priority GLOB 'P[0-9]*' THEN CAST(substr(priority, 2) AS INTEGER)
@@ -96,6 +126,36 @@ fn claim_pending_run_by_slug(
                          ON prerequisite.id = dependency.depends_on_work_item_id
                        WHERE dependency.work_item_id = work_item.id
                          AND prerequisite.status != 'done'
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1
+                       FROM error_record AS blocking_error
+                       JOIN error_relation AS relation
+                         ON relation.error_id=blocking_error.id
+                       LEFT JOIN run AS related_run
+                         ON relation.entity_type='run'
+                        AND CAST(relation.entity_id AS INTEGER)=related_run.id
+                       WHERE (
+                           blocking_error.disposition_pending=1
+                           OR (
+                               blocking_error.state IN ('open', 'acknowledged')
+                               AND blocking_error.severity IN ('error', 'critical')
+                               AND NOT EXISTS (
+                                   SELECT 1
+                                   FROM error_disposition AS authorization
+                                   WHERE authorization.error_id=blocking_error.id
+                                     AND authorization.occurrence_id=blocking_error.latest_occurrence_id
+                                     AND authorization.disposition='retry'
+                               )
+                           )
+                       )
+                       AND (
+                           (
+                               relation.entity_type='work_item'
+                               AND CAST(relation.entity_id AS INTEGER)=work_item.id
+                           )
+                           OR related_run.work_item_id=work_item.id
+                       )
                    )
                  RETURNING *",
                 params![work_slug],
@@ -148,9 +208,20 @@ pub fn finish_run(
     if run.status != RunStatus::Running {
         bail!("run {run_id} is already {}", run.status);
     }
-    in_write_transaction(connection, |connection| {
+    if status == RunStatus::Success {
+        ensure_no_blocking_errors_for_work_item(
+            connection,
+            run.work_item_id,
+            "finish the run successfully",
+        )?;
+    }
+    let finished = in_write_transaction(connection, |connection| {
         finish_run_unchecked(connection, run_id, status, notes)
-    })
+    })?;
+    if status == RunStatus::Failed {
+        best_effort_queue_core_work_run_terminal(connection, finished.id, finished.status, None);
+    }
+    Ok(finished)
 }
 
 fn finish_run_unchecked(
@@ -188,12 +259,19 @@ pub fn close_run(
     if status == RunStatus::Running {
         bail!("run close requires a terminal status");
     }
-    in_write_transaction(connection, |connection| {
+    let closed = in_write_transaction(connection, |connection| {
         let run = get_run_by_id(connection, run_id)?;
         if run.status != RunStatus::Running {
             bail!("run {run_id} is already {}", run.status);
         }
         let work_item = get_work_item_by_id(connection, run.work_item_id)?;
+        if status == RunStatus::Success {
+            ensure_no_blocking_errors_for_work_item(
+                connection,
+                work_item.id,
+                "close the run successfully",
+            )?;
+        }
         ensure_no_other_running_runs_for_work_item(connection, &work_item, run_id)?;
         validate_decision_invariants(connection, &work_item, outcome, next_work.is_some())?;
         let next_work_item_id = match next_work {
@@ -215,7 +293,14 @@ pub fn close_run(
             decision,
             work_item,
         })
-    })
+    })?;
+    best_effort_queue_core_work_run_terminal(
+        connection,
+        closed.run.id,
+        closed.run.status,
+        Some(closed.decision.outcome),
+    );
+    Ok(closed)
 }
 
 pub fn restore_work_item_pending_after_dry_run(
@@ -260,6 +345,7 @@ pub fn record_run_phase(
     let payload = serde_json::json!({
         "phase": phase,
         "progress_report": progress_report,
+        "process_id": std::process::id(),
     })
     .to_string();
     record_event(connection, "run", run_id, "phase", &payload)

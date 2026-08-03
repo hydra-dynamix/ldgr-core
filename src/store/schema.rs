@@ -4,7 +4,7 @@ use crate::database_contract::{
 };
 use rusqlite::OpenFlags;
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 2;
+pub const CURRENT_SCHEMA_VERSION: i64 = 5;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SchemaDoctorReport {
@@ -141,6 +141,108 @@ CREATE TABLE IF NOT EXISTS component_record (
 
 CREATE INDEX IF NOT EXISTS idx_component_ingest_namespace ON component_ingest(component_namespace, created_at);
 CREATE INDEX IF NOT EXISTS idx_component_record_ingest ON component_record(ingest_id);
+
+CREATE TABLE IF NOT EXISTS project_identity (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    project_id TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS error_record (
+    id INTEGER PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES project_identity(project_id) ON DELETE RESTRICT,
+    fingerprint_version TEXT NOT NULL,
+    fingerprint TEXT NOT NULL CHECK (
+        length(fingerprint) = 71
+        AND fingerprint LIKE 'sha256:%'
+        AND substr(fingerprint, 8) NOT GLOB '*[^0-9a-f]*'
+    ),
+    class TEXT NOT NULL CHECK (class IN (
+        'task-failure', 'validation-failure', 'infrastructure-error',
+        'interruption', 'operator-cancellation'
+    )),
+    domain TEXT NOT NULL,
+    code TEXT NOT NULL,
+    severity TEXT NOT NULL CHECK (severity IN ('info', 'warning', 'error', 'critical')),
+    retryability TEXT NOT NULL CHECK (retryability IN ('never', 'after-change', 'transient', 'unknown')),
+    state TEXT NOT NULL DEFAULT 'open' CHECK (state IN ('open', 'acknowledged', 'resolved', 'accepted')),
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    occurrence_count INTEGER NOT NULL DEFAULT 0 CHECK (occurrence_count >= 0),
+    latest_occurrence_id TEXT NOT NULL,
+    disposition_pending INTEGER NOT NULL DEFAULT 1 CHECK (disposition_pending IN (0, 1)),
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(project_id, fingerprint_version, fingerprint)
+);
+
+CREATE TABLE IF NOT EXISTS error_occurrence (
+    occurrence_id TEXT PRIMARY KEY,
+    error_id INTEGER NOT NULL REFERENCES error_record(id) ON DELETE RESTRICT,
+    producer TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    operation_id TEXT NOT NULL,
+    attempt_id TEXT NOT NULL,
+    class TEXT NOT NULL CHECK (class IN (
+        'task-failure', 'validation-failure', 'infrastructure-error',
+        'interruption', 'operator-cancellation'
+    )),
+    domain TEXT NOT NULL,
+    code TEXT NOT NULL,
+    severity TEXT NOT NULL CHECK (severity IN ('info', 'warning', 'error', 'critical')),
+    retryability TEXT NOT NULL CHECK (retryability IN ('never', 'after-change', 'transient', 'unknown')),
+    source TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    details_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(details_json) AND json_type(details_json) = 'object'),
+    environment_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(environment_json) AND json_type(environment_json) = 'object'),
+    observed_at TEXT NOT NULL,
+    recorded_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    recovery_origin TEXT NOT NULL CHECK (recovery_origin IN ('database', 'project-inbox', 'user-spool')),
+    payload_digest TEXT NOT NULL CHECK (
+        length(payload_digest) = 71
+        AND payload_digest LIKE 'sha256:%'
+        AND substr(payload_digest, 8) NOT GLOB '*[^0-9a-f]*'
+    ),
+    UNIQUE(producer, idempotency_key)
+);
+
+CREATE TABLE IF NOT EXISTS error_relation (
+    id INTEGER PRIMARY KEY,
+    error_id INTEGER NOT NULL REFERENCES error_record(id) ON DELETE RESTRICT,
+    occurrence_id TEXT REFERENCES error_occurrence(occurrence_id) ON DELETE RESTRICT,
+    relation_kind TEXT NOT NULL,
+    entity_type TEXT NOT NULL,
+    entity_id TEXT NOT NULL,
+    source TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(error_id, occurrence_id, relation_kind, entity_type, entity_id)
+);
+
+CREATE TABLE IF NOT EXISTS error_transition (
+    id INTEGER PRIMARY KEY,
+    error_id INTEGER NOT NULL REFERENCES error_record(id) ON DELETE RESTRICT,
+    occurrence_id TEXT REFERENCES error_occurrence(occurrence_id) ON DELETE RESTRICT,
+    old_state TEXT NOT NULL CHECK (old_state IN ('open', 'acknowledged', 'resolved', 'accepted')),
+    new_state TEXT NOT NULL CHECK (new_state IN ('open', 'acknowledged', 'resolved', 'accepted')),
+    actor TEXT NOT NULL,
+    source TEXT NOT NULL,
+    rationale TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    CHECK (old_state != new_state)
+);
+
+CREATE TABLE IF NOT EXISTS error_disposition (
+    id INTEGER PRIMARY KEY,
+    error_id INTEGER NOT NULL REFERENCES error_record(id) ON DELETE RESTRICT,
+    occurrence_id TEXT NOT NULL REFERENCES error_occurrence(occurrence_id) ON DELETE RESTRICT,
+    disposition TEXT NOT NULL CHECK (disposition IN (
+        'retry', 'workaround', 'defer', 'accept', 'escalate', 'cancel', 'resolve'
+    )),
+    actor TEXT NOT NULL,
+    source TEXT NOT NULL,
+    rationale TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 
 CREATE TABLE IF NOT EXISTS work_item (
     id INTEGER PRIMARY KEY,
@@ -292,6 +394,12 @@ const CORE_TABLES: &[&str] = &[
     "schema_component",
     "component_ingest",
     "component_record",
+    "project_identity",
+    "error_record",
+    "error_occurrence",
+    "error_relation",
+    "error_transition",
+    "error_disposition",
     "work_item",
     "work_dependency",
     "run",
@@ -305,6 +413,15 @@ const CORE_TABLES: &[&str] = &[
     "decision",
     "event_log",
     "loop_intervention",
+];
+
+const V5_TABLES: &[&str] = &[
+    "project_identity",
+    "error_record",
+    "error_occurrence",
+    "error_relation",
+    "error_transition",
+    "error_disposition",
 ];
 
 #[derive(Debug, PartialEq, Eq)]
@@ -361,6 +478,88 @@ const COMPONENT_RECORD_COLUMNS: &[ColumnSchema] = &[
     column("record_key", "TEXT", true, None, false),
     column("payload_json", "TEXT", true, None, false),
     column("source_schema_version", "INTEGER", true, None, false),
+    column("created_at", "TEXT", true, Some("datetime('now')"), false),
+];
+const PROJECT_IDENTITY_COLUMNS: &[ColumnSchema] = &[
+    column("id", "INTEGER", false, None, true),
+    column("project_id", "TEXT", true, None, false),
+    column("created_at", "TEXT", true, Some("datetime('now')"), false),
+];
+const ERROR_RECORD_COLUMNS: &[ColumnSchema] = &[
+    column("id", "INTEGER", false, None, true),
+    column("project_id", "TEXT", true, None, false),
+    column("fingerprint_version", "TEXT", true, None, false),
+    column("fingerprint", "TEXT", true, None, false),
+    column("class", "TEXT", true, None, false),
+    column("domain", "TEXT", true, None, false),
+    column("code", "TEXT", true, None, false),
+    column("severity", "TEXT", true, None, false),
+    column("retryability", "TEXT", true, None, false),
+    column("state", "TEXT", true, Some("'open'"), false),
+    column("first_seen_at", "TEXT", true, None, false),
+    column("last_seen_at", "TEXT", true, None, false),
+    column("occurrence_count", "INTEGER", true, Some("0"), false),
+    column("latest_occurrence_id", "TEXT", true, None, false),
+    column("disposition_pending", "INTEGER", true, Some("1"), false),
+    column("created_at", "TEXT", true, Some("datetime('now')"), false),
+    column("updated_at", "TEXT", true, Some("datetime('now')"), false),
+];
+const ERROR_OCCURRENCE_COLUMNS: &[ColumnSchema] = &[
+    column("occurrence_id", "TEXT", false, None, true),
+    column("error_id", "INTEGER", true, None, false),
+    column("producer", "TEXT", true, None, false),
+    column("idempotency_key", "TEXT", true, None, false),
+    column("operation_id", "TEXT", true, None, false),
+    column("attempt_id", "TEXT", true, None, false),
+    column("class", "TEXT", true, None, false),
+    column("domain", "TEXT", true, None, false),
+    column("code", "TEXT", true, None, false),
+    column("severity", "TEXT", true, None, false),
+    column("retryability", "TEXT", true, None, false),
+    column("source", "TEXT", true, None, false),
+    column("summary", "TEXT", true, None, false),
+    column("details_json", "TEXT", true, Some("'{}'"), false),
+    column("environment_json", "TEXT", true, Some("'{}'"), false),
+    column("observed_at", "TEXT", true, None, false),
+    column(
+        "recorded_at",
+        "TEXT",
+        true,
+        Some("strftime('%Y-%m-%dT%H:%M:%fZ', 'now')"),
+        false,
+    ),
+    column("recovery_origin", "TEXT", true, None, false),
+    column("payload_digest", "TEXT", true, None, false),
+];
+const ERROR_RELATION_COLUMNS: &[ColumnSchema] = &[
+    column("id", "INTEGER", false, None, true),
+    column("error_id", "INTEGER", true, None, false),
+    column("occurrence_id", "TEXT", false, None, false),
+    column("relation_kind", "TEXT", true, None, false),
+    column("entity_type", "TEXT", true, None, false),
+    column("entity_id", "TEXT", true, None, false),
+    column("source", "TEXT", true, None, false),
+    column("created_at", "TEXT", true, Some("datetime('now')"), false),
+];
+const ERROR_TRANSITION_COLUMNS: &[ColumnSchema] = &[
+    column("id", "INTEGER", false, None, true),
+    column("error_id", "INTEGER", true, None, false),
+    column("occurrence_id", "TEXT", false, None, false),
+    column("old_state", "TEXT", true, None, false),
+    column("new_state", "TEXT", true, None, false),
+    column("actor", "TEXT", true, None, false),
+    column("source", "TEXT", true, None, false),
+    column("rationale", "TEXT", true, None, false),
+    column("created_at", "TEXT", true, Some("datetime('now')"), false),
+];
+const ERROR_DISPOSITION_COLUMNS: &[ColumnSchema] = &[
+    column("id", "INTEGER", false, None, true),
+    column("error_id", "INTEGER", true, None, false),
+    column("occurrence_id", "TEXT", true, None, false),
+    column("disposition", "TEXT", true, None, false),
+    column("actor", "TEXT", true, None, false),
+    column("source", "TEXT", true, None, false),
+    column("rationale", "TEXT", true, None, false),
     column("created_at", "TEXT", true, Some("datetime('now')"), false),
 ];
 const WORK_ITEM_COLUMNS: &[ColumnSchema] = &[
@@ -515,6 +714,41 @@ const COMPONENT_RECORD_FOREIGN_KEYS: &[ForeignKeySchema] = &[foreign_key(
     "id",
     "CASCADE",
 )];
+const ERROR_RECORD_FOREIGN_KEYS: &[ForeignKeySchema] = &[foreign_key(
+    "project_id",
+    "project_identity",
+    "project_id",
+    "RESTRICT",
+)];
+const ERROR_OCCURRENCE_FOREIGN_KEYS: &[ForeignKeySchema] =
+    &[foreign_key("error_id", "error_record", "id", "RESTRICT")];
+const ERROR_RELATION_FOREIGN_KEYS: &[ForeignKeySchema] = &[
+    foreign_key("error_id", "error_record", "id", "RESTRICT"),
+    foreign_key(
+        "occurrence_id",
+        "error_occurrence",
+        "occurrence_id",
+        "RESTRICT",
+    ),
+];
+const ERROR_TRANSITION_FOREIGN_KEYS: &[ForeignKeySchema] = &[
+    foreign_key("error_id", "error_record", "id", "RESTRICT"),
+    foreign_key(
+        "occurrence_id",
+        "error_occurrence",
+        "occurrence_id",
+        "RESTRICT",
+    ),
+];
+const ERROR_DISPOSITION_FOREIGN_KEYS: &[ForeignKeySchema] = &[
+    foreign_key("error_id", "error_record", "id", "RESTRICT"),
+    foreign_key(
+        "occurrence_id",
+        "error_occurrence",
+        "occurrence_id",
+        "RESTRICT",
+    ),
+];
 const WORK_DEPENDENCY_FOREIGN_KEYS: &[ForeignKeySchema] = &[
     foreign_key("work_item_id", "work_item", "id", "CASCADE"),
     foreign_key("depends_on_work_item_id", "work_item", "id", "RESTRICT"),
@@ -566,6 +800,34 @@ const COMPONENT_RECORD_REQUIRED_SQL: &[&str] = &[
     "CHECK (source_schema_version > 0)",
     "UNIQUE(ingest_id, record_kind, record_key)",
 ];
+const PROJECT_IDENTITY_REQUIRED_SQL: &[&str] =
+    &["CHECK (id = 1)", "project_id TEXT NOT NULL UNIQUE"];
+const ERROR_RECORD_REQUIRED_SQL: &[&str] = &[
+    "UNIQUE(project_id, fingerprint_version, fingerprint)",
+    "CHECK (class IN ( 'task-failure', 'validation-failure', 'infrastructure-error', 'interruption', 'operator-cancellation' ))",
+    "CHECK (severity IN ('info', 'warning', 'error', 'critical'))",
+    "CHECK (retryability IN ('never', 'after-change', 'transient', 'unknown'))",
+    "CHECK (state IN ('open', 'acknowledged', 'resolved', 'accepted'))",
+    "CHECK (occurrence_count >= 0)",
+    "CHECK (disposition_pending IN (0, 1))",
+];
+const ERROR_OCCURRENCE_REQUIRED_SQL: &[&str] = &[
+    "UNIQUE(producer, idempotency_key)",
+    "CHECK (class IN ( 'task-failure', 'validation-failure', 'infrastructure-error', 'interruption', 'operator-cancellation' ))",
+    "CHECK (severity IN ('info', 'warning', 'error', 'critical'))",
+    "CHECK (retryability IN ('never', 'after-change', 'transient', 'unknown'))",
+    "CHECK (json_valid(details_json) AND json_type(details_json) = 'object')",
+    "CHECK (json_valid(environment_json) AND json_type(environment_json) = 'object')",
+    "CHECK (recovery_origin IN ('database', 'project-inbox', 'user-spool'))",
+];
+const ERROR_RELATION_REQUIRED_SQL: &[&str] =
+    &["UNIQUE(error_id, occurrence_id, relation_kind, entity_type, entity_id)"];
+const ERROR_TRANSITION_REQUIRED_SQL: &[&str] = &[
+    "CHECK (old_state IN ('open', 'acknowledged', 'resolved', 'accepted'))",
+    "CHECK (new_state IN ('open', 'acknowledged', 'resolved', 'accepted'))",
+    "CHECK (old_state != new_state)",
+];
+const ERROR_DISPOSITION_REQUIRED_SQL: &[&str] = &["CHECK (disposition IN ( 'retry', 'workaround', 'defer', 'accept', 'escalate', 'cancel', 'resolve' ))"];
 const WORK_ITEM_REQUIRED_SQL: &[&str] = &[
     "slug TEXT NOT NULL UNIQUE",
     "CHECK (status IN ('pending', 'running', 'held', 'done', 'canceled'))",
@@ -625,6 +887,42 @@ const EXPECTED_SCHEMA: &[TableSchema] = &[
         COMPONENT_RECORD_COLUMNS,
         COMPONENT_RECORD_FOREIGN_KEYS,
         COMPONENT_RECORD_REQUIRED_SQL,
+    ),
+    table(
+        "project_identity",
+        PROJECT_IDENTITY_COLUMNS,
+        NO_FOREIGN_KEYS,
+        PROJECT_IDENTITY_REQUIRED_SQL,
+    ),
+    table(
+        "error_record",
+        ERROR_RECORD_COLUMNS,
+        ERROR_RECORD_FOREIGN_KEYS,
+        ERROR_RECORD_REQUIRED_SQL,
+    ),
+    table(
+        "error_occurrence",
+        ERROR_OCCURRENCE_COLUMNS,
+        ERROR_OCCURRENCE_FOREIGN_KEYS,
+        ERROR_OCCURRENCE_REQUIRED_SQL,
+    ),
+    table(
+        "error_relation",
+        ERROR_RELATION_COLUMNS,
+        ERROR_RELATION_FOREIGN_KEYS,
+        ERROR_RELATION_REQUIRED_SQL,
+    ),
+    table(
+        "error_transition",
+        ERROR_TRANSITION_COLUMNS,
+        ERROR_TRANSITION_FOREIGN_KEYS,
+        ERROR_TRANSITION_REQUIRED_SQL,
+    ),
+    table(
+        "error_disposition",
+        ERROR_DISPOSITION_COLUMNS,
+        ERROR_DISPOSITION_FOREIGN_KEYS,
+        ERROR_DISPOSITION_REQUIRED_SQL,
     ),
     table(
         "work_item",
@@ -746,6 +1044,13 @@ const fn table(
 }
 
 const SCHEMA_INDEXES: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_error_record_latest ON error_record(last_seen_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_error_record_unresolved ON error_record(state, disposition_pending, severity, last_seen_at DESC);
+CREATE INDEX IF NOT EXISTS idx_error_occurrence_error ON error_occurrence(error_id, observed_at, recorded_at, occurrence_id);
+CREATE INDEX IF NOT EXISTS idx_error_occurrence_operation ON error_occurrence(operation_id, attempt_id);
+CREATE INDEX IF NOT EXISTS idx_error_relation_entity ON error_relation(entity_type, entity_id, error_id);
+CREATE INDEX IF NOT EXISTS idx_error_transition_error ON error_transition(error_id, created_at, id);
+CREATE INDEX IF NOT EXISTS idx_error_disposition_occurrence ON error_disposition(occurrence_id, created_at, id);
 CREATE INDEX IF NOT EXISTS idx_work_item_status ON work_item(status);
 CREATE INDEX IF NOT EXISTS idx_work_item_parent ON work_item(parent_work_item_id);
 CREATE INDEX IF NOT EXISTS idx_work_item_priority_program ON work_item(priority, program, status);
@@ -779,6 +1084,18 @@ WHEN NEW.work_item_id = NEW.depends_on_work_item_id OR EXISTS (
 )
 BEGIN
     SELECT RAISE(ABORT, 'work dependency cycle');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_error_occurrence_immutable_update
+BEFORE UPDATE ON error_occurrence
+BEGIN
+    SELECT RAISE(ABORT, 'error occurrences are immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_error_occurrence_immutable_delete
+BEFORE DELETE ON error_occurrence
+BEGIN
+    SELECT RAISE(ABORT, 'error occurrences are immutable');
 END;
 "#;
 
@@ -831,21 +1148,25 @@ pub(crate) fn preflight_schema_migration(connection: &Connection) -> anyhow::Res
         1 => Err(incompatible_schema_error(
             "schema version 1 shape is not eligible for migration",
         )),
-        2 if current_schema_matches(connection)? => {
-            validate_component_catalog(connection)?;
-            Ok(None)
-        }
+        2 if legacy_current_schema_matches(connection)? => Ok(Some(2)),
         2 if version_2_schema_matches(connection)? => Ok(Some(2)),
         2 => Err(incompatible_schema_error(
             "schema version 2 shape is not eligible for migration",
         )),
         3 if version_3_schema_matches(connection)? => Ok(Some(3)),
         3 => Err(incompatible_schema_error(
-            "obsolete schema version 3 shape is not eligible for normalization to schema v2",
+            "obsolete schema version 3 shape is not eligible for normalization to schema v5",
         )),
-        4 if current_schema_matches(connection)? => Ok(Some(4)),
+        4 if legacy_current_schema_matches(connection)? => Ok(Some(4)),
         4 => Err(incompatible_schema_error(
-            "obsolete schema version 4 shape is not eligible for normalization to schema v2",
+            "obsolete schema version 4 shape is not eligible for normalization to schema v5",
+        )),
+        5 if current_schema_matches(connection)? => {
+            validate_component_catalog(connection)?;
+            Ok(None)
+        }
+        5 => Err(incompatible_schema_error(
+            "schema version 5 shape does not match the current Core contract",
         )),
         _ => Err(incompatible_schema_error(format!(
             "schema version {version} does not match required version {CURRENT_SCHEMA_VERSION}"
@@ -853,30 +1174,65 @@ pub(crate) fn preflight_schema_migration(connection: &Connection) -> anyhow::Res
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MigrationFailpoint {
+    AfterLegacyUpgrade,
+    AfterTableCreation,
+    BeforeVersionUpdate,
+    BeforeCommit,
+}
+
 fn apply_pending_schema_migrations(
     connection: &Connection,
-    fail_after_version: Option<i64>,
+    failpoint: Option<MigrationFailpoint>,
 ) -> anyhow::Result<()> {
     let migration_origin = preflight_schema_migration(connection)?;
     if migration_origin.is_none() {
         return Ok(());
     }
     in_migration_transaction(connection, |connection| {
-        let version = schema_version(connection)?;
-        if version == 1 {
-            migrate_v1_to_v2(connection)?;
-            if fail_after_version == Some(CURRENT_SCHEMA_VERSION) {
-                anyhow::bail!("injected migration failure after schema v{CURRENT_SCHEMA_VERSION}");
-            }
-        }
-        apply_current_v2_contract(connection)?;
-        anyhow::ensure!(
-            current_schema_matches(connection)?,
-            "normalized schema shape does not match ldgr-core schema v{CURRENT_SCHEMA_VERSION}"
-        );
-        validate_component_catalog(connection)?;
-        validate_foreign_keys(connection)
+        apply_pending_schema_migrations_locked(connection, failpoint)
     })
+}
+
+pub(crate) fn apply_pending_schema_migrations_in_locked_transaction(
+    connection: &Connection,
+) -> anyhow::Result<()> {
+    apply_pending_schema_migrations_locked(connection, None)
+}
+
+fn apply_pending_schema_migrations_locked(
+    connection: &Connection,
+    failpoint: Option<MigrationFailpoint>,
+) -> anyhow::Result<()> {
+    let version = schema_version(connection)?;
+    if version == CURRENT_SCHEMA_VERSION {
+        return Ok(());
+    }
+    if version == 1 {
+        migrate_v1_to_v2(connection)?;
+        if failpoint == Some(MigrationFailpoint::AfterLegacyUpgrade) {
+            anyhow::bail!("injected migration failure after schema v2");
+        }
+    }
+    apply_current_v5_contract(connection)?;
+    if failpoint == Some(MigrationFailpoint::AfterTableCreation) {
+        anyhow::bail!("injected migration failure after v5 table creation");
+    }
+    anyhow::ensure!(
+        current_schema_matches(connection)?,
+        "normalized schema shape does not match ldgr-core schema v{CURRENT_SCHEMA_VERSION}"
+    );
+    validate_component_catalog_contents(connection)?;
+    validate_foreign_keys(connection)?;
+    if failpoint == Some(MigrationFailpoint::BeforeVersionUpdate) {
+        anyhow::bail!("injected migration failure before v5 version update");
+    }
+    set_schema_version(connection, CURRENT_SCHEMA_VERSION)?;
+    if failpoint == Some(MigrationFailpoint::BeforeCommit) {
+        anyhow::bail!("injected migration failure before v5 commit");
+    }
+    Ok(())
 }
 
 fn migrate_v1_to_v2(connection: &Connection) -> anyhow::Result<()> {
@@ -910,18 +1266,18 @@ fn migrate_v1_to_v2(connection: &Connection) -> anyhow::Result<()> {
     set_schema_version(connection, 2)
 }
 
-fn apply_current_v2_contract(connection: &Connection) -> anyhow::Result<()> {
+fn apply_current_v5_contract(connection: &Connection) -> anyhow::Result<()> {
     connection
         .execute_batch(SCHEMA_COMPONENT_TABLE)
-        .context("failed to create the v2 schema component catalog")?;
+        .context("failed to create the schema component catalog")?;
     connection
         .execute_batch(CURRENT_SCHEMA)
-        .context("failed to create the v2 component ingestion ledger")?;
+        .context("failed to create the schema v5 tables")?;
     seed_generated_component_catalog(connection)?;
+    seed_project_identity(connection)?;
     connection
         .execute_batch(SCHEMA_INDEXES)
-        .context("failed to create v2 schema indexes")?;
-    set_schema_version(connection, CURRENT_SCHEMA_VERSION)
+        .context("failed to create schema v5 indexes and immutability triggers")
 }
 
 fn validate_foreign_keys(connection: &Connection) -> anyhow::Result<()> {
@@ -948,7 +1304,7 @@ fn version_2_schema_matches(connection: &Connection) -> anyhow::Result<bool> {
             !matches!(
                 *name,
                 "schema_component" | "component_ingest" | "component_record"
-            )
+            ) && !V5_TABLES.contains(name)
         })
         .collect::<Vec<_>>();
     for table in &v2_tables {
@@ -960,7 +1316,8 @@ fn version_2_schema_matches(connection: &Connection) -> anyhow::Result<bool> {
         if matches!(
             table_schema.name,
             "schema_component" | "component_ingest" | "component_record"
-        ) {
+        ) || V5_TABLES.contains(&table_schema.name)
+        {
             continue;
         }
         if !table_matches_schema(connection, table_schema)? {
@@ -975,7 +1332,9 @@ fn version_3_schema_matches(connection: &Connection) -> anyhow::Result<bool> {
     let v3_tables = CORE_TABLES
         .iter()
         .copied()
-        .filter(|name| !matches!(*name, "component_ingest" | "component_record"))
+        .filter(|name| {
+            !matches!(*name, "component_ingest" | "component_record") && !V5_TABLES.contains(name)
+        })
         .collect::<Vec<_>>();
     if table_names.len() != v3_tables.len()
         || table_names
@@ -985,7 +1344,9 @@ fn version_3_schema_matches(connection: &Connection) -> anyhow::Result<bool> {
         return Ok(false);
     }
     for table_schema in EXPECTED_SCHEMA {
-        if matches!(table_schema.name, "component_ingest" | "component_record") {
+        if matches!(table_schema.name, "component_ingest" | "component_record")
+            || V5_TABLES.contains(&table_schema.name)
+        {
             continue;
         }
         if !table_matches_schema(connection, table_schema)? {
@@ -1019,7 +1380,8 @@ fn version_1_schema_matches(connection: &Connection) -> anyhow::Result<bool> {
                 | "schema_component"
                 | "component_ingest"
                 | "component_record"
-        ) {
+        ) || V5_TABLES.contains(&table_schema.name)
+        {
             continue;
         }
         // Some released v1 binaries did not create the later prompt tables
@@ -1029,6 +1391,23 @@ fn version_1_schema_matches(connection: &Connection) -> anyhow::Result<bool> {
         if table_exists(connection, table_schema.name)?
             && !table_matches_schema(connection, table_schema)?
         {
+            return Ok(false);
+        }
+    }
+    work_item_accepts_held_status(connection)
+}
+
+fn legacy_current_schema_matches(connection: &Connection) -> anyhow::Result<bool> {
+    for table_name in CORE_TABLES.iter().filter(|name| !V5_TABLES.contains(name)) {
+        if !table_exists(connection, table_name)? {
+            return Ok(false);
+        }
+    }
+    for table_schema in EXPECTED_SCHEMA
+        .iter()
+        .filter(|schema| !V5_TABLES.contains(&schema.name))
+    {
+        if !table_matches_schema(connection, table_schema)? {
             return Ok(false);
         }
     }
@@ -1055,6 +1434,7 @@ fn create_current_schema(connection: &Connection) -> anyhow::Result<()> {
         .execute_batch(SCHEMA_INDEXES)
         .context("failed to create schema indexes")?;
     seed_generated_component_catalog(connection)?;
+    seed_project_identity(connection)?;
     set_schema_version(connection, CURRENT_SCHEMA_VERSION)
 }
 
@@ -1327,6 +1707,20 @@ fn seed_generated_component_catalog(connection: &Connection) -> anyhow::Result<(
 }
 
 fn validate_component_catalog(connection: &Connection) -> anyhow::Result<()> {
+    validate_component_catalog_contents(connection)?;
+    let actual = list_schema_components(connection)?;
+    let core = actual
+        .iter()
+        .find(|component| component.namespace == "core")
+        .context("schema component catalog is missing core")?;
+    anyhow::ensure!(
+        core.schema_version == schema_version(connection)?,
+        "core component version does not match schema_version"
+    );
+    Ok(())
+}
+
+fn validate_component_catalog_contents(connection: &Connection) -> anyhow::Result<()> {
     anyhow::ensure!(
         CURRENT_SCHEMA_VERSION == GENERATED_CORE_SCHEMA_VERSION,
         "generated database contract is stale: Core schema is {} but contract is {}",
@@ -1375,14 +1769,6 @@ fn validate_component_catalog(connection: &Connection) -> anyhow::Result<()> {
             generated.namespace
         );
     }
-    let core = actual
-        .iter()
-        .find(|component| component.namespace == "core")
-        .context("schema component catalog is missing core")?;
-    anyhow::ensure!(
-        core.schema_version == schema_version(connection)?,
-        "core component version does not match schema_version"
-    );
     Ok(())
 }
 
@@ -1497,6 +1883,28 @@ mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(preserved, "preserved-old-work");
+        Ok(())
+    }
+
+    #[test]
+    fn future_and_corrupt_databases_fail_closed_without_byte_mutation() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let future_path = temp.path().join("future.sqlite3");
+        {
+            let connection = Connection::open(&future_path)?;
+            create_current_schema(&connection)?;
+            set_schema_version(&connection, 99)?;
+        }
+        let future_before = fs::read(&future_path)?;
+        let future_error = open_store(&future_path).unwrap_err();
+        assert!(format!("{future_error:#}").contains("schema version 99"));
+        assert_eq!(fs::read(&future_path)?, future_before);
+
+        let corrupt_path = temp.path().join("corrupt.sqlite3");
+        fs::write(&corrupt_path, b"not a sqlite database")?;
+        let corrupt_before = fs::read(&corrupt_path)?;
+        assert!(open_store(&corrupt_path).is_err());
+        assert_eq!(fs::read(&corrupt_path)?, corrupt_before);
         Ok(())
     }
 
@@ -1621,12 +2029,21 @@ mod tests {
             let connection = Connection::open(&db_path)?;
             create_current_schema(&connection)?;
             downgrade_test_schema_to_v2(&connection)?;
+            connection.pragma_update(None, "journal_mode", "WAL")?;
             assert_eq!(schema_version(&connection)?, 2);
             assert!(!table_exists(&connection, "schema_component")?);
         }
 
         let connection = open_store(&db_path)?;
         assert_eq!(schema_version(&connection)?, CURRENT_SCHEMA_VERSION);
+        let migration_from: i64 = connection.query_row(
+            "SELECT CAST(json_extract(payload_json, '$.from_schema_version') AS INTEGER)
+             FROM event_log WHERE entity_type='schema' AND event_type='migration'
+             ORDER BY id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(migration_from, 2);
         assert_eq!(
             list_schema_components(&connection)?.len(),
             GENERATED_DATABASE_COMPONENTS.len()
@@ -1677,7 +2094,7 @@ mod tests {
         assert!(report.readable);
         assert!(report.compatible);
         assert_eq!(report.active_schema_version, Some(2));
-        assert_eq!(report.pending_migrations, vec![2]);
+        assert_eq!(report.pending_migrations, vec![CURRENT_SCHEMA_VERSION]);
         assert!(report.components.is_empty());
         assert!(report.last_backup.is_none());
         let connection = Connection::open(&db_path)?;
@@ -1698,7 +2115,11 @@ mod tests {
             [],
         )?;
 
-        let error = apply_pending_schema_migrations(&connection, Some(2)).unwrap_err();
+        let error = apply_pending_schema_migrations(
+            &connection,
+            Some(MigrationFailpoint::AfterLegacyUpgrade),
+        )
+        .unwrap_err();
         assert!(format!("{error:#}").contains("injected migration failure"));
         assert_eq!(schema_version(&connection)?, 1);
         assert!(!table_exists(&connection, "work_dependency")?);
@@ -1741,12 +2162,13 @@ mod tests {
     }
 
     #[test]
-    fn withdrawn_v4_database_is_normalized_to_v2_without_losing_ingestion() -> anyhow::Result<()> {
+    fn withdrawn_v4_database_is_normalized_to_v5_without_losing_ingestion() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let db_path = temp.path().join("ldgr.sqlite3");
         {
             let connection = Connection::open(&db_path)?;
             create_current_schema(&connection)?;
+            drop_v5_error_schema(&connection)?;
             connection.execute(
                 "INSERT INTO component_ingest (
                     component_namespace, source_schema_version, source_contract_hash,
@@ -1768,7 +2190,15 @@ mod tests {
         }
 
         let connection = open_store(&db_path)?;
-        assert_eq!(schema_version(&connection)?, 2);
+        assert_eq!(schema_version(&connection)?, CURRENT_SCHEMA_VERSION);
+        let migration_from: i64 = connection.query_row(
+            "SELECT CAST(json_extract(payload_json, '$.from_schema_version') AS INTEGER)
+             FROM event_log WHERE entity_type='schema' AND event_type='migration'
+             ORDER BY id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(migration_from, 4);
         validate_component_catalog(&connection)?;
         let preserved: i64 = connection.query_row(
             "SELECT COUNT(*) FROM component_ingest WHERE idempotency_key = 'preserved'",
@@ -1782,7 +2212,9 @@ mod tests {
             .filter(|path| {
                 path.file_name()
                     .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.contains("backup-schema-v4-to-v2"))
+                    .is_some_and(|name| {
+                        name.contains(&format!("backup-schema-v4-to-v{}", CURRENT_SCHEMA_VERSION))
+                    })
                     && path.extension().and_then(|value| value.to_str()) == Some("sqlite3")
             })
             .collect::<Vec<_>>();
@@ -1799,6 +2231,7 @@ mod tests {
         {
             let connection = Connection::open(&db_path)?;
             create_current_schema(&connection)?;
+            drop_v5_error_schema(&connection)?;
             connection.execute(
                 "INSERT INTO schema_component (
                     namespace, schema_version, minimum_core_schema, migration_digest, contract_hash
@@ -1828,6 +2261,50 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn recognized_v3_database_migrates_without_losing_causal_ids() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let db_path = temp.path().join("ldgr.sqlite3");
+        {
+            let connection = Connection::open(&db_path)?;
+            create_current_schema(&connection)?;
+            drop_v5_error_schema(&connection)?;
+            connection.execute_batch(
+                r#"
+                DROP TABLE component_record;
+                DROP TABLE component_ingest;
+                UPDATE schema_component
+                   SET schema_version=3, minimum_core_schema=3,
+                       contract_hash='sha256:obsolete-v3';
+                UPDATE schema_version SET version=3 WHERE id=1;
+                INSERT INTO work_item (id, slug, title, description)
+                VALUES (4242, 'v3-preserved', 'V3 preserved', 'Keep causal ID');
+                "#,
+            )?;
+        }
+        let connection = open_store(&db_path)?;
+        assert_eq!(current_schema_version(&connection)?, CURRENT_SCHEMA_VERSION);
+        let migration_from: i64 = connection.query_row(
+            "SELECT CAST(json_extract(payload_json, '$.from_schema_version') AS INTEGER)
+             FROM event_log WHERE entity_type='schema' AND event_type='migration'
+             ORDER BY id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(migration_from, 3);
+        assert_eq!(
+            connection.query_row(
+                "SELECT id FROM work_item WHERE slug='v3-preserved'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )?,
+            4242
+        );
+        assert!(table_exists(&connection, "error_occurrence")?);
+        validate_component_catalog(&connection)?;
+        Ok(())
+    }
+
     fn assert_core_tables_exist(connection: &Connection) -> anyhow::Result<()> {
         for table_name in CORE_TABLES {
             assert!(
@@ -1835,6 +2312,101 @@ mod tests {
                 "missing {table_name}"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn v5_migration_failpoints_roll_back_and_preserve_verified_backup() -> anyhow::Result<()> {
+        for failpoint in [
+            MigrationFailpoint::AfterTableCreation,
+            MigrationFailpoint::BeforeVersionUpdate,
+            MigrationFailpoint::BeforeCommit,
+        ] {
+            let temp = TempDir::new()?;
+            let db_path = temp.path().join("ldgr.sqlite3");
+            let connection = Connection::open(&db_path)?;
+            create_current_schema(&connection)?;
+            downgrade_test_schema_to_v2(&connection)?;
+            connection.pragma_update(None, "journal_mode", "WAL")?;
+            connection.execute(
+                "INSERT INTO work_item (slug, title, description)
+                 VALUES ('preserved', 'Preserved', 'Migration rollback evidence')",
+                [],
+            )?;
+
+            let mut backup_path = None;
+            let error = in_migration_transaction(&connection, |connection| {
+                let backup =
+                    super::super::helpers::create_migration_backup(connection, &db_path, 2)?;
+                backup_path = Some(backup.backup);
+                apply_pending_schema_migrations_locked(connection, Some(failpoint))
+            })
+            .unwrap_err();
+            assert!(format!("{error:#}").contains("injected migration failure"));
+            assert_eq!(schema_version(&connection)?, 2);
+            assert!(!table_exists(&connection, "error_record")?);
+            let preserved: String = connection.query_row(
+                "SELECT slug FROM work_item WHERE slug='preserved'",
+                [],
+                |row| row.get(0),
+            )?;
+            assert_eq!(preserved, "preserved");
+
+            let backup_path = backup_path.context("failpoint did not create backup")?;
+            let backup = Connection::open(backup_path)?;
+            assert_eq!(schema_version(&backup)?, 2);
+            assert!(!table_exists(&backup, "error_record")?);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_openers_converge_on_one_complete_v5_migration() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let db_path = temp.path().join("ldgr.sqlite3");
+        {
+            let connection = Connection::open(&db_path)?;
+            create_current_schema(&connection)?;
+            downgrade_test_schema_to_v2(&connection)?;
+        }
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+        let mut threads = Vec::new();
+        for _ in 0..4 {
+            let db_path = db_path.clone();
+            let barrier = barrier.clone();
+            threads.push(std::thread::spawn(move || -> anyhow::Result<String> {
+                barrier.wait();
+                let connection = open_store(&db_path)?;
+                anyhow::ensure!(
+                    current_schema_version(&connection)? == CURRENT_SCHEMA_VERSION,
+                    "opener observed incomplete schema"
+                );
+                connection
+                    .query_row(
+                        "SELECT project_id FROM project_identity WHERE id=1",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .map_err(Into::into)
+            }));
+        }
+        let project_ids = threads
+            .into_iter()
+            .map(|thread| thread.join().expect("migration opener panicked"))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        assert!(project_ids.windows(2).all(|pair| pair[0] == pair[1]));
+        let backups = fs::read_dir(temp.path())?
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("backup-schema-v2-to-v5")
+                    && entry.path().extension().and_then(|value| value.to_str()) == Some("sqlite3")
+            })
+            .count();
+        assert_eq!(backups, 1);
         Ok(())
     }
 
@@ -1855,6 +2427,12 @@ mod tests {
             DROP TABLE component_record;
             DROP TABLE component_ingest;
             DROP TABLE schema_component;
+            DROP TABLE error_disposition;
+            DROP TABLE error_transition;
+            DROP TABLE error_relation;
+            DROP TABLE error_occurrence;
+            DROP TABLE error_record;
+            DROP TABLE project_identity;
             DROP TRIGGER IF EXISTS trg_work_dependency_no_cycle;
             DROP INDEX IF EXISTS idx_work_dependency_depends_on;
             DROP INDEX IF EXISTS idx_work_item_priority_program;
@@ -1871,12 +2449,32 @@ mod tests {
         Ok(())
     }
 
+    fn drop_v5_error_schema(connection: &Connection) -> anyhow::Result<()> {
+        connection.execute_batch(
+            r#"
+            DROP TABLE error_disposition;
+            DROP TABLE error_transition;
+            DROP TABLE error_relation;
+            DROP TABLE error_occurrence;
+            DROP TABLE error_record;
+            DROP TABLE project_identity;
+            "#,
+        )?;
+        Ok(())
+    }
+
     fn downgrade_test_schema_to_v2(connection: &Connection) -> anyhow::Result<()> {
         connection.execute_batch(
             r#"
             DROP TABLE component_record;
             DROP TABLE component_ingest;
             DROP TABLE schema_component;
+            DROP TABLE error_disposition;
+            DROP TABLE error_transition;
+            DROP TABLE error_relation;
+            DROP TABLE error_occurrence;
+            DROP TABLE error_record;
+            DROP TABLE project_identity;
             UPDATE schema_version SET version = 2 WHERE id = 1;
             "#,
         )?;

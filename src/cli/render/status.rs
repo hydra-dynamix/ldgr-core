@@ -6,8 +6,8 @@ use serde::Serialize;
 use crate::store::{
     last_completed_work_item, list_decisions, list_observations_for_work,
     list_validation_records_for_work, list_work_item_views_filtered, list_work_items_filtered,
-    next_ready_work_item, normalize_priority, work_readiness, DecisionSummary, ObservationSummary,
-    StoreContext, ValidationSummary, WorkItem, WorkItemStatus, WorkItemView,
+    next_ready_work_item, normalize_priority, work_readiness, DecisionSummary, ErrorSurface,
+    ObservationSummary, StoreContext, ValidationSummary, WorkItem, WorkItemStatus, WorkItemView,
 };
 
 use super::brief_context::{
@@ -29,6 +29,7 @@ pub(crate) struct StatusSummary {
     pub observations: Vec<ObservationSummary>,
     pub validations: Vec<ValidationSummary>,
     pub decision: Option<DecisionSummary>,
+    pub errors: ErrorSurface,
     pub loop_state: BriefLoopState,
     pub active_runs: Vec<BriefActiveRun>,
     pub installed_adapter_namespaces: Vec<BriefAdapterNamespace>,
@@ -142,6 +143,7 @@ pub(crate) fn build_status_summary(
             width: width.clamp(40, 2000),
         },
     );
+    let errors = crate::store::error_surface(connection, 1, 3)?;
     let global_history = full.then(|| StatusGlobalHistory {
         loop_state: brief.loop_state.clone(),
         active_runs: brief.active_runs.clone(),
@@ -208,6 +210,7 @@ pub(crate) fn build_status_summary(
         observations,
         validations,
         decision,
+        errors,
         loop_state,
         active_runs: brief.active_runs.clone(),
         installed_adapter_namespaces: brief.installed_adapter_namespaces.clone(),
@@ -393,6 +396,7 @@ pub(crate) fn print_status_summary(summary: &StatusSummary) {
         summary.work_items.done,
         summary.work_items.canceled
     );
+    print_error_surface(&summary.errors);
     if let Some(next) = &summary.next {
         let priority = next
             .priority
@@ -463,6 +467,44 @@ pub(crate) fn print_status_summary(summary: &StatusSummary) {
         println!("full_status: ldgr status --full");
     }
     print_operational_handoff(summary);
+}
+
+fn print_error_surface(errors: &ErrorSurface) {
+    println!(
+        "errors: unresolved={} repeated={} disposition_pending={} total={} latest_truncated={}",
+        errors.counts.unresolved,
+        errors.counts.repeated,
+        errors.counts.disposition_pending,
+        errors.counts.total,
+        errors.truncated
+    );
+    let Some(latest) = errors.latest.first() else {
+        println!("latest_error: none");
+        return;
+    };
+    let disposition = if latest.disposition_pending {
+        "pending".to_owned()
+    } else {
+        latest
+            .latest_disposition
+            .as_ref()
+            .map(|value| value.action.as_str().to_owned())
+            .unwrap_or_else(|| "none".to_owned())
+    };
+    println!(
+        "latest_error: error={} occurrence={} state={} repeated={} occurrences={} disposition={} severity={} domain={} code={} observed_at={}",
+        latest.error_id,
+        latest.latest_occurrence.occurrence_id,
+        latest.state,
+        latest.repeated,
+        latest.occurrence_count,
+        disposition,
+        latest.severity,
+        latest.domain,
+        latest.code,
+        latest.latest_occurrence.observed_at
+    );
+    println!("latest_error_summary: {}", latest.latest_occurrence.summary);
 }
 
 fn print_global_history(history: &StatusGlobalHistory) {

@@ -55,11 +55,30 @@ pub fn run_loop_once(
         Ok(result) => Ok(LoopRuntimeOutcome::Completed(result)),
         Err(error) => {
             let message = format!("Loop runtime failed for {}: {error:#}", work_item.slug);
+            let failure = classify_runtime_error(&error);
+            let durability = options
+                .attempt
+                .record_durable(Some(connection), failure, Some(run.id));
             let _ = record_run_phase(connection, run.id, "failed", &message);
             let _ = add_observation(connection, run.id, &message);
             let _ = finish_run(connection, run.id, RunStatus::Failed, Some(&message));
+            durability?;
             Err(error)
         }
+    }
+}
+
+fn classify_runtime_error(error: &anyhow::Error) -> crate::recovery::FailureKind {
+    let text = format!("{error:#}");
+    if text.contains("failed to spawn") {
+        crate::recovery::FailureKind::Spawn
+    } else if text.contains("failed to wait")
+        || text.contains("reader stopped")
+        || text.contains("pipe")
+    {
+        crate::recovery::FailureKind::UnexpectedDisappearance
+    } else {
+        crate::recovery::FailureKind::Initialization
     }
 }
 
@@ -212,6 +231,7 @@ fn run_loop_after_start(
         "running_agent",
         &format!("Running autonomous agent command for {work_slug}."),
     )?;
+    crate::fault_injection::crash_if("loop-before-spawn");
     let mut agent = match &options.agent {
         LoopAgent::DryRun => ProcessCapture::from_memory(
             None,
@@ -240,6 +260,26 @@ fn run_loop_after_start(
 
     if matches!(options.agent, LoopAgent::Agentctl) {
         agent = enrich_agentctl_failure_output(agent);
+    }
+
+    if let Some(signal) = agent.signal {
+        options.attempt.record_durable(
+            Some(connection),
+            crate::recovery::FailureKind::Signal(signal),
+            Some(run_id),
+        )?;
+    } else if let Some(exit_code) = agent.exit_code.filter(|code| *code != 0) {
+        options.attempt.record_durable(
+            Some(connection),
+            crate::recovery::FailureKind::ExitCode(exit_code),
+            Some(run_id),
+        )?;
+    } else if agent.exit_code.is_none() && !options.dry_run {
+        options.attempt.record_durable(
+            Some(connection),
+            crate::recovery::FailureKind::UnexpectedDisappearance,
+            Some(run_id),
+        )?;
     }
 
     if get_run(connection, run_id)?.status == RunStatus::Running {
@@ -271,6 +311,7 @@ fn run_loop_after_start(
         "Autonomous loop agent stdout/stderr capture.",
     )?;
 
+    crate::fault_injection::crash_if("loop-before-summary");
     let (summary_artifact_path, summary_exit_code) = run_post_cycle_summary(
         connection,
         artifact_root,
@@ -453,4 +494,3 @@ fn append_summary_log(
     }
     Ok(())
 }
-

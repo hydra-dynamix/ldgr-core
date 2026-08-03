@@ -1,6 +1,6 @@
 [package]
 name = "ldgr-core"
-version = "0.1.12"
+version = "0.1.13"
 edition = "2021"
 description = "A minimal durable investigation loop backed by SQLite."
 license = "Apache-2.0"
@@ -42,3 +42,4 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Securit
 [dev-dependencies]
 assert_cmd = "2.0"
 predicates = "3.1"
+rustls = { version = "0.23.42", default-features = false, features = ["ring", "std"] }

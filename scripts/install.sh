@@ -4,6 +4,7 @@ set -eu
 REPO="${LDGR_REPO:-hydra-dynamix/ldgr-core}"
 PACKAGE="ldgr-core"
 BINARY="ldgr"
+AGENTCTL_BINARY="agentctl"
 INSTALL_DIR="${LDGR_INSTALL_DIR:-$HOME/.local/bin}"
 VERSION="${LDGR_VERSION:-}"
 BASE_URL="${LDGR_RELEASE_BASE_URL:-https://github.com/$REPO/releases/download}"
@@ -106,13 +107,29 @@ sha256_check "$TMP_DIR/$ARCHIVE.sha256" "$TMP_DIR/$ARCHIVE"
 
 tar -xzf "$TMP_DIR/$ARCHIVE" -C "$TMP_DIR"
 SRC="$TMP_DIR/$PACKAGE-$VERSION/$PLATFORM/$BINARY_FILE"
+AGENTCTL_FILE="$AGENTCTL_BINARY"
+case "$PLATFORM" in
+  windows-*) AGENTCTL_FILE="$AGENTCTL_BINARY.exe" ;;
+esac
+AGENTCTL_SRC="$TMP_DIR/$PACKAGE-$VERSION/$PLATFORM/$AGENTCTL_FILE"
 [ -f "$SRC" ] || fail "archive did not contain expected binary: $PACKAGE-$VERSION/$PLATFORM/$BINARY_FILE"
+[ -f "$AGENTCTL_SRC" ] || fail "archive did not contain paired launcher: $PACKAGE-$VERSION/$PLATFORM/$AGENTCTL_FILE"
 mkdir -p "$INSTALL_DIR"
+if [ -f "$INSTALL_DIR/$AGENTCTL_FILE" ]; then
+  cp "$INSTALL_DIR/$AGENTCTL_FILE" "$INSTALL_DIR/$AGENTCTL_FILE.previous"
+fi
+if [ -f "$INSTALL_DIR/$BINARY_FILE" ]; then
+  cp "$INSTALL_DIR/$BINARY_FILE" "$INSTALL_DIR/$BINARY_FILE.previous"
+fi
+cp "$AGENTCTL_SRC" "$INSTALL_DIR/$AGENTCTL_FILE"
 cp "$SRC" "$INSTALL_DIR/$BINARY_FILE"
-chmod +x "$INSTALL_DIR/$BINARY_FILE"
-log "Installed $BINARY_FILE to $INSTALL_DIR/$BINARY_FILE"
+chmod +x "$INSTALL_DIR/$BINARY_FILE" "$INSTALL_DIR/$AGENTCTL_FILE"
+log "Installed paired $BINARY_FILE and $AGENTCTL_FILE to $INSTALL_DIR"
 case ":$PATH:" in
   *":$INSTALL_DIR:"*) ;;
   *) log "Add $INSTALL_DIR to PATH if needed." ;;
 esac
 "$INSTALL_DIR/$BINARY_FILE" --version
+"$INSTALL_DIR/$AGENTCTL_FILE" --version
+agentctl_version="$("$INSTALL_DIR/$AGENTCTL_FILE" --version | awk '{print $2}')"
+"$INSTALL_DIR/$BINARY_FILE" compatibility --agentctl-version "$agentctl_version" --json

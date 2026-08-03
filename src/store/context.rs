@@ -8,6 +8,8 @@ const CONTEXT_LATEST_VALIDATION_LIMIT: i64 = 3;
 const CONTEXT_LOOP_INTERVENTION_LIMIT: i64 = 10;
 const CONTEXT_LATEST_EVENT_LIMIT: i64 = 10;
 const CONTEXT_RUN_NARRATIVE_LIMIT: i64 = 6;
+const CONTEXT_ERROR_LIMIT: usize = 5;
+const CONTEXT_ERROR_RELATED_WORK_LIMIT: usize = 5;
 
 pub fn read_context(connection: &Connection) -> anyhow::Result<StoreContext> {
     base_context(connection)
@@ -20,6 +22,11 @@ fn base_context(connection: &Connection) -> anyhow::Result<StoreContext> {
         held_work_items: count_work_items_by_status(connection, WorkItemStatus::Held)?,
         done_work_items: count_work_items_by_status(connection, WorkItemStatus::Done)?,
         canceled_work_items: count_work_items_by_status(connection, WorkItemStatus::Canceled)?,
+        errors: error_surface(
+            connection,
+            CONTEXT_ERROR_LIMIT,
+            CONTEXT_ERROR_RELATED_WORK_LIMIT,
+        )?,
         loop_state: read_loop_state(connection)?,
         active_runs: list_active_runs(connection, CONTEXT_ACTIVE_RUN_LIMIT)?,
         next_work_item: next_pending_work_item(connection)?,

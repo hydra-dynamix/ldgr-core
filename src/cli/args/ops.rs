@@ -21,7 +21,7 @@ pub enum TelemetryInstallChoice {
 
 #[derive(Debug, Args)]
 #[command(
-    after_help = "Examples:\n  ldgr install\n  ldgr install --harness pi --harness claude --adapter conduct --yes --telemetry disable\n  ldgr install --yes --no-agentctl --telemetry enable\n  ldgr install adapter code --yes\n\nThe first interactive install requires an explicit telemetry Yes or No choice with no default. Non-interactive installs must pass --telemetry enable or --telemetry disable; --yes is not telemetry consent. The decision is remembered and later installs do not ask again. Without --harness, the installer asks interactively and defaults to Pi. Multiple harnesses may be selected. In interactive mode the installer also offers adapter bundle selection. The selected harness config is recorded under ~/.ldgr/. agentctl is installed when missing unless --no-agentctl is passed."
+    after_help = "Examples:\n  ldgr install\n  ldgr install --harness pi --harness claude --adapter conduct --yes --telemetry disable\n  ldgr install --yes --no-agentctl --telemetry enable\n  ldgr install adapter code --yes\n\nThe first interactive install requires an explicit telemetry Yes or No choice with no default. Non-interactive installs must pass --telemetry enable or --telemetry disable; --yes is not telemetry consent. The decision is remembered and later installs do not ask again. Without --harness, the installer asks interactively and defaults to Pi. Multiple harnesses may be selected. In interactive mode the installer also offers adapter bundle selection. The selected harness config is recorded in ~/.ldgr/config.toml with a legacy config.json compatibility mirror. agentctl is installed when missing unless --no-agentctl is passed."
 )]
 pub struct InstallArgs {
     #[command(subcommand)]
@@ -63,7 +63,7 @@ pub struct InstallAdapterArgs {
     /// Adapter name, e.g. conduct, research, example, code, bench, explore, security.
     pub name: String,
 
-    /// Source checkout root containing adapter crates. Optional override for local source installs.
+    /// Monorepo root containing the adapter crate, or the adapter crate root itself.
     #[arg(long)]
     pub source_root: Option<PathBuf>,
 
@@ -227,7 +227,7 @@ pub struct WebArgs {
 
 #[derive(Debug, Args)]
 #[command(
-    after_help = "Examples:\n  ldgr loop run --prompt prompts/loop-prompt.md --agent agentctl\n  ldgr loop run --prompt prompts/loop-prompt.md --agent agentctl --until-empty --summary-agent agentctl\n  ldgr loop run --prompt prompts/loop-prompt.md --dry-run\n  ldgr loop run --prompt prompts/loop-prompt.md --agent-argv '[\"my-agent\"]'\n\nLoop run executes bounded cycles from pending work items. Each cycle is a fresh agent invocation that rehydrates from LDGR context. Use --until-empty to keep launching one fresh cycle at a time until no pending work remains or the loop blocks."
+    after_help = "Examples:\n  ldgr loop run --prompt prompts/loop-prompt.md --agent agentctl\n  ldgr loop run --prompt prompts/loop-prompt.md --agent agentctl --until-empty --summary-agent agentctl\n  ldgr loop run --prompt prompts/loop-prompt.md --agent agentctl --until-empty --detach\n  ldgr loop run --prompt prompts/loop-prompt.md --dry-run\n  ldgr loop run --prompt prompts/loop-prompt.md --agent-argv '[\"my-agent\"]'\n\nLoop run executes bounded cycles from pending work items. Each cycle is a fresh agent invocation that rehydrates from LDGR context. Use --until-empty to keep launching one fresh cycle at a time until no pending work remains or the loop blocks. Use --detach for a background process whose stdout and stderr are written under the LDGR logs directory."
 )]
 pub struct LoopArgs {
     #[command(subcommand)]
@@ -293,6 +293,10 @@ pub struct LoopRunArgs {
     /// Tee autonomous agent stdout/stderr to this terminal while still recording the output artifact.
     #[arg(long)]
     pub stream_agent_output: bool,
+
+    /// Run the loop in a detached background process with output under the LDGR logs directory.
+    #[arg(long)]
+    pub detach: bool,
 
     /// Maximum seconds to wait for each spawned agent process. Zero disables the wall-clock timeout.
     #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u64))]
