@@ -96,18 +96,13 @@ fn enrich_agentctl_failure_output(mut capture: ProcessCapture) -> ProcessCapture
 }
 
 fn process_home_dir() -> Option<PathBuf> {
-    nonempty_environment_value("HOME")
-        .or_else(|| {
-            #[cfg(windows)]
-            {
-                nonempty_environment_value("USERPROFILE")
-            }
-            #[cfg(not(windows))]
-            {
-                None
-            }
-        })
-        .map(PathBuf::from)
+    #[cfg(windows)]
+    let home = nonempty_environment_value("HOME")
+        .or_else(|| nonempty_environment_value("USERPROFILE"));
+    #[cfg(not(windows))]
+    let home = nonempty_environment_value("HOME");
+
+    home.map(PathBuf::from)
 }
 
 fn nonempty_environment_value(name: &str) -> Option<std::ffi::OsString> {
