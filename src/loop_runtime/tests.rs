@@ -102,19 +102,8 @@ mod tests {
         ]
     }
 
-    #[cfg(unix)]
     fn sleeping_child_argv() -> Vec<String> {
         vec!["sh".to_owned(), "-c".to_owned(), "sleep 5".to_owned()]
-    }
-
-    #[cfg(windows)]
-    fn sleeping_child_argv() -> Vec<String> {
-        vec![
-            "cmd".to_owned(),
-            "/D".to_owned(),
-            "/C".to_owned(),
-            "ping -n 6 127.0.0.1 >nul".to_owned(),
-        ]
     }
 
     #[cfg(unix)]

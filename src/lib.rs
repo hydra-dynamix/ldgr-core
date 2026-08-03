@@ -5,6 +5,7 @@ pub mod cli;
 pub mod database_contract;
 mod fault_injection;
 pub mod harness_config;
+mod host_process;
 pub mod loop_runtime;
 pub mod manifest_integrity;
 pub mod recovery;

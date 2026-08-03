@@ -372,9 +372,9 @@ fn run_process_with_stdin_timeouts(
 
     let command_text = render_command(argv);
     let prepared_process_tree = PreparedProcessTree::new()?;
-    let mut command = Command::new(&argv[0]);
+    let host_argv = argv.iter().map(OsString::from).collect::<Vec<_>>();
+    let mut command = crate::host_process::command_from_argv(&host_argv)?;
     command
-        .args(&argv[1..])
         .stdin(Stdio::from(stdin_file))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

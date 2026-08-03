@@ -7,7 +7,6 @@ use std::ffi::OsString;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
-use std::process::Command as ProcessCommand;
 
 use anyhow::{bail, Context};
 use clap::{
@@ -574,10 +573,11 @@ fn dispatch_adapter_namespace(
         .as_ref()
         .map(|toolchain| toolchain.cargo.as_os_str())
         .unwrap_or_else(|| command.argv[0].as_ref());
-    let mut process = ProcessCommand::new(executable);
+    let mut argv = vec![executable.to_os_string()];
+    argv.extend(command.argv[1..].iter().map(OsString::from));
+    argv.extend(request.remaining);
+    let mut process = crate::host_process::command_from_argv(&argv)?;
     process
-        .args(&command.argv[1..])
-        .args(request.remaining)
         .env("LDGR_DB", &request.db)
         .env("LDGR_ARTIFACT_ROOT", &request.artifact_root)
         .env("LDGR_WORKING_DIR", working_dir)

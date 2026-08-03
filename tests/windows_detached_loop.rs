@@ -129,9 +129,10 @@ fn detached_loop_survives_launcher_exit_and_maps_userprofile_to_home() -> anyhow
     while Instant::now() < deadline && !observed_home.exists() {
         thread::sleep(Duration::from_millis(50));
     }
+    let detached_logs = diagnostic_files(&project.path().join(".ldgr"));
     assert!(
         observed_home.exists(),
-        "detached loop did not execute its child agent"
+        "detached loop did not execute its child agent\n{detached_logs}"
     );
     assert_eq!(
         fs::read_to_string(&observed_home)?,
@@ -169,6 +170,35 @@ fn detached_loop_survives_launcher_exit_and_maps_userprofile_to_home() -> anyhow
         })
     }));
     Ok(())
+}
+
+fn diagnostic_files(root: &Path) -> String {
+    let mut files = Vec::new();
+    collect_diagnostic_files(root, &mut files);
+    files.sort();
+    files
+        .into_iter()
+        .filter_map(|path| {
+            fs::read_to_string(&path)
+                .ok()
+                .map(|text| format!("{}:\n{}", path.display(), text))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn collect_diagnostic_files(root: &Path, files: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_diagnostic_files(&path, files);
+        } else if path.is_file() {
+            files.push(path);
+        }
+    }
 }
 
 #[test]

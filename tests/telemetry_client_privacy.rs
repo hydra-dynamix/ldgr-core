@@ -497,6 +497,11 @@ fn run_capture_server(
     let mut requests = Vec::new();
     for response in plan {
         let stream = accept_with_timeout(&listener, Duration::from_secs(5))?;
+        // Windows accepted sockets inherit the listener's nonblocking mode.
+        // Return the connected socket to blocking mode before rustls performs
+        // its handshake; the explicit read/write timeouts still bound every
+        // operation.
+        stream.set_nonblocking(false)?;
         stream.set_read_timeout(Some(Duration::from_secs(5)))?;
         stream.set_write_timeout(Some(Duration::from_secs(5)))?;
         let connection = ServerConnection::new(config.clone())?;
