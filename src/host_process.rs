@@ -1,8 +1,11 @@
 use std::ffi::OsString;
-use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{bail, Context};
+use anyhow::bail;
+#[cfg(windows)]
+use anyhow::Context;
+#[cfg(windows)]
+use std::path::{Path, PathBuf};
 
 pub(crate) fn command_from_argv(argv: &[OsString]) -> anyhow::Result<Command> {
     let Some(program) = argv.first() else {

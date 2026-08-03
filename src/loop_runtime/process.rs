@@ -114,11 +114,11 @@ fn nonempty_environment_value(name: &str) -> Option<std::ffi::OsString> {
     std::env::var_os(name).filter(|value| !value.is_empty())
 }
 
-pub(crate) fn configure_child_home(command: &mut Command) {
+pub(crate) fn configure_child_home(_command: &mut Command) {
     #[cfg(windows)]
     if nonempty_environment_value("HOME").is_none() {
         if let Some(profile) = nonempty_environment_value("USERPROFILE") {
-            command.env("HOME", profile);
+            _command.env("HOME", profile);
         }
     }
 }
