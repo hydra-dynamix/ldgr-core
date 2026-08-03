@@ -1385,7 +1385,13 @@ fn legacy_intent_is_stale(path: &Path, threshold_seconds: u64) -> Result<bool> {
 
 #[cfg(unix)]
 fn process_is_live(process_id: u32) -> Result<bool> {
-    let result = unsafe { libc::kill(process_id as libc::pid_t, 0) };
+    let Ok(process_id) = libc::pid_t::try_from(process_id) else {
+        return Ok(false);
+    };
+    if process_id <= 0 {
+        return Ok(false);
+    }
+    let result = unsafe { libc::kill(process_id, 0) };
     if result == 0 {
         return Ok(true);
     }
@@ -1880,6 +1886,15 @@ mod tests {
                 |row| row.get(0),
             )
             .context("reading test project identity")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_process_liveness_rejects_non_positive_or_overflowing_pids() -> Result<()> {
+        assert!(!process_is_live(0)?);
+        assert!(!process_is_live(u32::MAX)?);
+        assert!(process_is_live(std::process::id())?);
+        Ok(())
     }
 
     fn valid_error_envelope(
