@@ -6,6 +6,10 @@ principle. The Core CLI is primarily an agent interface, so parsing and error
 recovery are non-interactive. The human-driven installer is the only
 interactive exception.
 
+This document covers CLI parsing and diagnostics. Durable failures after an
+operation is accepted follow the
+[first-class error domain contract](first-class-errors.md).
+
 ## Accepted normalization
 
 Core accepts deterministic syntax variants when they identify exactly one

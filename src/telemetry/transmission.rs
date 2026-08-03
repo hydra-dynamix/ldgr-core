@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 
+use anyhow::Context;
 use reqwest::blocking::{Client, Request};
 use reqwest::header::{ACCEPT, CONTENT_TYPE};
 use reqwest::redirect::Policy;
@@ -22,6 +23,19 @@ pub struct TransmissionReport {
     pub accepted: usize,
     pub retained: usize,
     pub invalid_dropped: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingSequencePreview {
+    pub protocol_endpoint: &'static str,
+    pub raw_array: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PendingSequencePreviewReport {
+    pub payloads: Vec<PendingSequencePreview>,
+    pub invalid: usize,
+    pub unreadable: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -101,6 +115,20 @@ impl TransmissionClient {
         protocol: &NumericalProtocol,
         transport: &T,
     ) -> TransmissionReport {
+        self.transmit_with_delay(ldgr_home, protocol, transport, random_delay)
+    }
+
+    fn transmit_with_delay<T, D>(
+        &self,
+        ldgr_home: &Path,
+        protocol: &NumericalProtocol,
+        transport: &T,
+        mut delay: D,
+    ) -> TransmissionReport
+    where
+        T: SequenceTransport,
+        D: FnMut(Duration),
+    {
         let mut report = TransmissionReport::default();
         if !collection_is_eligible(ldgr_home) {
             report.disabled = true;
@@ -109,15 +137,10 @@ impl TransmissionClient {
         if protocol.validate().is_err() {
             return report;
         }
-        let Some(route) = protocol.endpoint().strip_prefix("/sequences/") else {
-            return report;
-        };
-        let pending_directory = ldgr_home.join(TELEMETRY_PENDING_DIRECTORY).join(route);
-        let mut pending = match real_pending_files(&pending_directory) {
+        let pending = match pending_protocol_files(ldgr_home, protocol) {
             Ok(pending) => pending,
             Err(_) => return report,
         };
-        pending.sort();
 
         let endpoint = match self.collector_origin.join(protocol.endpoint()) {
             Ok(endpoint) => endpoint,
@@ -128,26 +151,26 @@ impl TransmissionClient {
                 report.disabled = true;
                 break;
             }
-            let payload = match fs::read(&path) {
-                Ok(payload) => payload,
-                Err(_) => {
+            let sequence = match load_pending_sequence(protocol, path) {
+                PendingSequenceLoad::Valid(sequence) => sequence,
+                PendingSequenceLoad::Invalid { path } => {
+                    if fs::remove_file(&path).is_ok() {
+                        report.invalid_dropped += 1;
+                    } else {
+                        report.retained += 1;
+                    }
+                    continue;
+                }
+                PendingSequenceLoad::Unreadable => {
                     report.retained += 1;
                     continue;
                 }
             };
-            if parse_exact_sequence(protocol, &payload).is_err() {
-                if fs::remove_file(&path).is_ok() {
-                    report.invalid_dropped += 1;
-                } else {
-                    report.retained += 1;
-                }
-                continue;
-            }
 
-            random_delay(self.max_delay);
+            delay(self.max_delay);
             report.attempted += 1;
-            if transport.post(&endpoint, &payload) {
-                if fs::remove_file(&path).is_ok() {
+            if transport.post(&endpoint, &sequence.payload) {
+                if fs::remove_file(&sequence.path).is_ok() {
                     report.accepted += 1;
                 } else {
                     report.retained += 1;
@@ -158,6 +181,26 @@ impl TransmissionClient {
         }
         report
     }
+}
+
+pub fn preview_pending_sequences(
+    ldgr_home: &Path,
+    protocol: &NumericalProtocol,
+) -> anyhow::Result<PendingSequencePreviewReport> {
+    let mut report = PendingSequencePreviewReport::default();
+    for path in pending_protocol_files(ldgr_home, protocol)? {
+        match load_pending_sequence(protocol, path) {
+            PendingSequenceLoad::Valid(sequence) => {
+                report.payloads.push(PendingSequencePreview {
+                    protocol_endpoint: sequence.protocol_endpoint,
+                    raw_array: sequence.payload,
+                });
+            }
+            PendingSequenceLoad::Invalid { .. } => report.invalid += 1,
+            PendingSequenceLoad::Unreadable => report.unreadable += 1,
+        }
+    }
+    Ok(report)
 }
 
 trait SequenceTransport {
@@ -219,6 +262,50 @@ fn collection_is_eligible(ldgr_home: &Path) -> bool {
         && load_telemetry_consent(ldgr_home)
             .map(|consent| consent.collection_enabled())
             .unwrap_or(false)
+}
+
+#[derive(Debug)]
+struct PendingSequencePayload {
+    path: PathBuf,
+    protocol_endpoint: &'static str,
+    payload: Vec<u8>,
+}
+
+#[derive(Debug)]
+enum PendingSequenceLoad {
+    Valid(PendingSequencePayload),
+    Invalid { path: PathBuf },
+    Unreadable,
+}
+
+fn pending_protocol_files(
+    ldgr_home: &Path,
+    protocol: &NumericalProtocol,
+) -> anyhow::Result<Vec<PathBuf>> {
+    protocol.validate().context("invalid numerical protocol")?;
+    let route = protocol
+        .endpoint()
+        .strip_prefix("/sequences/")
+        .context("validated protocol endpoint lost /sequences/ prefix")?;
+    let pending_directory = ldgr_home.join(TELEMETRY_PENDING_DIRECTORY).join(route);
+    let mut pending = real_pending_files(&pending_directory)?;
+    pending.sort();
+    Ok(pending)
+}
+
+fn load_pending_sequence(protocol: &NumericalProtocol, path: PathBuf) -> PendingSequenceLoad {
+    let payload = match fs::read(&path) {
+        Ok(payload) => payload,
+        Err(_) => return PendingSequenceLoad::Unreadable,
+    };
+    if parse_exact_sequence(protocol, &payload).is_err() {
+        return PendingSequenceLoad::Invalid { path };
+    }
+    PendingSequenceLoad::Valid(PendingSequencePayload {
+        path,
+        protocol_endpoint: protocol.endpoint(),
+        payload,
+    })
 }
 
 fn real_pending_files(directory: &Path) -> anyhow::Result<Vec<PathBuf>> {
@@ -306,6 +393,59 @@ mod tests {
         Ok(TransmissionClient::new("https://collector.example")?.with_max_delay(Duration::ZERO))
     }
 
+    fn pending_route(home: &Path) -> PathBuf {
+        home.join(TELEMETRY_PENDING_DIRECTORY).join("core-work/v1")
+    }
+
+    #[test]
+    fn preview_lists_exact_raw_arrays_and_protocol_without_removing_files() -> anyhow::Result<()> {
+        let _guard = telemetry_environment_lock()
+            .lock()
+            .expect("environment lock poisoned");
+        let home = tempfile::tempdir()?;
+        enable(home.path())?;
+        queue(home.path(), COMPLETED_POSITIVE)?;
+        queue(home.path(), COMPLETED_NEGATIVE)?;
+
+        let report = preview_pending_sequences(home.path(), &CORE_WORK_V1)?;
+        assert_eq!(report.invalid, 0);
+        assert_eq!(report.unreadable, 0);
+        assert_eq!(report.payloads.len(), 2);
+        assert!(report
+            .payloads
+            .iter()
+            .all(|preview| preview.protocol_endpoint == "/sequences/core-work/v1"));
+        let mut raw_arrays = report
+            .payloads
+            .iter()
+            .map(|preview| preview.raw_array.clone())
+            .collect::<Vec<_>>();
+        raw_arrays.sort();
+        assert_eq!(raw_arrays, [b"[0,1,3]".to_vec(), b"[0,1,4]".to_vec()]);
+        assert_eq!(fs::read_dir(pending_route(home.path()))?.count(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn preview_counts_malformed_payloads_without_dropping_them() -> anyhow::Result<()> {
+        let _guard = telemetry_environment_lock()
+            .lock()
+            .expect("environment lock poisoned");
+        let home = tempfile::tempdir()?;
+        enable(home.path())?;
+        let route = pending_route(home.path());
+        fs::create_dir_all(&route)?;
+        let invalid = route.join("invalid");
+        fs::write(&invalid, br#"{"project":"secret","sequence":[0,1,3]}"#)?;
+
+        let report = preview_pending_sequences(home.path(), &CORE_WORK_V1)?;
+        assert_eq!(report.payloads, Vec::new());
+        assert_eq!(report.invalid, 1);
+        assert_eq!(report.unreadable, 0);
+        assert!(invalid.exists());
+        Ok(())
+    }
+
     #[test]
     fn one_raw_array_is_sent_per_request_and_accepted_files_are_removed() -> anyhow::Result<()> {
         let _guard = telemetry_environment_lock()
@@ -342,6 +482,10 @@ mod tests {
         )?;
         assert_eq!(request.method(), reqwest::Method::POST);
         assert_eq!(request.headers().len(), 1);
+        // This source-level Request contains only the application header. HTTP
+        // transport defaults such as Host, Content-Length, and reqwest/hyper's
+        // current generic Accept: */* are asserted by the verified-TLS wire
+        // capture in tests/telemetry_client_privacy.rs.
         assert_eq!(request.headers()[CONTENT_TYPE], "application/json");
         assert!(request.headers().get("user-agent").is_none());
         assert!(request.headers().get("cookie").is_none());
@@ -418,6 +562,42 @@ mod tests {
         assert_eq!(report.invalid_dropped, 1);
         assert_eq!(report.attempted, 0);
         assert!(fs::read_dir(route)?.next().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn jitter_is_applied_once_per_valid_send_attempt_only() -> anyhow::Result<()> {
+        let _guard = telemetry_environment_lock()
+            .lock()
+            .expect("environment lock poisoned");
+        let home = tempfile::tempdir()?;
+        enable(home.path())?;
+        queue(home.path(), COMPLETED_POSITIVE)?;
+        queue(home.path(), COMPLETED_NEGATIVE)?;
+        let route = pending_route(home.path());
+        fs::write(route.join("invalid"), br#"{"project":"secret"}"#)?;
+        let transport = CaptureTransport::default();
+        let client = TransmissionClient::new("https://collector.example")?
+            .with_max_delay(Duration::from_millis(17));
+        let mut delays = Vec::new();
+
+        let report = client.transmit_with_delay(home.path(), &CORE_WORK_V1, &transport, |delay| {
+            delays.push(delay);
+        });
+
+        assert_eq!(report.invalid_dropped, 1);
+        assert_eq!(report.attempted, 2);
+        assert_eq!(report.accepted, 0);
+        assert_eq!(report.retained, 2);
+        assert_eq!(delays, vec![Duration::from_millis(17); 2]);
+        assert_eq!(
+            transport
+                .requests
+                .lock()
+                .expect("capture lock poisoned")
+                .len(),
+            2
+        );
         Ok(())
     }
 

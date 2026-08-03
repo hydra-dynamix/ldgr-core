@@ -1,6 +1,8 @@
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+    use std::path::Path;
     use std::sync::{Arc, Barrier};
     use std::thread;
     use tempfile::TempDir;
@@ -386,6 +388,250 @@ mod tests {
             "outside"
         );
 
+        Ok(())
+    }
+
+    struct TelemetryEnvGuard {
+        home: Option<OsString>,
+        userprofile: Option<OsString>,
+        kill_switch: Option<OsString>,
+    }
+
+    impl TelemetryEnvGuard {
+        fn install(home: &Path) -> Self {
+            let guard = Self {
+                home: std::env::var_os("HOME"),
+                userprofile: std::env::var_os("USERPROFILE"),
+                kill_switch: std::env::var_os("LDGR_TELEMETRY"),
+            };
+            std::env::set_var("HOME", home);
+            std::env::remove_var("USERPROFILE");
+            std::env::remove_var("LDGR_TELEMETRY");
+            guard
+        }
+    }
+
+    impl Drop for TelemetryEnvGuard {
+        fn drop(&mut self) {
+            restore_env("HOME", &self.home);
+            restore_env("USERPROFILE", &self.userprofile);
+            restore_env("LDGR_TELEMETRY", &self.kill_switch);
+        }
+    }
+
+    fn restore_env(name: &str, value: &Option<OsString>) {
+        match value {
+            Some(value) => std::env::set_var(name, value),
+            None => std::env::remove_var(name),
+        }
+    }
+
+    fn enable_core_telemetry(home: &Path) -> anyhow::Result<()> {
+        crate::telemetry::save_telemetry_consent(
+            &home.join(".ldgr"),
+            &crate::telemetry::TelemetryConsent::current(
+                crate::telemetry::TelemetryConsentDecision::Enabled,
+            ),
+        )?;
+        Ok(())
+    }
+
+    fn core_telemetry_sequences(
+        home: &Path,
+    ) -> anyhow::Result<Vec<Vec<crate::telemetry::transition::StateCode>>> {
+        let route = home.join(".ldgr/telemetry-pending/core-work/v1");
+        if !route.exists() {
+            return Ok(Vec::new());
+        }
+        let mut files = fs::read_dir(route)?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<Result<Vec<_>, _>>()?;
+        files.sort();
+        files
+            .into_iter()
+            .map(|path| {
+                let payload = fs::read(path)?;
+                Ok(serde_json::from_slice(&payload)?)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn core_work_telemetry_maps_completed_result_terminals_without_content() -> anyhow::Result<()> {
+        let _lock = crate::telemetry::telemetry_environment_lock()
+            .lock()
+            .expect("telemetry environment lock poisoned");
+        let home = TempDir::new()?;
+        let _env = TelemetryEnvGuard::install(home.path());
+        enable_core_telemetry(home.path())?;
+
+        let (_temp, connection) = temp_store()?;
+
+        create_work_item(&connection, None, "positive", "Positive", "Positive work")?;
+        let positive_run = start_run(&connection, "positive", Some("secret positive command"))?;
+        close_run(
+            &connection,
+            positive_run.id,
+            RunStatus::Success,
+            Some("secret positive notes"),
+            DecisionOutcome::Continue,
+            "secret positive rationale",
+            Some(NextWorkSpec {
+                slug: "after-positive",
+                title: Some("After positive"),
+                description: Some("Queued follow-up"),
+            }),
+        )?;
+
+        create_work_item(&connection, None, "negative", "Negative", "Negative work")?;
+        let negative_run = start_run(&connection, "negative", Some("secret negative command"))?;
+        add_validation_record(
+            &connection,
+            negative_run.id,
+            ValidationOutcome::Fail,
+            Some("secret failing validation command"),
+            Some("secret failing validation rationale"),
+        )?;
+        close_run(
+            &connection,
+            negative_run.id,
+            RunStatus::Success,
+            None,
+            DecisionOutcome::Continue,
+            "secret negative rationale",
+            Some(NextWorkSpec {
+                slug: "after-negative",
+                title: Some("After negative"),
+                description: Some("Queued follow-up"),
+            }),
+        )?;
+
+        create_work_item(
+            &connection,
+            None,
+            "inconclusive",
+            "Inconclusive",
+            "Inconclusive work",
+        )?;
+        let inconclusive_run = start_run(&connection, "inconclusive", Some("secret command"))?;
+        close_run(
+            &connection,
+            inconclusive_run.id,
+            RunStatus::Success,
+            None,
+            DecisionOutcome::Inconclusive,
+            "secret inconclusive rationale",
+            Some(NextWorkSpec {
+                slug: "after-inconclusive",
+                title: Some("After inconclusive"),
+                description: Some("Queued follow-up"),
+            }),
+        )?;
+
+        let mut sequences = core_telemetry_sequences(home.path())?;
+        sequences.sort();
+        assert_eq!(sequences, vec![vec![0, 1, 3], vec![0, 1, 4], vec![0, 1, 5]]);
+        for path in fs::read_dir(home.path().join(".ldgr/telemetry-pending/core-work/v1"))? {
+            let payload = fs::read_to_string(path?.path())?;
+            assert!(!payload.contains("secret"));
+            assert!(payload.starts_with('[') && payload.ends_with(']'));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn core_work_telemetry_maps_failure_cancellation_and_hold_resume_sequences(
+    ) -> anyhow::Result<()> {
+        let _lock = crate::telemetry::telemetry_environment_lock()
+            .lock()
+            .expect("telemetry environment lock poisoned");
+        let home = TempDir::new()?;
+        let _env = TelemetryEnvGuard::install(home.path());
+        enable_core_telemetry(home.path())?;
+
+        let (_temp, connection) = temp_store()?;
+
+        create_work_item(&connection, None, "failure", "Failure", "Failure work")?;
+        let failed_run = start_run(&connection, "failure", Some("secret failed command"))?;
+        finish_run(
+            &connection,
+            failed_run.id,
+            RunStatus::Failed,
+            Some("secret operational failure notes"),
+        )?;
+
+        create_work_item(&connection, None, "cancel", "Cancel", "Cancel work")?;
+        let _cancel_run = start_run(&connection, "cancel", Some("secret cancel command"))?;
+        cancel_work_item(&connection, "cancel", Some("secret cancellation reason"))?;
+
+        create_work_item(&connection, None, "held", "Held", "Held work")?;
+        let first_run = start_run(&connection, "held", Some("secret first command"))?;
+        assert_eq!(first_run.status, RunStatus::Running);
+        hold_work_item(&connection, "held", Some("secret hold reason"))?;
+        resume_work_item(&connection, "held", Some("secret resume reason"))?;
+        let second_run = start_run(&connection, "held", Some("secret second command"))?;
+        close_run(
+            &connection,
+            second_run.id,
+            RunStatus::Success,
+            None,
+            DecisionOutcome::Continue,
+            "secret held completion rationale",
+            Some(NextWorkSpec {
+                slug: "after-held",
+                title: Some("After held"),
+                description: Some("Queued follow-up"),
+            }),
+        )?;
+
+        let mut sequences = core_telemetry_sequences(home.path())?;
+        sequences.sort();
+        assert_eq!(
+            sequences,
+            vec![vec![0, 1, 2, 1, 3], vec![0, 1, 6], vec![0, 1, 7]]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn core_work_telemetry_respects_consent_off_and_failed_commits() -> anyhow::Result<()> {
+        let _lock = crate::telemetry::telemetry_environment_lock()
+            .lock()
+            .expect("telemetry environment lock poisoned");
+        let home = TempDir::new()?;
+        let _env = TelemetryEnvGuard::install(home.path());
+
+        let (_temp, connection) = temp_store()?;
+        create_work_item(&connection, None, "off", "Off", "Consent off work")?;
+        let off_run = start_run(&connection, "off", Some("command"))?;
+        close_run(
+            &connection,
+            off_run.id,
+            RunStatus::Success,
+            None,
+            DecisionOutcome::Stop,
+            "done with consent off",
+            None,
+        )?;
+        assert!(core_telemetry_sequences(home.path())?.is_empty());
+
+        enable_core_telemetry(home.path())?;
+        create_work_item(&connection, None, "rollback", "Rollback", "Rollback work")?;
+        let rollback_run = start_run(&connection, "rollback", Some("command"))?;
+        let error = close_run(
+            &connection,
+            rollback_run.id,
+            RunStatus::Success,
+            Some("should not commit"),
+            DecisionOutcome::Continue,
+            "missing next work should roll back",
+            None,
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("continuing requires a next work item"));
+        assert!(core_telemetry_sequences(home.path())?.is_empty());
         Ok(())
     }
 }

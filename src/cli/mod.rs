@@ -1,12 +1,12 @@
 pub mod args;
 pub mod commands;
 pub(crate) mod render;
+mod rust_toolchain;
 
 use std::ffi::OsString;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
-use std::process::Command as ProcessCommand;
 
 use anyhow::{bail, Context};
 use clap::{
@@ -36,6 +36,9 @@ pub(crate) const CLI_DEFAULT_HELP_SECTIONS: &str = r#"Core loop:
   artifact add <run-id-or-work-slug> --path <file> --description <why-it-matters>
   artifact show <artifact-id>
   validation record <run-id-or-work-slug> --outcome <pass|fail|error|skipped> --rationale <why-if-skipped>
+  error record --occurrence-id <id> --producer <producer> --idempotency-key <key> ...
+  error list
+  error context <error-id> [--occurrence-id <id>] [--limit 5]
   decision record <work-slug> --outcome continue --rationale <why> --next-slug <slug> --next-title <title> --next-description <description>
   status
   schema doctor [--json]
@@ -58,70 +61,7 @@ Adapters:
 Default help shows the day-one workflow. Run `ldgr --full` for the core command map.
 "#;
 
-pub(crate) const CLI_FULL_HELP_SECTIONS: &str = r#"Core command tree:
-  init
-  migrate
-  status
-  context
-    --brief
-  web
-  next
-  rerun
-  work
-    list
-    show
-    create
-    edit
-    import
-    export
-    status
-      set
-    delete
-  run
-    list
-    show
-    start
-    finish
-    close
-  observation (alias: observe)
-    list
-    add
-  artifact
-    list
-    show
-    add
-  validation
-    list
-    record
-  decision
-    list
-    record
-  prompt
-    create
-    import
-    update
-    activate
-  bundle
-    create
-    seal
-  adapter
-    install
-      list | <slug>
-    list
-    show
-    dispatch
-  telemetry
-    status
-    enable
-    disable
-  notice
-    list
-    add
-    edit
-    clear
-  loop
-    run
-
+const CLI_FULL_HELP_FOOTER: &str = r#"
 Research/readiness commands moved to `ldgr-research`:
   issue, blocker, fact, expectation, failure, milestone, target-profile,
   profile, coverage, readiness, tool, skill, evidence, and chat.
@@ -133,6 +73,30 @@ Effective workflow:
   4. Record a decision that either queues the next work item or stops for a stated reason.
   5. Start each agent handoff with `ldgr status`; expand to `ldgr context` only when needed.
 "#;
+
+fn render_full_command_map() -> String {
+    let mut output = String::from("Core command tree:\n");
+    render_command_paths(&Cli::command(), &[], &mut output);
+    output.push_str(CLI_FULL_HELP_FOOTER);
+    output
+}
+
+fn render_command_paths(command: &clap::Command, parent: &[&str], output: &mut String) {
+    for subcommand in command.get_subcommands() {
+        let mut path = parent.to_vec();
+        path.push(subcommand.get_name());
+        output.push_str("  ");
+        output.push_str(&path.join(" "));
+        let aliases = subcommand.get_visible_aliases().collect::<Vec<_>>();
+        if !aliases.is_empty() {
+            output.push_str(" [aliases: ");
+            output.push_str(&aliases.join(", "));
+            output.push(']');
+        }
+        output.push('\n');
+        render_command_paths(subcommand, &path, output);
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "ldgr")]
@@ -159,6 +123,15 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Negotiate the launcher/Core recovery protocol before worker startup.
+    Compatibility {
+        /// Agentctl semantic version requesting compatibility.
+        #[arg(long)]
+        agentctl_version: String,
+        /// Emit the versioned machine-readable report.
+        #[arg(long)]
+        json: bool,
+    },
     /// Initialize local SQLite storage and print the on-ramp.
     Init,
     /// Install LDGR harness integrations and record ~/.ldgr config.
@@ -184,6 +157,9 @@ enum Command {
     /// Record decisions and optional next work.
     #[command(alias = "decisions")]
     Decision(DecisionArgs),
+    /// Record and manage first-class durable errors.
+    #[command(alias = "errors")]
+    Error(ErrorArgs),
     /// Manage durable loop prompt records.
     #[command(alias = "prompts")]
     Prompt(PromptArgs),
@@ -226,6 +202,7 @@ where
     I: IntoIterator<Item = T>,
     T: Into<OsString>,
 {
+    crate::recovery::repair_process_home()?;
     let args = args.into_iter().map(Into::into).collect::<Vec<_>>();
     let args = normalize_command_aliases(args);
     let cli = match Cli::try_parse_from(args.clone()) {
@@ -386,17 +363,23 @@ fn first_command_arg_index(args: &[OsString]) -> Option<usize> {
 
 fn handle_cli(cli: Cli) -> anyhow::Result<()> {
     if cli.full {
-        print!("{}", CLI_FULL_HELP_SECTIONS);
+        print!("{}", render_full_command_map());
         return Ok(());
     }
     let Some(command) = cli.command else {
         Cli::command().print_help()?;
+        println!();
+        commands::ops::print_current_sequence_collection_status_summary("")?;
         println!();
         commands::ops::print_available_adapter_catalog();
         print_dynamic_adapter_help();
         return Ok(());
     };
     match command {
+        Command::Compatibility {
+            agentctl_version,
+            json,
+        } => commands::ops::handle_compatibility(&agentctl_version, json),
         Command::Init => commands::ops::handle_init(&cli.db, &cli.artifact_root),
         Command::Install(args) => commands::ops::handle_install(args),
         Command::Work(args) => commands::work::handle_work(&open_store(&cli.db)?, args),
@@ -410,11 +393,17 @@ fn handle_cli(cli: Cli) -> anyhow::Result<()> {
         }
         Command::Validation(args) => commands::runs::handle_validation(&open_store(&cli.db)?, args),
         Command::Decision(args) => commands::audit::handle_decision(&open_store(&cli.db)?, args),
+        Command::Error(args) => commands::errors::handle_error(&open_store(&cli.db)?, args),
         Command::Prompt(args) => commands::prompts::handle_prompt(&open_store(&cli.db)?, args),
         Command::Bundle(args) => commands::prompts::handle_bundle(&open_store(&cli.db)?, args),
         Command::Status(args) => {
             let (connection, migration) = crate::store::open_store_with_migration_info(&cli.db)?;
             commands::ops::print_migration_notice(migration.as_ref());
+            let recovery = crate::recovery::reconcile_startup(
+                &connection,
+                &crate::recovery::project_root_for_db(&cli.db),
+            )?;
+            crate::recovery::print_startup_recovery_report(&recovery);
             commands::ops::handle_status(&connection, &cli.artifact_root, args)
         }
         Command::Schema(args) => commands::ops::handle_schema(&cli.db, args),
@@ -424,12 +413,15 @@ fn handle_cli(cli: Cli) -> anyhow::Result<()> {
         Command::Context(args) => {
             let (connection, migration) = crate::store::open_store_with_migration_info(&cli.db)?;
             commands::ops::print_migration_notice(migration.as_ref());
+            let recovery = crate::recovery::reconcile_startup(
+                &connection,
+                &crate::recovery::project_root_for_db(&cli.db),
+            )?;
+            crate::recovery::print_startup_recovery_report(&recovery);
             commands::ops::handle_context(&connection, &cli.artifact_root, args)
         }
         Command::Web(args) => commands::ops::handle_web(&cli.db, &cli.artifact_root, args),
-        Command::Loop(args) => {
-            commands::ops::handle_loop(&open_store(&cli.db)?, &cli.artifact_root, args)
-        }
+        Command::Loop(args) => commands::ops::handle_loop_entry(&cli.db, &cli.artifact_root, args),
         Command::Adapter(args) => commands::adapters::handle_adapter(args),
         Command::Telemetry(args) => commands::ops::handle_telemetry(args),
         Command::Next(args) => commands::work::handle_next(&open_store(&cli.db)?, args),
@@ -565,15 +557,35 @@ fn dispatch_adapter_namespace(
         }
     }
     let working_dir = std::env::current_dir().context("failed to resolve current directory")?;
-    let mut process = ProcessCommand::new(&command.argv[0]);
+    let source_toolchain = rust_toolchain::resolve_source_adapter_toolchain(&command.argv)
+        .map_err(|issue| {
+            let record_result =
+                rust_toolchain::record_discovery_error(&request.db, &command.adapter_slug, &issue);
+            let record_note = match record_result {
+                Ok(error_id) => format!("; recorded first-class infrastructure error {error_id}"),
+                Err(error) => {
+                    format!("; additionally failed to record infrastructure error: {error:#}")
+                }
+            };
+            anyhow::anyhow!("{issue}{record_note}")
+        })?;
+    let executable = source_toolchain
+        .as_ref()
+        .map(|toolchain| toolchain.cargo.as_os_str())
+        .unwrap_or_else(|| command.argv[0].as_ref());
+    let mut argv = vec![executable.to_os_string()];
+    argv.extend(command.argv[1..].iter().map(OsString::from));
+    argv.extend(request.remaining);
+    let mut process = crate::host_process::command_from_argv(&argv)?;
     process
-        .args(&command.argv[1..])
-        .args(request.remaining)
         .env("LDGR_DB", &request.db)
         .env("LDGR_ARTIFACT_ROOT", &request.artifact_root)
         .env("LDGR_WORKING_DIR", working_dir)
         .env("LDGR_ADAPTER_SLUG", &command.adapter_slug)
         .env("LDGR_ADAPTER_NAMESPACE", &request.namespace);
+    if let Some(toolchain) = &source_toolchain {
+        toolchain.apply(&mut process);
+    }
     if let Some(hash) = &command.database_contract_hash {
         process.env("LDGR_DATABASE_CONTRACT_HASH", hash);
     }

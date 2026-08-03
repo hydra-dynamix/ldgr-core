@@ -282,6 +282,60 @@ pub struct InstallationReceipt {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct SourceInstallationReceipt {
+    pub schema_version: u32,
+    pub install_kind: String,
+    pub domain: String,
+    pub installed_at_unix_seconds: u64,
+    pub source: SourceInstallIdentity,
+    pub manifest_digests: SourceManifestDigests,
+    pub installer_invocation: Vec<String>,
+    pub executable_invocations: Vec<SourceExecutableInvocation>,
+    pub installed_files: Vec<OwnedResource>,
+    pub owned_resources: Vec<OwnedResource>,
+    pub ownership: SourceOwnershipBoundaries,
+    pub verified_release: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceInstallIdentity {
+    pub package: String,
+    pub bundle_root: String,
+    pub cargo_manifest: String,
+    pub bundle_sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceManifestDigests {
+    pub source_adapter_manifest_sha256: String,
+    pub source_cargo_manifest_sha256: String,
+    pub installed_adapter_manifest_sha256: String,
+    pub source_resource_manifest_sha256: Option<String>,
+    pub installed_resource_manifest_sha256: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceExecutableInvocation {
+    pub kind: String,
+    pub name: String,
+    pub argv: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceOwnershipBoundaries {
+    pub install_root: String,
+    pub marker_path: String,
+    pub source_checkout_owned: bool,
+    pub generated_paths: Vec<String>,
+    pub external_resource_roots: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct OwnedResource {
     pub path: String,
     pub sha256: String,

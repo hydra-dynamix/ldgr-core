@@ -6,6 +6,7 @@ include!("runs.rs");
 include!("observations.rs");
 include!("artifacts.rs");
 include!("decisions.rs");
+include!("telemetry.rs");
 include!("queries.rs");
 include!("graph.rs");
 include!("schedule.rs");

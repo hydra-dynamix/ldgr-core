@@ -1,7 +1,7 @@
 use serde::Serialize;
 
 use crate::adapter_registry::AdapterRegistry;
-use crate::store::StoreContext;
+use crate::store::{ErrorSurface, StoreContext};
 
 use super::display_optional_id;
 
@@ -17,6 +17,7 @@ pub(crate) struct BriefContextOptions {
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct BriefContext {
     pub work_items: BriefWorkCounts,
+    pub errors: ErrorSurface,
     pub next: Option<BriefNextWork>,
     pub loop_state: BriefLoopState,
     pub active_runs: Vec<BriefActiveRun>,
@@ -129,6 +130,15 @@ pub(crate) fn brief_context(context: &StoreContext, options: BriefContextOptions
                 "running".to_owned()
             }
         });
+    let mut errors = context.errors.clone();
+    errors.truncated |= errors.latest.len() > 1;
+    errors.latest.truncate(1);
+    errors.bounds.errors = 1;
+    errors.bounds.related_work_per_error = 3;
+    for error in &mut errors.latest {
+        error.related_work_truncated |= error.related_work.len() > 3;
+        error.related_work.truncate(3);
+    }
     BriefContext {
         work_items: BriefWorkCounts {
             pending: context.pending_work_items,
@@ -137,6 +147,7 @@ pub(crate) fn brief_context(context: &StoreContext, options: BriefContextOptions
             done: context.done_work_items,
             canceled: context.canceled_work_items,
         },
+        errors,
         next: context
             .next_work_item
             .as_ref()
@@ -226,6 +237,7 @@ pub(crate) fn print_brief_context(context: &BriefContext) {
         context.work_items.done,
         context.work_items.canceled
     );
+    print_brief_errors(&context.errors);
     match &context.next {
         Some(work_item) => {
             println!("next: {} {}", work_item.slug, work_item.title);
@@ -254,6 +266,43 @@ pub(crate) fn print_brief_context(context: &BriefContext) {
         "workflow: {} to understand this project's workflow",
         context.workflow_command
     );
+}
+
+fn print_brief_errors(errors: &ErrorSurface) {
+    println!(
+        "errors: unresolved={} repeated={} disposition_pending={} total={} latest_truncated={}",
+        errors.counts.unresolved,
+        errors.counts.repeated,
+        errors.counts.disposition_pending,
+        errors.counts.total,
+        errors.truncated
+    );
+    let Some(error) = errors.latest.first() else {
+        println!("latest_error: none");
+        return;
+    };
+    let disposition = if error.disposition_pending {
+        "pending".to_owned()
+    } else {
+        error
+            .latest_disposition
+            .as_ref()
+            .map(|value| value.action.as_str().to_owned())
+            .unwrap_or_else(|| "none".to_owned())
+    };
+    println!(
+        "latest_error: error={} occurrence={} state={} repeated={} occurrences={} disposition={} severity={} domain={} code={}",
+        error.error_id,
+        error.latest_occurrence.occurrence_id,
+        error.state,
+        error.repeated,
+        error.occurrence_count,
+        disposition,
+        error.severity,
+        error.domain,
+        error.code
+    );
+    println!("latest_error_summary: {}", error.latest_occurrence.summary);
 }
 
 fn brief_handoff(context: &StoreContext) -> BriefHandoff {
@@ -326,6 +375,23 @@ fn next_commands_with_registry(
             return dedup_commands(commands);
         }
         return adapter_commands;
+    }
+    if let Some(error) = context.errors.latest.iter().find(|error| {
+        error.disposition_pending
+            && error.related_work.iter().any(|related| {
+                matches!(
+                    related.status,
+                    crate::store::WorkItemStatus::Pending | crate::store::WorkItemStatus::Running
+                )
+            })
+    }) {
+        let mut commands = adapter_commands;
+        commands.push(format!("ldgr error context {}", error.error_id));
+        commands.push(format!(
+            "ldgr error disposition {} --action <retry|workaround|defer|accept|escalate|cancel|resolve> --actor <actor> --source <source> --rationale <why>",
+            error.error_id
+        ));
+        return dedup_commands(commands);
     }
     if let Some(work_item) = &context.next_work_item {
         let mut commands = adapter_commands;

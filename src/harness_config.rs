@@ -7,8 +7,22 @@ use serde::{Deserialize, Serialize};
 pub const HARNESS_CONFIG_SCHEMA_VERSION: u32 = 1;
 
 pub fn parse_harness_config(text: &str) -> anyhow::Result<HarnessConfig> {
+    parse_harness_config_json(text)
+}
+
+pub fn parse_harness_config_json(text: &str) -> anyhow::Result<HarnessConfig> {
     let config: HarnessConfig =
         serde_json::from_str(text).context("failed to parse LDGR harness config JSON")?;
+    validate_harness_config(config)
+}
+
+pub fn parse_harness_config_toml(text: &str) -> anyhow::Result<HarnessConfig> {
+    let config: HarnessConfig =
+        toml::from_str(text).context("failed to parse LDGR harness config TOML")?;
+    validate_harness_config(config)
+}
+
+fn validate_harness_config(config: HarnessConfig) -> anyhow::Result<HarnessConfig> {
     if config.schema_version != HARNESS_CONFIG_SCHEMA_VERSION {
         bail!(
             "unsupported LDGR harness config schema_version {}; expected {}",
@@ -148,7 +162,7 @@ pub enum HarnessResourceKind {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_harness_config, HarnessResourceKind};
+    use super::{parse_harness_config, parse_harness_config_toml, HarnessResourceKind};
 
     #[test]
     fn parses_current_schema_without_losing_harnesses_or_paths() -> anyhow::Result<()> {
@@ -178,5 +192,22 @@ mod tests {
         assert!(error
             .to_string()
             .contains("unsupported LDGR harness config"));
+    }
+
+    #[test]
+    fn parses_canonical_toml_harness_selection() -> anyhow::Result<()> {
+        let config = parse_harness_config_toml(
+            r#"
+schema_version = 1
+default_harness = "codex"
+selected_harnesses = ["codex", "claude"]
+interview_depth = "low"
+"#,
+        )?;
+
+        assert_eq!(config.default_harness.as_deref(), Some("codex"));
+        assert_eq!(config.selected_harnesses, ["codex", "claude"]);
+        assert_eq!(config.interview_depth.as_str(), "low");
+        Ok(())
     }
 }

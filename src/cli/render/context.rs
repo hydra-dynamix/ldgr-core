@@ -13,6 +13,7 @@ pub(crate) fn print_context(context: &StoreContext) {
         context.done_work_items,
         context.canceled_work_items
     );
+    print_errors(&context.errors);
     match &context.next_work_item {
         Some(work_item) => {
             println!("next: {} {}", work_item.slug, work_item.title);
@@ -206,4 +207,73 @@ pub(crate) fn print_context(context: &StoreContext) {
         }
     }
     println!("workflow: ldgr workflow to understand this project's workflow");
+}
+
+fn print_errors(errors: &crate::store::ErrorSurface) {
+    println!(
+        "errors: unresolved={} repeated={} disposition_pending={} total={} latest_limit={} latest_truncated={}",
+        errors.counts.unresolved,
+        errors.counts.repeated,
+        errors.counts.disposition_pending,
+        errors.counts.total,
+        errors.bounds.errors,
+        errors.truncated
+    );
+    if errors.latest.is_empty() {
+        println!("latest_errors: none");
+        return;
+    }
+    println!("latest_errors:");
+    for error in &errors.latest {
+        let disposition = if error.disposition_pending {
+            "pending".to_owned()
+        } else {
+            error
+                .latest_disposition
+                .as_ref()
+                .map(|value| value.action.as_str().to_owned())
+                .unwrap_or_else(|| "none".to_owned())
+        };
+        println!(
+            "- error={} occurrence={} state={} repeated={} occurrences={} disposition={} severity={} domain={} code={} observed_at={}",
+            error.error_id,
+            error.latest_occurrence.occurrence_id,
+            error.state,
+            error.repeated,
+            error.occurrence_count,
+            disposition,
+            error.severity,
+            error.domain,
+            error.code,
+            error.latest_occurrence.observed_at
+        );
+        println!("  summary: {}", error.latest_occurrence.summary);
+        if error.related_work.is_empty() {
+            println!("  related_work: none");
+        } else {
+            println!(
+                "  related_work: {}",
+                error
+                    .related_work
+                    .iter()
+                    .map(|work| format!("{}({})", work.slug, work.status))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        if error.related_work_truncated {
+            println!("  related_work_truncated: true");
+        }
+        if let Some(latest_disposition) = &error.latest_disposition {
+            println!(
+                "  latest_disposition: action={} occurrence={} actor={} source={} created_at={}",
+                latest_disposition.action,
+                latest_disposition.occurrence_id,
+                latest_disposition.actor,
+                latest_disposition.source,
+                latest_disposition.created_at
+            );
+            println!("    rationale: {}", latest_disposition.rationale);
+        }
+    }
 }

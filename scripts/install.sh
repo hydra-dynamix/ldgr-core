@@ -4,14 +4,32 @@ set -eu
 REPO="${LDGR_REPO:-hydra-dynamix/ldgr-core}"
 PACKAGE="ldgr-core"
 BINARY="ldgr"
+AGENTCTL_BINARY="agentctl"
+AGENTCTL_REPO="${AGENTCTL_REPO:-https://github.com/hydra-dynamix/agentctl}"
+AGENTCTL_VERSION="${AGENTCTL_VERSION:-0.1.2}"
 INSTALL_DIR="${LDGR_INSTALL_DIR:-$HOME/.local/bin}"
 VERSION="${LDGR_VERSION:-}"
 BASE_URL="${LDGR_RELEASE_BASE_URL:-https://github.com/$REPO/releases/download}"
 TMP_DIR="${TMPDIR:-/tmp}/ldgr-install.$$"
+INSTALL_AGENTCTL=1
 
 log() { printf '%s\n' "$*" >&2; }
 fail() { log "error: $*"; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
+
+usage() {
+  cat <<'EOF'
+Usage: install.sh [--no-agentctl]
+
+Install the LDGR Core release bundle. By default the paired agentctl binary is
+installed too, including when release assets are unavailable and source
+installation is required.
+
+Options:
+  --no-agentctl  Install only ldgr; never install or replace agentctl.
+  --help         Show this help.
+EOF
+}
 
 cleanup() {
   rm -rf "$TMP_DIR"
@@ -73,7 +91,20 @@ install_from_source() {
   else
     cargo install --git "https://github.com/$REPO" --locked --force "$PACKAGE"
   fi
+  if [ "$INSTALL_AGENTCTL" -eq 1 ]; then
+    log "Installing paired agentctl $AGENTCTL_VERSION from source."
+    cargo install --git "$AGENTCTL_REPO" --tag "v$AGENTCTL_VERSION" --locked --force
+  fi
 }
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --no-agentctl) INSTALL_AGENTCTL=0 ;;
+    --help|-h) usage; exit 0 ;;
+    *) fail "unknown option: $1" ;;
+  esac
+  shift
+done
 
 require uname
 require tar
@@ -106,13 +137,38 @@ sha256_check "$TMP_DIR/$ARCHIVE.sha256" "$TMP_DIR/$ARCHIVE"
 
 tar -xzf "$TMP_DIR/$ARCHIVE" -C "$TMP_DIR"
 SRC="$TMP_DIR/$PACKAGE-$VERSION/$PLATFORM/$BINARY_FILE"
+AGENTCTL_FILE="$AGENTCTL_BINARY"
+case "$PLATFORM" in
+  windows-*) AGENTCTL_FILE="$AGENTCTL_BINARY.exe" ;;
+esac
+AGENTCTL_SRC="$TMP_DIR/$PACKAGE-$VERSION/$PLATFORM/$AGENTCTL_FILE"
 [ -f "$SRC" ] || fail "archive did not contain expected binary: $PACKAGE-$VERSION/$PLATFORM/$BINARY_FILE"
+if [ "$INSTALL_AGENTCTL" -eq 1 ]; then
+  [ -f "$AGENTCTL_SRC" ] || fail "archive did not contain paired launcher: $PACKAGE-$VERSION/$PLATFORM/$AGENTCTL_FILE"
+fi
 mkdir -p "$INSTALL_DIR"
+if [ "$INSTALL_AGENTCTL" -eq 1 ] && [ -f "$INSTALL_DIR/$AGENTCTL_FILE" ]; then
+  cp "$INSTALL_DIR/$AGENTCTL_FILE" "$INSTALL_DIR/$AGENTCTL_FILE.previous"
+fi
+if [ -f "$INSTALL_DIR/$BINARY_FILE" ]; then
+  cp "$INSTALL_DIR/$BINARY_FILE" "$INSTALL_DIR/$BINARY_FILE.previous"
+fi
 cp "$SRC" "$INSTALL_DIR/$BINARY_FILE"
 chmod +x "$INSTALL_DIR/$BINARY_FILE"
-log "Installed $BINARY_FILE to $INSTALL_DIR/$BINARY_FILE"
+if [ "$INSTALL_AGENTCTL" -eq 1 ]; then
+  cp "$AGENTCTL_SRC" "$INSTALL_DIR/$AGENTCTL_FILE"
+  chmod +x "$INSTALL_DIR/$AGENTCTL_FILE"
+  log "Installed paired $BINARY_FILE and $AGENTCTL_FILE to $INSTALL_DIR"
+else
+  log "Installed $BINARY_FILE to $INSTALL_DIR without changing agentctl"
+fi
 case ":$PATH:" in
   *":$INSTALL_DIR:"*) ;;
   *) log "Add $INSTALL_DIR to PATH if needed." ;;
 esac
 "$INSTALL_DIR/$BINARY_FILE" --version
+if [ "$INSTALL_AGENTCTL" -eq 1 ]; then
+  "$INSTALL_DIR/$AGENTCTL_FILE" --version
+  agentctl_version="$("$INSTALL_DIR/$AGENTCTL_FILE" --version | awk '{print $2}')"
+  "$INSTALL_DIR/$BINARY_FILE" compatibility --agentctl-version "$agentctl_version" --json
+fi

@@ -10,6 +10,9 @@ use serde::{Deserialize, Serialize, Serializer};
 use thiserror::Error;
 
 mod context;
+mod error_context;
+mod errors;
+mod fingerprints;
 mod helpers;
 mod ingestion;
 mod mission_log;
@@ -20,6 +23,9 @@ mod validation;
 mod work;
 
 pub use context::*;
+pub use error_context::*;
+pub use errors::*;
+pub use fingerprints::*;
 pub use helpers::*;
 pub use ingestion::*;
 pub use mission_log::*;

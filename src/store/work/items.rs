@@ -103,7 +103,10 @@ pub fn edit_work_item_fields(
     if patch.title.is_some_and(|title| title.trim().is_empty()) {
         bail!("work title must not be empty");
     }
-    if patch.description.is_some_and(|description| description.trim().is_empty()) {
+    if patch
+        .description
+        .is_some_and(|description| description.trim().is_empty())
+    {
         bail!("work description must not be empty");
     }
     let priority = patch
@@ -186,7 +189,7 @@ pub fn cancel_work_item(
     if work_item.status == WorkItemStatus::Canceled {
         return Ok(work_item);
     }
-    in_write_transaction(connection, |connection| {
+    let canceled = in_write_transaction(connection, |connection| {
         connection
             .execute(
                 "UPDATE work_item
@@ -201,7 +204,9 @@ pub fn cancel_work_item(
             .unwrap_or_else(|| "{}".to_owned());
         record_event(connection, "work_item", work_item.id, "cancel", &payload)?;
         get_work_item_by_id(connection, work_item.id)
-    })
+    })?;
+    best_effort_queue_core_work_cancellation(connection, canceled.id);
+    Ok(canceled)
 }
 
 pub fn hold_work_item(
@@ -311,6 +316,11 @@ pub fn set_work_item_status(
     }
     if status == WorkItemStatus::Done {
         ensure_no_running_runs_for_work_item(connection, &work_item)?;
+        ensure_no_blocking_errors_for_work_item(
+            connection,
+            work_item.id,
+            "mark the work item done",
+        )?;
     }
     if status == WorkItemStatus::Running {
         let readiness = work_readiness(connection, slug)?;
@@ -324,7 +334,7 @@ pub fn set_work_item_status(
     if work_item.status == WorkItemStatus::Canceled && status != WorkItemStatus::Canceled {
         bail!("work item {slug} is canceled");
     }
-    in_write_transaction(connection, |connection| {
+    let updated = in_write_transaction(connection, |connection| {
         connection
             .execute(
                 "UPDATE work_item
@@ -346,7 +356,11 @@ pub fn set_work_item_status(
         };
         record_event(connection, "work_item", work_item.id, event_type, &payload)?;
         get_work_item_by_id(connection, work_item.id)
-    })
+    })?;
+    if status == WorkItemStatus::Done {
+        best_effort_queue_core_work_completion(connection, updated.id, None);
+    }
+    Ok(updated)
 }
 
 fn validate_work_fields(slug: &str, title: &str, description: &str) -> anyhow::Result<()> {
@@ -474,7 +488,13 @@ pub fn add_work_dependency(
             })?;
         debug_assert_eq!(inserted, 1);
         let payload = serde_json::json!({ "prerequisite": prerequisite_slug }).to_string();
-        record_event(connection, "work_item", child.id, "dependency_add", &payload)?;
+        record_event(
+            connection,
+            "work_item",
+            child.id,
+            "dependency_add",
+            &payload,
+        )?;
         Ok(())
     })
 }
@@ -496,7 +516,13 @@ pub fn remove_work_dependency(
             bail!("work item {child_slug} does not depend on {prerequisite_slug}");
         }
         let payload = serde_json::json!({ "prerequisite": prerequisite_slug }).to_string();
-        record_event(connection, "work_item", child.id, "dependency_remove", &payload)?;
+        record_event(
+            connection,
+            "work_item",
+            child.id,
+            "dependency_remove",
+            &payload,
+        )?;
         Ok(())
     })
 }

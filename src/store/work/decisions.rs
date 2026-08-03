@@ -76,9 +76,23 @@ pub fn record_decision(
     rationale: &str,
     next_work: Option<NextWorkSpec<'_>>,
 ) -> anyhow::Result<Decision> {
-    in_write_transaction(connection, |connection| {
+    let decision = in_write_transaction(connection, |connection| {
         let work_item = require_work_item_by_slug(connection, work_slug)?;
         ensure_no_running_runs_for_work_item(connection, &work_item)?;
+        let latest_run_status = connection
+            .query_row(
+                "SELECT status FROM run WHERE work_item_id=?1 ORDER BY id DESC LIMIT 1",
+                params![work_item.id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if latest_run_status.as_deref() == Some(RunStatus::Success.as_str()) {
+            ensure_no_blocking_errors_for_work_item(
+                connection,
+                work_item.id,
+                "record successful terminal work",
+            )?;
+        }
         validate_decision_invariants(connection, &work_item, outcome, next_work.is_some())?;
         let next_work_item_id = match next_work {
             Some(next_work) => Some(resolve_next_work_item_id(
@@ -93,7 +107,13 @@ pub fn record_decision(
             rationale,
             next_work_item_id,
         )
-    })
+    })?;
+    best_effort_queue_core_work_completion(
+        connection,
+        decision.work_item_id,
+        Some(decision.outcome),
+    );
+    Ok(decision)
 }
 
 fn record_decision_unchecked(

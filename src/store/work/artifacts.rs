@@ -16,7 +16,7 @@ pub fn add_artifact(
                 params![
                     run_id,
                     kind.as_str(),
-                    managed_path.display().to_string(),
+                    portable_path(&managed_path),
                     description
                 ],
             )
@@ -25,6 +25,10 @@ pub fn add_artifact(
         record_event(connection, "artifact", artifact_id, "add", "{}")?;
         get_artifact_by_id(connection, artifact_id)
     })
+}
+
+fn portable_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
 }
 
 fn managed_artifact_record_path(
@@ -132,7 +136,13 @@ fn sanitize_artifact_file_name(value: &str) -> String {
 
 #[cfg(test)]
 mod sanitize_tests {
-    use super::sanitize_artifact_file_name;
+    use super::{portable_path, sanitize_artifact_file_name};
+    use std::path::Path;
+
+    #[test]
+    fn renders_artifact_paths_with_portable_separators() {
+        assert_eq!(portable_path(Path::new(r"reports\run-1\out.txt")), "reports/run-1/out.txt");
+    }
 
     #[test]
     fn replaces_every_character_that_is_unsafe_in_a_file_name() {

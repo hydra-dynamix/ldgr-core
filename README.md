@@ -27,6 +27,12 @@ See `docs/ldgr-loop-philosophy.html` for the longer explanation of the loop.
 curl -fsSL https://raw.githubusercontent.com/hydra-dynamix/ldgr-core/main/scripts/install.sh | sh
 ```
 
+On native Windows, run this from PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/hydra-dynamix/ldgr-core/main/scripts/install.ps1 | iex
+```
+
 The installer detects the current OS/CPU, downloads the matching release archive,
 verifies its SHA-256 checksum when checksum tooling is available, and installs
 `ldgr` to `~/.local/bin` by default. Override with:
@@ -53,6 +59,40 @@ changing the database. Upgrade Core before adapters; Core applies the complete
 migration plan atomically and refuses unknown shapes or incompatible sidecars.
 See `docs/database-upgrade-and-recovery.md` in the LDGR repository for the
 backup and restore procedure.
+
+## Numerical sequence telemetry
+
+LDGR can optionally share numerical state-transition sequences for research.
+Collection is disabled until an explicit telemetry choice is recorded. The first
+interactive `ldgr install` asks for Yes or No with no default; non-interactive
+installs must pass `--telemetry enable` or `--telemetry disable` because `--yes`
+is not telemetry consent. Later installs remember the stored decision.
+
+When enabled, Core buffers only committed terminal sequences as bare JSON integer
+arrays under `~/.ldgr/telemetry-pending/<protocol>/`. The released v1 protocols
+are `core-work/v1` and `research-workflow/v1`; adapters inherit Core consent and
+must use Core-owned buffering and transmission.
+
+```sh
+ldgr telemetry status
+ldgr telemetry preview
+ldgr telemetry transmit --collector https://collector.example
+ldgr telemetry transmit --collector https://collector.example --root-ca-pem /path/to/ca.pem --max-delay-ms 30000 --timeout-ms 10000
+ldgr telemetry disable
+```
+
+`preview` prints the exact raw arrays and destination endpoints without sending
+them. `transmit` is best-effort, HTTPS-only, and can also read the collector
+origin from `LDGR_TELEMETRY_COLLECTOR`; failed sends are retained locally and do
+not affect ordinary LDGR commands. `disable` requires no network request, deletes
+unsent local payloads, and sends no final event. `LDGR_TELEMETRY=off` disables
+collection and transmission for the current process without changing the stored
+choice.
+
+Already-ingested sequences cannot be individually located for deletion because
+the collector intentionally receives and stores no user, installation, request,
+timestamp, or join identifier. Disabling prevents future collection and removes
+unsent local data only.
 
 ## Quick start
 
@@ -149,12 +189,46 @@ ldgr loop run --prompt prompts/loop-prompt.md --agent agentctl    # use the ldgr
 ldgr loop run --prompt-slug surface --agent agentctl       # use an active stored prompt
 ldgr loop run --bundle cleanroom --prompt-role surface-loop # use a sealed bundle
 ldgr loop run --prompt prompts/loop-prompt.md --agent-argv '["my-agent"]' # any command that reads the prompt on stdin
+ldgr loop run --prompt prompts/loop-prompt.md --agent agentctl --until-empty --detach # background process with durable logs
 ldgr loop run --prompt prompts/loop-prompt.md --dry-run            # render artifacts without spawning anything
 ```
+
+Detached loops print their PID and write stdout/stderr under `.ldgr/logs` by
+default. On Windows, loop children also receive `HOME` from `USERPROFILE` when
+`HOME` is absent. See [Detached loops on Windows](docs/windows-detached-loops.md).
 
 `ldgr install` writes `~/.agentctl/config.toml` entries named `ldgr-loop` and
 `ldgr-loop-<harness>` so the built-in `--agent agentctl` runner can call
 `agentctl run ldgr-loop` and stream the rendered prompt through stdin.
+
+Core 0.1.13 is released with agentctl 0.1.2 in the same checksum-covered
+archive. Before an LDGR-owned profile starts a worker, agentctl negotiates
+`ldgr.launcher-compatibility.v1` with the resolved Core binary. Mixed or older
+Core installations stop with a durable `agentctl.compatibility/core-incompatible`
+error and upgrade instructions instead of losing the accepted attempt.
+
+```sh
+ldgr compatibility --agentctl-version 0.1.2 --json
+agentctl discover --json
+```
+
+## Completion-grade CLI E2E gate
+
+On a Windows CI runner, one shell-neutral Cargo entrypoint runs the maintained
+fresh-project schema/migration/source matrix, the signed offline release-adapter
+lifecycle, and the live loopback web-safety probes:
+
+```sh
+cargo test --test cli_e2e_gate -- --ignored --nocapture
+```
+
+Every invocation retains a unique directory under `target/cli-e2e-gate/` with
+separate stdout/stderr logs for each safety class, the full matrix result, and
+an aggregate `ldgr.cli-e2e-gate-result.v1` JSON document. The gate runs every
+probe even after an earlier failure and rejects successful process exits when a
+test filter selects the wrong count or the matrix reports a semantic failure.
+Non-Windows runners fail this ignored completion target explicitly instead of
+reporting a misleading zero-test success; keep the completion job on Windows.
 
 Prompt records live in the ledger with slug, role, body, hash, status, and
 version history. Updating a prompt creates a new version while preserving prior

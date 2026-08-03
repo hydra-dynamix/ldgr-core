@@ -47,7 +47,11 @@ fn is_broken_pipe_panic(payload: &(dyn Any + Send)) -> bool {
     // being closed" (os error 232) or "The pipe has been ended" (os error 109)
     // depending on which side closes first. All three mean the reader went
     // away, which is normal for `ldgr context | head`.
-    ["Broken pipe", "The pipe is being closed", "The pipe has been ended"]
-        .iter()
-        .any(|phrase| message.contains(phrase))
+    [
+        "Broken pipe",
+        "The pipe is being closed",
+        "The pipe has been ended",
+    ]
+    .iter()
+    .any(|phrase| message.contains(phrase))
 }

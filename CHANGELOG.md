@@ -7,9 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Resolve and probe Windows source-adapter Cargo/Rustup configurations across split harness and user-profile homes, preserve working explicit homes, reject relative overrides, and record redacted first-class infrastructure errors before spawn when fallbacks are unavailable or ambiguous.
+
+## [0.1.13] - 2026-07-30
+
 ### Added
 
 - Add one-shot `ldgr rerun` recovery for complete, non-destructive parser corrections, backed by a project-local restricted receipt.
+- Add versioned structured error fingerprints, explicit audited override/split controls, collision rejection, recurrence flags, and bounded redacted recurrence context containing prior occurrences and related causal evidence.
+- Reconcile project and per-user recovery spools on init/status/context/loop startup, quarantine corrupt envelopes intact, import emergency occurrences transactionally, and restore dead-worker runs behind explicit disposition gates.
+- Add `ldgr compatibility --agentctl-version <version> --json` and pair Core 0.1.13 with agentctl 0.1.2 through a versioned launcher/recovery negotiation contract.
 
 ### Changed
 
@@ -26,12 +35,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Add human-readable, JSON, filtered, and Mermaid dependency graph inspection with `ldgr work graph`.
 - Add `ldgr work audit` findings for graph structure, canceled dependencies, priority inversions, terminal reachability, and missing validation records.
 - Add transactional import dry-runs and an exported example schedule document.
+- Add the released numerical-sequence telemetry transmit path: `ldgr telemetry status` and `preview` cover `core-work/v1` and `research-workflow/v1`, while `ldgr telemetry transmit` sends one raw array per HTTPS request with root-CA, random-delay, and timeout controls.
+- Add `ldgr loop run --detach` for background queues with durable logs, including Windows child-process `HOME` compatibility through `USERPROFILE`.
+- Publish agentctl beside `ldgr` in every Core release archive and make Windows updates replace the user-owned binary directory already resolved on `PATH`, preserving `*.previous` rollback copies.
 
 ### Changed
 
 - Include the enriched nonterminal queue and scoped pending-decision identity in full machine-readable status output.
 - Explain dependency-list syntax and the distinction between `run finish` and `run close` in CLI help.
 - Print the required work-decision command after `run finish` leaves a completed run awaiting its decision.
+- Document the telemetry deletion boundary plainly: disabling removes unsent local payloads and prevents future collection, but already-ingested sequences cannot be individually located for deletion because no user, installation, request, timestamp, or join identifier is stored.
+- Validate completion-audit requirements before starting or detaching a loop run.
 
 ## [0.1.11] - 2026-07-15
 
