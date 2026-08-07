@@ -1,7 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
-use std::process::Command;
 
 use anyhow::{bail, Context};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -10,6 +9,8 @@ use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tar::EntryType;
+
+use crate::update::network::{CatalogFetch, UpdateNetworkClient};
 
 pub const ADAPTER_RELEASE_INDEX_SCHEMA_VERSION: u32 = 1;
 pub const ADAPTER_RELEASE_INDEX_ENV: &str = "LDGR_ADAPTER_INDEX";
@@ -24,23 +25,14 @@ pub fn load_configured_release_index() -> anyhow::Result<AdapterReleaseIndex> {
 }
 
 pub fn load_release_index(source: &str) -> anyhow::Result<AdapterReleaseIndex> {
-    let text = if source.starts_with("https://") {
-        let output = Command::new("curl")
-            .args(["-fsSL", source])
-            .output()
-            .with_context(|| format!("failed to execute curl for adapter index {source}"))?;
-        if !output.status.success() {
-            bail!(
-                "failed to download adapter release index {source}: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
+    let client = UpdateNetworkClient::new(false)?;
+    let bytes = match client.fetch_catalog(source, None)? {
+        CatalogFetch::Modified { bytes, .. } => bytes,
+        CatalogFetch::NotModified { .. } => {
+            bail!("adapter release index unexpectedly returned not-modified")
         }
-        String::from_utf8(output.stdout).context("adapter release index is not UTF-8")?
-    } else {
-        let path = source.strip_prefix("file://").unwrap_or(source);
-        fs::read_to_string(Path::new(path))
-            .with_context(|| format!("failed to read adapter release index {path}"))?
     };
+    let text = String::from_utf8(bytes).context("adapter release index is not UTF-8")?;
     parse_release_index(&text)
         .with_context(|| format!("invalid adapter release index from {source}"))
 }

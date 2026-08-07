@@ -1224,7 +1224,7 @@ fn install_adapter_from_index(
     println!("◇ Installing LDGR adapter `{}`", adapter.domain);
     println!("├─ Resolved version {} for {platform}", resolved.version);
     println!("├─ Install root {}", install_root.display());
-    install_resolved_index_release(&resolved, &install_root, &home)?;
+    install_resolved_index_release(&resolved, &install_root, &home, args.offline)?;
     println!(
         "└─ Installed adapter `{}`. Try `ldgr {} --help` or `ldgr adapter show {}`.",
         adapter.domain, adapter.domain, adapter.domain
@@ -1236,6 +1236,7 @@ fn install_resolved_index_release(
     resolved: &crate::release_index::ResolvedAdapterRelease<'_>,
     install_root: &Path,
     home: &Path,
+    offline: bool,
 ) -> anyhow::Result<()> {
     let temp = std::env::temp_dir().join(format!(
         "ldgr-adapter-index-install-{}-{}",
@@ -1245,23 +1246,18 @@ fn install_resolved_index_release(
     let _ = fs::remove_dir_all(&temp);
     fs::create_dir_all(&temp)?;
     let archive = temp.join("adapter.tar.gz");
-    run_checked(
-        Command::new("curl")
-            .arg("-fsSL")
-            .arg(&resolved.platform.asset_url)
-            .arg("-o")
-            .arg(&archive),
-        "download indexed adapter release",
+    let update_client = crate::update::network::UpdateNetworkClient::new(offline)?;
+    update_client.download_artifact(
+        &resolved.platform.asset_url,
+        &archive,
+        crate::update::network::MAX_UPDATE_ARTIFACT_BYTES,
     )?;
     crate::release_index::verify_file_sha256(&archive, &resolved.platform.sha256)?;
     let signature = temp.join("adapter.sig");
-    run_checked(
-        Command::new("curl")
-            .arg("-fsSL")
-            .arg(&resolved.platform.signature_url)
-            .arg("-o")
-            .arg(&signature),
-        "download indexed adapter signature",
+    update_client.download_artifact(
+        &resolved.platform.signature_url,
+        &signature,
+        crate::update::network::MAX_UPDATE_SIGNATURE_BYTES,
     )?;
     let keyring = configured_release_keyring(home)?;
     crate::release_index::verify_detached_release_signature(

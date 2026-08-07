@@ -12,6 +12,9 @@ use crate::release_index::{
     validate_release_keyring, validate_sha256, verify_detached_signature_bytes,
     verify_file_sha256_for, DetachedSignature, ReleaseChannel, ReleaseKeyring, ReleasePublicKey,
 };
+use crate::update::network::{
+    CatalogFetch, UpdateNetworkClient, MAX_UPDATE_KEYRING_BYTES, MAX_UPDATE_SIGNATURE_BYTES,
+};
 
 pub const CORE_UPDATE_CATALOG_SCHEMA_VERSION: u32 = 1;
 pub const CORE_RELEASE_METADATA_SCHEMA_VERSION: u32 = 1;
@@ -23,9 +26,6 @@ pub const LAUNCHER_COMPATIBILITY_SCHEMA_V1: &str = "ldgr.launcher-compatibility.
 pub const ERROR_RECOVERY_SCHEMA_VERSION: u32 = 1;
 
 const EMBEDDED_CORE_RELEASE_KEYRING: &str = include_str!("../../release-keyring.json");
-const MAX_LOCAL_CATALOG_BYTES: u64 = 1024 * 1024;
-const MAX_LOCAL_SIGNATURE_BYTES: u64 = 16 * 1024;
-const MAX_LOCAL_KEYRING_BYTES: u64 = 64 * 1024;
 const MAX_RELEASE_METADATA_BYTES: u64 = 64 * 1024;
 const SUPPORTED_PLATFORMS: [&str; 5] = [
     "linux-x86_64",
@@ -89,6 +89,17 @@ pub struct VerifiedCoreUpdateCatalog {
     pub catalog: CoreUpdateCatalog,
     pub catalog_signing_key_id: String,
     pub archive_keyring: ReleaseKeyring,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CoreCatalogFetch {
+    Modified {
+        verified: VerifiedCoreUpdateCatalog,
+        etag: Option<String>,
+    },
+    NotModified {
+        etag: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -198,29 +209,57 @@ pub fn verify_signed_core_update_catalog(
 pub fn load_local_signed_core_update_catalog(
     sources: &CoreCatalogSources,
 ) -> anyhow::Result<VerifiedCoreUpdateCatalog> {
-    let catalog_path = local_source_path(&sources.index, sources.offline, "Core update index")?;
-    let signature_path = local_source_path(
+    ensure!(
+        !sources.index.starts_with("https://")
+            && !sources.signature.starts_with("https://")
+            && sources
+                .keyring
+                .as_deref()
+                .is_none_or(|source| !source.starts_with("https://")),
+        "local Core update catalog loader does not perform network access"
+    );
+    let client = UpdateNetworkClient::new(sources.offline)?;
+    match fetch_signed_core_update_catalog(&client, sources, None)? {
+        CoreCatalogFetch::Modified { verified, .. } => Ok(verified),
+        CoreCatalogFetch::NotModified { .. } => {
+            bail!("local Core update catalog unexpectedly returned not-modified")
+        }
+    }
+}
+
+pub fn fetch_signed_core_update_catalog(
+    client: &UpdateNetworkClient,
+    sources: &CoreCatalogSources,
+    previous_etag: Option<&str>,
+) -> anyhow::Result<CoreCatalogFetch> {
+    let (catalog_bytes, etag) = match client.fetch_catalog(&sources.index, previous_etag)? {
+        CatalogFetch::Modified { bytes, etag } => (bytes, etag),
+        CatalogFetch::NotModified { etag } => {
+            return Ok(CoreCatalogFetch::NotModified { etag });
+        }
+    };
+    let signature_bytes = client.fetch_bounded(
         &sources.signature,
-        sources.offline,
+        MAX_UPDATE_SIGNATURE_BYTES,
         "Core update index signature",
     )?;
     let catalog_json =
-        read_bounded_utf8(&catalog_path, MAX_LOCAL_CATALOG_BYTES, "Core update index")?;
-    let signature_json = read_bounded_utf8(
-        &signature_path,
-        MAX_LOCAL_SIGNATURE_BYTES,
-        "Core update index signature",
-    )?;
+        String::from_utf8(catalog_bytes).context("Core update catalog response is not UTF-8")?;
+    let signature_json = String::from_utf8(signature_bytes)
+        .context("Core update catalog signature response is not UTF-8")?;
     let trusted_keyring = match sources.keyring.as_deref() {
         Some(source) => {
-            let path = local_source_path(source, sources.offline, "Core release keyring")?;
-            let text = read_bounded_utf8(&path, MAX_LOCAL_KEYRING_BYTES, "Core release keyring")?;
+            let bytes =
+                client.fetch_bounded(source, MAX_UPDATE_KEYRING_BYTES, "Core release keyring")?;
+            let text = String::from_utf8(bytes).context("Core release keyring is not UTF-8")?;
             parse_release_keyring(&text)?
         }
         None => embedded_core_release_keyring()?,
     };
-    verify_signed_core_update_catalog(&catalog_json, &signature_json, &trusted_keyring)
-        .with_context(|| format!("untrusted Core update catalog from {}", sources.index))
+    let verified =
+        verify_signed_core_update_catalog(&catalog_json, &signature_json, &trusted_keyring)
+            .with_context(|| format!("untrusted Core update catalog from {}", sources.index))?;
+    Ok(CoreCatalogFetch::Modified { verified, etag })
 }
 
 pub fn resolve_newer_core_release(
@@ -598,6 +637,7 @@ fn canonical_json_value(value: JsonValue) -> JsonValue {
 
 fn validate_source_location(source: &str, offline: bool, label: &str) -> anyhow::Result<()> {
     if source.starts_with("https://") {
+        ensure!(!offline, "offline mode forbids remote {label} sources");
         validate_https_url(source, label)
     } else if let Some(path) = source.strip_prefix("file://") {
         ensure!(!path.is_empty(), "{label} file URL must contain a path");
@@ -610,18 +650,6 @@ fn validate_source_location(source: &str, offline: bool, label: &str) -> anyhow:
     } else {
         bail!("local {label} paths require file:// or --offline")
     }
-}
-
-fn local_source_path(source: &str, offline: bool, label: &str) -> anyhow::Result<PathBuf> {
-    validate_source_location(source, offline, label)?;
-    if source.starts_with("https://") {
-        bail!(
-            "{label} source `{source}` is remote; the local loader never performs network access"
-        );
-    }
-    Ok(PathBuf::from(
-        source.strip_prefix("file://").unwrap_or(source),
-    ))
 }
 
 fn validate_artifact_url(url: &str, field: &str) -> anyhow::Result<()> {
@@ -1012,6 +1040,18 @@ mod tests {
                 .to_string()
                 .contains("must use HTTPS")
         );
+        assert!(
+            CoreCatalogSources::new("https://example.invalid/core-index.json", None, true)
+                .unwrap_err()
+                .to_string()
+                .contains("offline mode")
+        );
+        let remote =
+            CoreCatalogSources::new("https://example.invalid/core-index.json", None, false)?;
+        assert!(load_local_signed_core_update_catalog(&remote)
+            .unwrap_err()
+            .to_string()
+            .contains("does not perform network access"));
         let offline = CoreCatalogSources::new(
             catalog_path.display().to_string(),
             Some(keyring_path.display().to_string()),
