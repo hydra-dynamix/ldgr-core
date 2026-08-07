@@ -173,7 +173,7 @@ pub struct WorkflowArgs {
 
 #[derive(Debug, Args)]
 #[command(
-    after_help = "Examples:\n  ldgr config show\n  ldgr config set interview-depth low\n\nReads and writes ~/.ldgr/config.json. Unknown keys in that file are preserved."
+    after_help = "Examples:\n  ldgr config show\n  ldgr config set interview-depth low\n  ldgr config set updates.check never\n  ldgr config set updates.interval-hours 12\n  ldgr config set updates.channel prerelease\n  ldgr config set updates.include-adapters false\n  ldgr config set updates.notify false\n\nReads and writes canonical ~/.ldgr/config.toml plus the legacy config.json mirror. Unknown extensions are preserved."
 )]
 pub struct ConfigArgs {
     #[command(subcommand)]
@@ -196,7 +196,7 @@ pub struct ConfigShowArgs {
 
 #[derive(Debug, Args)]
 pub struct ConfigSetArgs {
-    /// Configuration key. Currently: interview-depth.
+    /// Configuration key: interview-depth or an updates.* key shown in config --help.
     pub key: String,
     /// Value to set.
     pub value: String,

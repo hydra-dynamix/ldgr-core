@@ -396,6 +396,22 @@ fn install_writes_canonical_toml_and_keeps_legacy_json_in_sync() -> anyhow::Resu
     assert_eq!(canonical["selected_harnesses"][1].as_str(), Some("claude"));
     assert_eq!(legacy["default_harness"], "codex");
     assert_eq!(legacy["selected_harnesses"][1], "claude");
+    assert_eq!(canonical["updates"]["check"].as_str(), Some("startup"));
+    assert_eq!(
+        canonical["updates"]["interval_hours"].as_integer(),
+        Some(24)
+    );
+    assert_eq!(canonical["updates"]["channel"].as_str(), Some("stable"));
+    assert_eq!(
+        canonical["updates"]["include_adapters"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(canonical["updates"]["notify"].as_bool(), Some(true));
+    assert_eq!(legacy["updates"]["check"], "startup");
+    assert_eq!(legacy["updates"]["interval_hours"], 24);
+    assert_eq!(legacy["updates"]["channel"], "stable");
+    assert_eq!(legacy["updates"]["include_adapters"], true);
+    assert_eq!(legacy["updates"]["notify"], true);
 
     let mut update = isolated_command(project.path())?;
     update.args(["config", "set", "interview-depth", "low"]);
@@ -406,6 +422,131 @@ fn install_writes_canonical_toml_and_keeps_legacy_json_in_sync() -> anyhow::Resu
     assert_eq!(legacy["interview_depth"], "low");
     assert_eq!(canonical["selected_harnesses"][0].as_str(), Some("codex"));
     assert_eq!(legacy["selected_harnesses"][0], "codex");
+    Ok(())
+}
+
+#[test]
+fn config_update_settings_show_set_and_preserve_extensions_in_both_formats() -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    let home = project.path().join(".ldgr/test-empty-home");
+    let config_root = home.join(".ldgr");
+    let toml_path = config_root.join("config.toml");
+    let json_path = config_root.join("config.json");
+
+    let mut default_show = isolated_command(project.path())?;
+    default_show.args(["config", "show", "--json"]);
+    let output = default_show.output()?;
+    assert!(output.status.success(), "{output:?}");
+    let shown: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(shown["exists"], false);
+    assert_eq!(shown["updates"]["check"], "startup");
+    assert_eq!(shown["updates"]["interval_hours"], 24);
+    assert_eq!(shown["updates"]["channel"], "stable");
+    assert_eq!(shown["updates"]["include_adapters"], true);
+    assert_eq!(shown["updates"]["notify"], true);
+
+    fs::create_dir_all(&config_root)?;
+    fs::write(
+        &toml_path,
+        r#"schema_version = 1
+future_top_level = "preserved"
+
+[updates]
+future_nested = "preserved"
+"#,
+    )?;
+
+    for (key, value) in [
+        ("updates.check", "never"),
+        ("updates.interval-hours", "12"),
+        ("updates.channel", "prerelease"),
+        ("updates.include-adapters", "false"),
+        ("updates.notify", "false"),
+    ] {
+        let mut set = isolated_command(project.path())?;
+        set.args(["config", "set", key, value]);
+        set.assert()
+            .success()
+            .stdout(predicate::str::contains(format!("{key}: {value}")));
+    }
+
+    let canonical: toml::Value = toml::from_str(&fs::read_to_string(&toml_path)?)?;
+    let legacy: serde_json::Value = serde_json::from_str(&fs::read_to_string(&json_path)?)?;
+    assert_eq!(canonical["schema_version"].as_integer(), Some(1));
+    assert_eq!(canonical["future_top_level"].as_str(), Some("preserved"));
+    assert_eq!(canonical["updates"]["check"].as_str(), Some("never"));
+    assert_eq!(
+        canonical["updates"]["interval_hours"].as_integer(),
+        Some(12)
+    );
+    assert_eq!(canonical["updates"]["channel"].as_str(), Some("prerelease"));
+    assert_eq!(
+        canonical["updates"]["include_adapters"].as_bool(),
+        Some(false)
+    );
+    assert_eq!(canonical["updates"]["notify"].as_bool(), Some(false));
+    assert_eq!(
+        canonical["updates"]["future_nested"].as_str(),
+        Some("preserved")
+    );
+    assert_eq!(legacy["schema_version"], 1);
+    assert_eq!(legacy["future_top_level"], "preserved");
+    assert_eq!(legacy["updates"]["check"], "never");
+    assert_eq!(legacy["updates"]["interval_hours"], 12);
+    assert_eq!(legacy["updates"]["channel"], "prerelease");
+    assert_eq!(legacy["updates"]["include_adapters"], false);
+    assert_eq!(legacy["updates"]["notify"], false);
+    assert_eq!(legacy["updates"]["future_nested"], "preserved");
+
+    let mut human_show = isolated_command(project.path())?;
+    human_show.args(["config", "show"]);
+    human_show
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("updates.check: never"))
+        .stdout(predicate::str::contains("updates.interval-hours: 12"))
+        .stdout(predicate::str::contains("updates.channel: prerelease"))
+        .stdout(predicate::str::contains("updates.include-adapters: false"))
+        .stdout(predicate::str::contains("updates.notify: false"));
+    Ok(())
+}
+
+#[test]
+fn config_update_settings_reject_invalid_values_and_help_lists_the_surface() -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    for (key, value, expected) in [
+        ("updates.check", "sometimes", "expected startup or never"),
+        (
+            "updates.interval-hours",
+            "tomorrow",
+            "expected a non-negative integer",
+        ),
+        (
+            "updates.channel",
+            "nightly",
+            "expected stable or prerelease",
+        ),
+        ("updates.include-adapters", "yes", "expected true or false"),
+        ("updates.notify", "yes", "expected true or false"),
+    ] {
+        let mut set = isolated_command(project.path())?;
+        set.args(["config", "set", key, value]);
+        set.assert()
+            .failure()
+            .stderr(predicate::str::contains(expected));
+    }
+
+    let mut help = isolated_command(project.path())?;
+    help.args(["config", "--help"]);
+    help.assert()
+        .success()
+        .stdout(predicate::str::contains("updates.check never"))
+        .stdout(predicate::str::contains("updates.interval-hours 12"))
+        .stdout(predicate::str::contains("updates.channel prerelease"))
+        .stdout(predicate::str::contains("updates.include-adapters false"))
+        .stdout(predicate::str::contains("updates.notify false"))
+        .stdout(predicate::str::contains("config.toml"))
+        .stdout(predicate::str::contains("config.json"));
     Ok(())
 }
 

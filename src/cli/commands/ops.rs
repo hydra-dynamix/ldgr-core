@@ -47,7 +47,7 @@ use super::super::render::emit;
 use super::super::render::status::{build_status_summary, print_status_summary};
 use super::super::render::text::print_loop_result;
 use super::super::{CLI_DEFAULT_HELP_SECTIONS, INIT_PROJECT_SETUP_PROMPT};
-use crate::harness_config::{HarnessConfig, InterviewDepth};
+use crate::harness_config::{HarnessConfig, InterviewDepth, UpdateChannel, UpdateCheck};
 
 const LDGR_CORE_LOOP_PROMPT: &str = include_str!("../../../prompts/loop-prompt.md");
 const LDGR_CORE_LOOP_PROMPT_FILE: &str = "ldgr-core-loop.md";
@@ -3622,7 +3622,7 @@ pub fn handle_config(args: ConfigArgs) -> anyhow::Result<()> {
     let legacy_config_path = home.join(".ldgr/config.json");
     match args.command {
         ConfigCommand::Show(show) => {
-            let depth = configured_interview_depth();
+            let config = read_ldgr_harness_config(&home).unwrap_or_default();
             if show.json {
                 println!(
                     "{}",
@@ -3630,7 +3630,14 @@ pub fn handle_config(args: ConfigArgs) -> anyhow::Result<()> {
                         "config_path": config_path,
                         "legacy_config_path": legacy_config_path,
                         "exists": config_path.is_file(),
-                        "interview_depth": depth.as_str(),
+                        "interview_depth": config.interview_depth.as_str(),
+                        "updates": {
+                            "check": config.updates.check.as_str(),
+                            "interval_hours": config.updates.interval_hours,
+                            "channel": config.updates.channel.as_str(),
+                            "include_adapters": config.updates.include_adapters,
+                            "notify": config.updates.notify,
+                        },
                     }))?
                 );
             } else {
@@ -3638,38 +3645,100 @@ pub fn handle_config(args: ConfigArgs) -> anyhow::Result<()> {
                 if !config_path.is_file() {
                     println!("status: not written yet; run `ldgr install`");
                 }
-                println!("interview_depth: {} — {}", depth.as_str(), depth.describe());
+                println!(
+                    "interview_depth: {} — {}",
+                    config.interview_depth.as_str(),
+                    config.interview_depth.describe()
+                );
+                println!("updates.check: {}", config.updates.check.as_str());
+                println!("updates.interval-hours: {}", config.updates.interval_hours);
+                println!("updates.channel: {}", config.updates.channel.as_str());
+                println!(
+                    "updates.include-adapters: {}",
+                    config.updates.include_adapters
+                );
+                println!("updates.notify: {}", config.updates.notify);
             }
             Ok(())
         }
         ConfigCommand::Set(set) => {
             let key = set.key.trim().to_ascii_lowercase().replace('_', "-");
-            if key != "interview-depth" {
-                anyhow::bail!("unknown config key `{}`; expected interview-depth", set.key);
-            }
-            let depth = InterviewDepth::parse(&set.value).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "unknown interview-depth `{}`; expected high, medium, low, or none",
-                    set.value
-                )
-            })?;
             // Preserve every known field and unknown extension while writing
             // canonical TOML plus the legacy JSON compatibility mirror.
-            let mut config = read_ldgr_harness_config(&home).unwrap_or_else(|| HarnessConfig {
-                schema_version: crate::harness_config::HARNESS_CONFIG_SCHEMA_VERSION,
-                default_harness: None,
-                interview_depth: InterviewDepth::default(),
-                selected_harnesses: Vec::new(),
-                installed: Vec::new(),
-                extensions: std::collections::BTreeMap::new(),
-            });
-            config.interview_depth = depth;
+            let mut config = read_ldgr_harness_config(&home).unwrap_or_default();
+            let rendered = set_harness_config_value(&mut config, &key, &set.value)?;
             let (config_path, legacy_config_path) = write_harness_config_files(&home, &config)?;
-            println!("interview_depth: {} — {}", depth.as_str(), depth.describe());
+            println!("{key}: {rendered}");
             println!("wrote {}", config_path.display());
             println!("wrote {}", legacy_config_path.display());
             Ok(())
         }
+    }
+}
+
+fn set_harness_config_value(
+    config: &mut HarnessConfig,
+    key: &str,
+    value: &str,
+) -> anyhow::Result<String> {
+    match key {
+        "interview-depth" => {
+            let depth = InterviewDepth::parse(value).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "unknown interview-depth `{value}`; expected high, medium, low, or none"
+                )
+            })?;
+            config.interview_depth = depth;
+            Ok(format!("{} — {}", depth.as_str(), depth.describe()))
+        }
+        "updates.check" => {
+            let check = UpdateCheck::parse(value).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "unknown updates.check `{value}`; expected startup or never"
+                )
+            })?;
+            config.updates.check = check;
+            Ok(check.as_str().to_owned())
+        }
+        "updates.interval-hours" => {
+            let interval = value.trim().parse::<u64>().map_err(|_| {
+                anyhow::anyhow!(
+                    "invalid updates.interval-hours `{value}`; expected a non-negative integer"
+                )
+            })?;
+            config.updates.interval_hours = interval;
+            Ok(interval.to_string())
+        }
+        "updates.channel" => {
+            let channel = UpdateChannel::parse(value).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "unknown updates.channel `{value}`; expected stable or prerelease"
+                )
+            })?;
+            config.updates.channel = channel;
+            Ok(channel.as_str().to_owned())
+        }
+        "updates.include-adapters" => {
+            let include_adapters = parse_config_bool(key, value)?;
+            config.updates.include_adapters = include_adapters;
+            Ok(include_adapters.to_string())
+        }
+        "updates.notify" => {
+            let notify = parse_config_bool(key, value)?;
+            config.updates.notify = notify;
+            Ok(notify.to_string())
+        }
+        _ => anyhow::bail!(
+            "unknown config key `{key}`; expected interview-depth, updates.check, updates.interval-hours, updates.channel, updates.include-adapters, or updates.notify"
+        ),
+    }
+}
+
+fn parse_config_bool(key: &str, value: &str) -> anyhow::Result<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => anyhow::bail!("invalid {key} `{value}`; expected true or false"),
     }
 }
 

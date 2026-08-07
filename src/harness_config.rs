@@ -94,12 +94,29 @@ pub struct HarnessConfig {
     /// How deep a requirements interview the agent should conduct.
     #[serde(default)]
     pub interview_depth: InterviewDepth,
+    /// User-level update discovery and notification preferences.
+    #[serde(default)]
+    pub updates: UpdateConfig,
     #[serde(default)]
     pub selected_harnesses: Vec<String>,
     #[serde(default)]
     pub installed: Vec<InstalledHarness>,
     #[serde(flatten)]
     pub extensions: BTreeMap<String, serde_json::Value>,
+}
+
+impl Default for HarnessConfig {
+    fn default() -> Self {
+        Self {
+            schema_version: HARNESS_CONFIG_SCHEMA_VERSION,
+            default_harness: None,
+            interview_depth: InterviewDepth::default(),
+            updates: UpdateConfig::default(),
+            selected_harnesses: Vec::new(),
+            installed: Vec::new(),
+            extensions: BTreeMap::new(),
+        }
+    }
 }
 
 fn default_schema_version() -> u32 {
@@ -119,6 +136,93 @@ pub struct InstalledHarness {
     pub command_paths: Vec<PathBuf>,
     #[serde(flatten)]
     pub extensions: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum UpdateCheck {
+    #[default]
+    Startup,
+    Never,
+}
+
+impl UpdateCheck {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Startup => "startup",
+            Self::Never => "never",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "startup" => Some(Self::Startup),
+            "never" => Some(Self::Never),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum UpdateChannel {
+    #[default]
+    Stable,
+    Prerelease,
+}
+
+impl UpdateChannel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Stable => "stable",
+            Self::Prerelease => "prerelease",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "stable" => Some(Self::Stable),
+            "prerelease" => Some(Self::Prerelease),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct UpdateConfig {
+    #[serde(default)]
+    pub check: UpdateCheck,
+    #[serde(default = "default_update_interval_hours")]
+    pub interval_hours: u64,
+    #[serde(default)]
+    pub channel: UpdateChannel,
+    #[serde(default = "default_true")]
+    pub include_adapters: bool,
+    #[serde(default = "default_true")]
+    pub notify: bool,
+    #[serde(flatten)]
+    pub extensions: BTreeMap<String, serde_json::Value>,
+}
+
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        Self {
+            check: UpdateCheck::default(),
+            interval_hours: default_update_interval_hours(),
+            channel: UpdateChannel::default(),
+            include_adapters: true,
+            notify: true,
+            extensions: BTreeMap::new(),
+        }
+    }
+}
+
+const fn default_update_interval_hours() -> u64 {
+    24
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 impl HarnessConfig {
@@ -162,7 +266,10 @@ pub enum HarnessResourceKind {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_harness_config, parse_harness_config_toml, HarnessResourceKind};
+    use super::{
+        parse_harness_config, parse_harness_config_toml, HarnessResourceKind, UpdateChannel,
+        UpdateCheck,
+    };
 
     #[test]
     fn parses_current_schema_without_losing_harnesses_or_paths() -> anyhow::Result<()> {
@@ -181,6 +288,12 @@ mod tests {
         assert_eq!(config.selected_harnesses, ["pi", "codex"]);
         assert_eq!(config.resource_paths(HarnessResourceKind::Skill).len(), 2);
         assert_eq!(config.resource_paths(HarnessResourceKind::Prompt).len(), 1);
+        assert_eq!(config.updates.check, UpdateCheck::Startup);
+        assert_eq!(config.updates.interval_hours, 24);
+        assert_eq!(config.updates.channel, UpdateChannel::Stable);
+        assert!(config.updates.include_adapters);
+        assert!(config.updates.notify);
+        assert_eq!(config.extensions["agentctl"]["status"], "installed");
         Ok(())
     }
 
@@ -208,6 +321,44 @@ interview_depth = "low"
         assert_eq!(config.default_harness.as_deref(), Some("codex"));
         assert_eq!(config.selected_harnesses, ["codex", "claude"]);
         assert_eq!(config.interview_depth.as_str(), "low");
+        assert_eq!(config.updates.check, UpdateCheck::Startup);
+        assert_eq!(config.updates.interval_hours, 24);
+        assert_eq!(config.updates.channel, UpdateChannel::Stable);
+        assert!(config.updates.include_adapters);
+        assert!(config.updates.notify);
+        Ok(())
+    }
+
+    #[test]
+    fn parses_update_preferences_and_preserves_nested_extensions() -> anyhow::Result<()> {
+        let config = parse_harness_config_toml(
+            r#"
+schema_version = 1
+future_top_level = "preserved"
+
+[updates]
+check = "never"
+interval_hours = 12
+channel = "prerelease"
+include_adapters = false
+notify = false
+enterprise_catalog = "mirror"
+"#,
+        )?;
+
+        assert_eq!(config.updates.check, UpdateCheck::Never);
+        assert_eq!(config.updates.interval_hours, 12);
+        assert_eq!(config.updates.channel, UpdateChannel::Prerelease);
+        assert!(!config.updates.include_adapters);
+        assert!(!config.updates.notify);
+        assert_eq!(config.extensions["future_top_level"], "preserved");
+        assert_eq!(config.updates.extensions["enterprise_catalog"], "mirror");
+
+        let serialized = toml::to_string_pretty(&config)?;
+        let reparsed = parse_harness_config_toml(&serialized)?;
+        assert_eq!(reparsed.schema_version, 1);
+        assert_eq!(reparsed.extensions["future_top_level"], "preserved");
+        assert_eq!(reparsed.updates.extensions["enterprise_catalog"], "mirror");
         Ok(())
     }
 }
