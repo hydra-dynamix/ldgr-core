@@ -208,6 +208,10 @@ try {
         -not (Test-Path -LiteralPath $agentctlSource -PathType Leaf)) {
         throw "The release archive did not contain the paired ldgr.exe and agentctl.exe binaries under $sourceRoot."
     }
+    $releaseMetadataPath = Join-Path $temporaryDirectory "ldgr-core-$Version\RELEASE-METADATA.json"
+    if (-not (Test-Path -LiteralPath $releaseMetadataPath -PathType Leaf)) {
+        throw "The release archive did not contain RELEASE-METADATA.json."
+    }
 
     New-Item -ItemType Directory -Force -Path $InstallDirectory | Out-Null
     $destination = Join-Path $InstallDirectory $Binary
@@ -243,9 +247,42 @@ try {
         [System.IO.Path]::GetFullPath($resolvedAgentctl) -ne [System.IO.Path]::GetFullPath($agentctlDestination)) {
         throw "PATH still resolves a different ldgr or agentctl. Expected $destination and $agentctlDestination; resolved $resolvedLdgr and $resolvedAgentctl."
     }
-    & $destination --version
-    & $agentctlDestination --version
-    & $destination compatibility --agentctl-version $((& $agentctlDestination --version) -replace '^agentctl\s+', '') --json
+    $coreVersionOutput = (& $destination --version).Trim()
+    if ($LASTEXITCODE -ne 0 -or $coreVersionOutput -ne "ldgr $Version") {
+        throw "Installed Core version validation failed: expected ldgr $Version; got $coreVersionOutput."
+    }
+    $agentctlVersionOutput = (& $agentctlDestination --version).Trim()
+    if ($LASTEXITCODE -ne 0 -or $agentctlVersionOutput -notmatch '^agentctl\s+(.+)$') {
+        throw "Installed agentctl version validation failed: $agentctlVersionOutput."
+    }
+    $agentctlVersion = $Matches[1]
+    & $destination compatibility --agentctl-version $agentctlVersion --json
+    if ($LASTEXITCODE -ne 0) {
+        throw "Installed Core/agentctl compatibility validation failed."
+    }
+    $homeDirectory = if ($env:USERPROFILE) { $env:USERPROFILE } else { $env:HOME }
+    if (-not $homeDirectory) {
+        throw "Could not determine the user home for the Core installation receipt."
+    }
+    $signingKeyId = if ($env:LDGR_SIGNING_KEY_ID) {
+        $env:LDGR_SIGNING_KEY_ID
+    } else {
+        "ldgr-release-2026-01"
+    }
+    $receiptArgs = @(
+        "__record-core-installation",
+        "--home", $homeDirectory,
+        "--agentctl-binary", $agentctlDestination,
+        "--release-metadata", $releaseMetadataPath,
+        "--archive-url", $downloadBase,
+        "--archive-sha256", $actualHash,
+        "--signing-key-id", $signingKeyId
+    )
+    & $destination @receiptArgs
+    if ($LASTEXITCODE -ne 0) {
+        throw "Installed pair validated, but the Core installation receipt was not written."
+    }
+    Write-Host "Recorded official installation ownership under $homeDirectory\.ldgr"
 } finally {
     if (Test-Path -LiteralPath $temporaryDirectory) {
         Remove-Item -LiteralPath $temporaryDirectory -Recurse -Force

@@ -142,6 +142,8 @@ case "$PLATFORM" in
   windows-*) AGENTCTL_FILE="$AGENTCTL_BINARY.exe" ;;
 esac
 AGENTCTL_SRC="$TMP_DIR/$PACKAGE-$VERSION/$PLATFORM/$AGENTCTL_FILE"
+RELEASE_METADATA="$TMP_DIR/$PACKAGE-$VERSION/RELEASE-METADATA.json"
+[ -f "$RELEASE_METADATA" ] || fail "archive did not contain RELEASE-METADATA.json"
 [ -f "$SRC" ] || fail "archive did not contain expected binary: $PACKAGE-$VERSION/$PLATFORM/$BINARY_FILE"
 if [ "$INSTALL_AGENTCTL" -eq 1 ]; then
   [ -f "$AGENTCTL_SRC" ] || fail "archive did not contain paired launcher: $PACKAGE-$VERSION/$PLATFORM/$AGENTCTL_FILE"
@@ -166,9 +168,22 @@ case ":$PATH:" in
   *":$INSTALL_DIR:"*) ;;
   *) log "Add $INSTALL_DIR to PATH if needed." ;;
 esac
-"$INSTALL_DIR/$BINARY_FILE" --version
+core_version_output="$("$INSTALL_DIR/$BINARY_FILE" --version)"
+[ "$core_version_output" = "ldgr $VERSION" ] ||
+  fail "installed Core version mismatch: expected ldgr $VERSION; got $core_version_output"
 if [ "$INSTALL_AGENTCTL" -eq 1 ]; then
-  "$INSTALL_DIR/$AGENTCTL_FILE" --version
-  agentctl_version="$("$INSTALL_DIR/$AGENTCTL_FILE" --version | awk '{print $2}')"
+  agentctl_version_output="$("$INSTALL_DIR/$AGENTCTL_FILE" --version)"
+  agentctl_version="$(printf '%s\n' "$agentctl_version_output" | awk '$1 == "agentctl" {print $2}')"
+  [ -n "$agentctl_version" ] ||
+    fail "installed agentctl version validation failed: $agentctl_version_output"
   "$INSTALL_DIR/$BINARY_FILE" compatibility --agentctl-version "$agentctl_version" --json
+  SIGNING_KEY_ID="${LDGR_SIGNING_KEY_ID:-ldgr-release-2026-01}"
+  "$INSTALL_DIR/$BINARY_FILE" __record-core-installation \
+    --home "$HOME" \
+    --agentctl-binary "$INSTALL_DIR/$AGENTCTL_FILE" \
+    --release-metadata "$RELEASE_METADATA" \
+    --archive-url "$URL" \
+    --archive-sha256 "$expected" \
+    --signing-key-id "$SIGNING_KEY_ID"
+  log "Recorded official installation ownership under $HOME/.ldgr"
 fi

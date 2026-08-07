@@ -123,6 +123,21 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    #[command(name = "__record-core-installation", hide = true)]
+    RecordCoreInstallation {
+        #[arg(long)]
+        home: PathBuf,
+        #[arg(long)]
+        agentctl_binary: PathBuf,
+        #[arg(long)]
+        release_metadata: PathBuf,
+        #[arg(long)]
+        archive_url: String,
+        #[arg(long)]
+        archive_sha256: String,
+        #[arg(long)]
+        signing_key_id: String,
+    },
     /// Negotiate the launcher/Core recovery protocol before worker startup.
     Compatibility {
         /// Agentctl semantic version requesting compatibility.
@@ -376,6 +391,29 @@ fn handle_cli(cli: Cli) -> anyhow::Result<()> {
         return Ok(());
     };
     match command {
+        Command::RecordCoreInstallation {
+            home,
+            agentctl_binary,
+            release_metadata,
+            archive_url,
+            archive_sha256,
+            signing_key_id,
+        } => {
+            let current_exe = std::env::current_exe().context("failed to resolve current_exe")?;
+            crate::update::installation::write_official_installation_receipt(
+                &crate::update::installation::OfficialReceiptInput {
+                    home,
+                    current_exe,
+                    agentctl_binary,
+                    release_metadata_path: release_metadata,
+                    archive_url,
+                    archive_sha256,
+                    signing_key_id,
+                    previous_successful_plan_id: None,
+                },
+            )?;
+            Ok(())
+        }
         Command::Compatibility {
             agentctl_version,
             json,
