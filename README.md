@@ -201,7 +201,7 @@ default. On Windows, loop children also receive `HOME` from `USERPROFILE` when
 `ldgr-loop-<harness>` so the built-in `--agent agentctl` runner can call
 `agentctl run ldgr-loop` and stream the rendered prompt through stdin.
 
-Core 0.1.13 is released with agentctl 0.1.2 in the same checksum-covered
+Core 0.1.14 is released with agentctl 0.1.2 in the same checksum-covered
 archive. Before an LDGR-owned profile starts a worker, agentctl negotiates
 `ldgr.launcher-compatibility.v1` with the resolved Core binary. Mixed or older
 Core installations stop with a durable `agentctl.compatibility/core-incompatible`
