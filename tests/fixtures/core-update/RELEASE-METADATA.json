@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "package": "ldgr-core",
+  "binary": "ldgr",
+  "version": "0.1.15",
+  "agentctl_version": "0.1.2",
+  "agentctl_repository": "hydra-dynamix/agentctl",
+  "agentctl_commit": "2222222222222222222222222222222222222222",
+  "launcher_compatibility_schema": "ldgr.launcher-compatibility.v1",
+  "error_recovery_schema": 1,
+  "platform": "linux-x86_64",
+  "commit": "1111111111111111111111111111111111111111",
+  "source_repository": "hydra-dynamix/ldgr-core"
+}

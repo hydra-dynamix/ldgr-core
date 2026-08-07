@@ -13,4 +13,5 @@ pub mod release_index;
 pub mod store;
 pub mod telemetry;
 pub mod tool_runner;
+pub mod update;
 pub mod web;

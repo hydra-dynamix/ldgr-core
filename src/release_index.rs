@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -92,14 +92,23 @@ pub fn resolve_release<'a>(
 }
 
 pub fn verify_file_sha256(path: &Path, expected: &str) -> anyhow::Result<()> {
-    if expected.len() != 64 || !expected.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        bail!("indexed SHA-256 must contain exactly 64 hexadecimal characters");
-    }
+    verify_file_sha256_for(path, expected, "adapter archive")
+}
+
+pub fn verify_file_sha256_for(path: &Path, expected: &str, subject: &str) -> anyhow::Result<()> {
+    validate_sha256(expected)?;
     let bytes = fs::read(path)
         .with_context(|| format!("failed to read {} for SHA-256 verification", path.display()))?;
     let actual = format!("{:x}", Sha256::digest(bytes));
     if !actual.eq_ignore_ascii_case(expected) {
-        bail!("adapter archive SHA-256 mismatch: expected {expected}, got {actual}");
+        bail!("{subject} SHA-256 mismatch: expected {expected}, got {actual}");
+    }
+    Ok(())
+}
+
+pub fn validate_sha256(expected: &str) -> anyhow::Result<()> {
+    if expected.len() != 64 || !expected.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("indexed SHA-256 must contain exactly 64 hexadecimal characters");
     }
     Ok(())
 }
@@ -110,19 +119,47 @@ pub fn verify_detached_release_signature(
     keyring_path: &Path,
     expected_key_id: &str,
 ) -> anyhow::Result<()> {
-    let keyring: ReleaseKeyring =
-        serde_json::from_str(&fs::read_to_string(keyring_path).with_context(|| {
+    let keyring =
+        parse_release_keyring(&fs::read_to_string(keyring_path).with_context(|| {
             format!("failed to read release keyring {}", keyring_path.display())
-        })?)
-        .context("release keyring is not valid JSON")?;
-    let envelope: DetachedSignature =
-        serde_json::from_str(&fs::read_to_string(signature_path).with_context(|| {
+        })?)?;
+    let envelope =
+        parse_detached_signature(&fs::read_to_string(signature_path).with_context(|| {
             format!(
                 "failed to read detached signature {}",
                 signature_path.display()
             )
-        })?)
-        .context("detached release signature is not valid JSON")?;
+        })?)?;
+    let archive = fs::read(archive_path)
+        .with_context(|| format!("failed to read signed archive {}", archive_path.display()))?;
+    verify_detached_signature_bytes(
+        &archive,
+        &envelope,
+        &keyring,
+        expected_key_id,
+        "adapter release",
+    )
+}
+
+pub fn parse_release_keyring(text: &str) -> anyhow::Result<ReleaseKeyring> {
+    let keyring: ReleaseKeyring =
+        serde_json::from_str(text).context("release keyring is not valid JSON")?;
+    validate_release_keyring(&keyring)?;
+    Ok(keyring)
+}
+
+pub fn parse_detached_signature(text: &str) -> anyhow::Result<DetachedSignature> {
+    serde_json::from_str(text).context("detached release signature is not valid JSON")
+}
+
+pub fn verify_detached_signature_bytes(
+    signed_bytes: &[u8],
+    envelope: &DetachedSignature,
+    keyring: &ReleaseKeyring,
+    expected_key_id: &str,
+    subject: &str,
+) -> anyhow::Result<()> {
+    validate_release_keyring(keyring)?;
     if envelope.algorithm != "Ed25519" {
         bail!(
             "unsupported detached signature algorithm `{}`",
@@ -152,19 +189,39 @@ pub fn verify_detached_release_signature(
         .map_err(|_| anyhow::anyhow!("detached signature must be 64 bytes"))?;
     let verifier = VerifyingKey::from_bytes(&public_key)
         .context("release public key is not a valid Ed25519 key")?;
-    let archive = fs::read(archive_path)
-        .with_context(|| format!("failed to read signed archive {}", archive_path.display()))?;
     verifier
-        .verify(&archive, &Signature::from_bytes(&signature))
-        .context("detached adapter release signature did not verify")
+        .verify(signed_bytes, &Signature::from_bytes(&signature))
+        .with_context(|| format!("detached {subject} signature did not verify"))
 }
 
+pub fn validate_release_keyring(keyring: &ReleaseKeyring) -> anyhow::Result<()> {
+    if keyring.keys.is_empty() {
+        bail!("release keyring must contain at least one trusted key");
+    }
+    let mut key_ids = HashSet::new();
+    for key in &keyring.keys {
+        if key.key_id.trim().is_empty() {
+            bail!("release key id must not be empty");
+        }
+        if !key_ids.insert(key.key_id.as_str()) {
+            bail!("duplicate release key id `{}`", key.key_id);
+        }
+        let public_key: [u8; 32] = STANDARD
+            .decode(&key.public_key)
+            .with_context(|| format!("release public key `{}` is not valid base64", key.key_id))?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("release public key `{}` must be 32 bytes", key.key_id))?;
+        VerifyingKey::from_bytes(&public_key)
+            .with_context(|| format!("release public key `{}` is not valid Ed25519", key.key_id))?;
+    }
+    Ok(())
+}
 pub fn extract_safe_tar_gz(
     archive_path: &Path,
     destination: &Path,
     expected_root: &str,
 ) -> anyhow::Result<()> {
-    validate_identifier_like_archive_root(expected_root)?;
+    validate_archive_root(expected_root)?;
     fs::create_dir_all(destination)?;
     let file = fs::File::open(archive_path)
         .with_context(|| format!("failed to open archive {}", archive_path.display()))?;
@@ -233,27 +290,27 @@ pub fn extract_safe_tar_gz(
     Ok(())
 }
 
-fn validate_identifier_like_archive_root(root: &str) -> anyhow::Result<()> {
+pub fn validate_archive_root(root: &str) -> anyhow::Result<()> {
     if root.is_empty() || root == "." || root == ".." || Path::new(root).components().count() != 1 {
         bail!("archive_root must be one relative path component");
     }
     Ok(())
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ReleaseKeyring {
     pub keys: Vec<ReleasePublicKey>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ReleasePublicKey {
     pub key_id: String,
     pub public_key: String,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct DetachedSignature {
     pub algorithm: String,
