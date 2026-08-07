@@ -18,6 +18,134 @@ function Resolve-InstallDirectory {
     }
     return Join-Path $env:LOCALAPPDATA "Programs\ldgr\bin"
 }
+
+function Test-PathEntryMatchesInstallDirectory {
+    param(
+        [Parameter(Mandatory = $true)][string]$PathEntry,
+        [Parameter(Mandatory = $true)][string]$InstallDirectory,
+        [switch]$ExpandEnvironmentNames
+    )
+
+    $candidate = $PathEntry.Trim().Trim('"')
+    if (-not $candidate) {
+        return $false
+    }
+
+    try {
+        if ($ExpandEnvironmentNames) {
+            $candidate = [Environment]::ExpandEnvironmentVariables($candidate)
+        }
+        $candidate = [System.IO.Path]::GetFullPath($candidate).TrimEnd("\")
+        $expected = [System.IO.Path]::GetFullPath($InstallDirectory).TrimEnd("\")
+        return $candidate.Equals($expected, [System.StringComparison]::OrdinalIgnoreCase)
+    } catch {
+        return $candidate.TrimEnd("\").Equals(
+            $InstallDirectory.TrimEnd("\"),
+            [System.StringComparison]::OrdinalIgnoreCase
+        )
+    }
+}
+
+function Publish-UserEnvironmentChange {
+    if (-not ("Ldgr.WindowsEnvironment" -as [type])) {
+        Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+
+namespace Ldgr {
+    public static class WindowsEnvironment {
+        [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern IntPtr SendMessageTimeout(
+            IntPtr hWnd,
+            uint message,
+            UIntPtr wParam,
+            string lParam,
+            uint flags,
+            uint timeout,
+            out UIntPtr result);
+    }
+}
+"@ | Out-Null
+    }
+
+    $result = [UIntPtr]::Zero
+    $sent = [Ldgr.WindowsEnvironment]::SendMessageTimeout(
+        [IntPtr]0xffff,
+        0x001A,
+        [UIntPtr]::Zero,
+        "Environment",
+        0x0002,
+        5000,
+        [ref]$result
+    )
+    if ($sent -eq [IntPtr]::Zero) {
+        $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        Write-Warning "Updated the user PATH in the registry, but Windows did not broadcast the environment change (Win32 error $errorCode). Open a new terminal; if it does not see the change, sign out and back in."
+    }
+}
+
+function Add-InstallDirectoryToUserPath {
+    param(
+        [Parameter(Mandatory = $true)][string]$InstallDirectory,
+        [string]$RegistrySubKey = "Environment",
+        [switch]$SkipBroadcast
+    )
+
+    $registryKey = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($RegistrySubKey, $true)
+    if (-not $registryKey) {
+        $registryKey = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($RegistrySubKey)
+    }
+    if (-not $registryKey) {
+        throw "Could not open HKCU:\$RegistrySubKey for writing."
+    }
+
+    try {
+        # Environment.GetEnvironmentVariable(..., "User") expands REG_EXPAND_SZ.
+        # Read the registry value without expansion so existing %VAR% entries and
+        # the registry value kind survive the update exactly as the user stored them.
+        $rawUserPath = [string]$registryKey.GetValue(
+            "Path",
+            "",
+            [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames
+        )
+        if ($registryKey.GetValueNames() -contains "Path") {
+            $pathValueKind = $registryKey.GetValueKind("Path")
+        } else {
+            $pathValueKind = [Microsoft.Win32.RegistryValueKind]::ExpandString
+        }
+        if ($pathValueKind -notin @(
+            [Microsoft.Win32.RegistryValueKind]::String,
+            [Microsoft.Win32.RegistryValueKind]::ExpandString
+        )) {
+            throw "HKCU:\$RegistrySubKey\Path has unsupported registry kind $pathValueKind."
+        }
+
+        foreach ($pathEntry in @($rawUserPath -split ";")) {
+            $entryMatches = $pathEntry -and (Test-PathEntryMatchesInstallDirectory `
+                -PathEntry $pathEntry `
+                -InstallDirectory $InstallDirectory `
+                -ExpandEnvironmentNames:($pathValueKind -eq [Microsoft.Win32.RegistryValueKind]::ExpandString))
+            if ($entryMatches) {
+                return $false
+            }
+        }
+
+        $newUserPath = if ($rawUserPath) {
+            "$InstallDirectory;$rawUserPath"
+        } else {
+            $InstallDirectory
+        }
+        $registryKey.SetValue("Path", $newUserPath, $pathValueKind)
+    } finally {
+        $registryKey.Dispose()
+    }
+
+    if (-not $SkipBroadcast) {
+        Publish-UserEnvironmentChange
+    }
+    return $true
+}
+
 $InstallDirectory = Resolve-InstallDirectory
 $Version = $env:LDGR_VERSION
 $Platform = "windows-x86_64"
@@ -99,15 +227,13 @@ try {
     }
 
     Write-Host "Installed paired binaries to $InstallDirectory"
-    $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
-    $pathEntries = @($userPath -split ";" | Where-Object { $_ })
-    if ($InstallDirectory -notin $pathEntries) {
-        [Environment]::SetEnvironmentVariable(
-            "Path",
-            (($InstallDirectory + $pathEntries) -join ";"),
-            "User"
-        )
-        Write-Host "Added $InstallDirectory to your user PATH. Open a new terminal to use it everywhere."
+    try {
+        $pathUpdated = Add-InstallDirectoryToUserPath $InstallDirectory
+        if ($pathUpdated) {
+            Write-Host "Added $InstallDirectory to your user PATH. Open a new terminal to use it everywhere."
+        }
+    } catch {
+        Write-Warning "Installed the binaries, but could not update your user PATH. Add $InstallDirectory manually. $($_.Exception.Message)"
     }
     $env:Path = "$InstallDirectory;$env:Path"
 

@@ -114,6 +114,11 @@ jobs:
         run: "target/release/${BINARY}${{ matrix.binary_ext }} --version"
         shell: bash
 
+      - name: Test Windows installer PATH handling
+        if: matrix.platform == 'windows-x86_64'
+        shell: powershell
+        run: tests/install_path.ps1
+
       - name: Build paired agentctl dependency
         shell: bash
         run: |
