@@ -30,6 +30,7 @@ use crate::telemetry::{
     NUMERICAL_SEQUENCE_PROTOCOLS_V1, TELEMETRY_CONSENT_POLICY_VERSION,
 };
 use crate::tool_runner::parse_argv_json;
+use crate::update::adapter::InstallTransaction;
 use crate::web::{generate_control_token, serve, WebOptions};
 
 use super::super::args::{
@@ -543,93 +544,29 @@ fn install_adapter_from_catalog(args: &InstallAdapterArgs) -> anyhow::Result<()>
 }
 
 pub(crate) fn handle_update_adapter(args: &AdapterUpdateArgs) -> anyhow::Result<()> {
-    use semver::Version;
-
-    let registry = AdapterRegistry::discover();
-    let installed = registry
-        .find(&args.name)
-        .with_context(|| format!("adapter `{}` is not installed", args.name))?;
-    let receipt_value = installed
-        .installation_receipt
-        .as_ref()
-        .context("installed adapter has no tracked installation receipt; reinstall it first")?;
-    let receipt = parse_adapter_installation_receipt(receipt_value.clone())?;
-    if let AdapterInstallationReceipt::Source(receipt) = receipt {
-        if args.prerelease {
-            bail!(
-                "--prerelease applies only to signed release adapters, not local source installs"
-            );
-        }
-        let home = home_dir()?;
-        let drift = source_receipt_drift(&installed.root_path, &home, &receipt)?;
-        if !drift.is_empty() {
-            bail!(
-                "refusing to update modified source adapter-owned files:\n{}\nRestore them or run `ldgr adapter uninstall {} --force` before reinstalling.",
-                format_drift_paths(&drift),
-                installed.slug
-            );
-        }
-        let source = resolve_adapter_source_package(
-            &receipt.source.package,
-            Path::new(&receipt.source.bundle_root),
-        )?;
-        verify_source_identity_paths(&receipt, &source)?;
-        let current_source_sha256 = digest_source_bundle(&source.bundle_root)?;
-        let source_changed = current_source_sha256 != receipt.source.bundle_sha256;
-        println!(
-            "adapter={} install_kind=local_source source_changed={} verified_release=false",
-            installed.slug, source_changed
-        );
-        if args.check {
-            return Ok(());
-        }
-        return install_adapter_from_source_root_with_package(
-            &installed.slug,
-            &receipt.source.package,
-            &source.bundle_root,
-            &installed.root_path,
-            &home,
-        );
-    }
-    let AdapterInstallationReceipt::Release(receipt) = receipt else {
-        unreachable!()
+    let inspection = crate::update::adapter::inspect_adapter_installation(&args.name)?;
+    let target_core_version = semver::Version::parse(env!("CARGO_PKG_VERSION"))?;
+    let channel = if args.prerelease {
+        UpdateChannel::Prerelease
+    } else {
+        UpdateChannel::Stable
     };
-    let current_text = receipt.version;
-    let current = Version::parse(&current_text).context("installed receipt version is invalid")?;
-    let index = crate::release_index::load_configured_release_index()?;
-    let core = Version::parse(env!("CARGO_PKG_VERSION"))?;
-    let platform = platform_tag()?;
-    let resolved = crate::release_index::resolve_release(
-        &index,
-        &installed.slug,
-        &core,
-        &platform,
-        None,
-        args.prerelease,
-    )?;
-    if resolved.version <= current {
-        println!(
-            "adapter={} installed={} latest_compatible={} update_available=false",
-            installed.slug, current, resolved.version
-        );
+    let plan =
+        crate::update::adapter::plan_adapter_update(inspection, &target_core_version, channel)?;
+    plan.print_status();
+    if args.check || !plan.should_apply_for_single_adapter_command() {
         return Ok(());
     }
-    println!(
-        "adapter={} installed={} latest_compatible={} update_available=true",
-        installed.slug, current, resolved.version
-    );
-    if args.check {
-        return Ok(());
-    }
-    install_adapter_from_configured_index(&InstallAdapterArgs {
-        name: installed.slug.clone(),
-        source_root: None,
-        install_root: Some(installed.root_path.clone()),
-        version: Some(resolved.version.to_string()),
-        prerelease: args.prerelease,
-        offline: false,
-        yes: true,
-    })
+    let temp = std::env::temp_dir().join(format!(
+        "ldgr-adapter-update-{}-{}",
+        normalize_adapter_name(&args.name),
+        std::process::id()
+    ));
+    remove_path_if_exists(&temp)?;
+    let mut transaction = InstallTransaction::new(temp.join("rollback"))?;
+    crate::update::adapter::stage_and_apply_adapter_update(&plan, &mut transaction)?;
+    transaction.commit()?;
+    remove_path_if_exists(&temp)
 }
 
 pub(crate) fn handle_uninstall_adapter(args: &AdapterUninstallArgs) -> anyhow::Result<()> {
@@ -988,6 +925,29 @@ fn prepare_source_reinstall(
     Ok(Some(receipt))
 }
 
+pub(crate) fn inspect_source_installation_for_update(
+    install_root: &Path,
+    home: &Path,
+    receipt: &crate::release_index::SourceInstallationReceipt,
+) -> anyhow::Result<(PathBuf, String, bool)> {
+    let drift = source_receipt_drift(install_root, home, receipt)?;
+    if !drift.is_empty() {
+        bail!(
+            "refusing to update modified source adapter-owned files:\n{}\nRestore them or run `ldgr adapter uninstall {} --force` before reinstalling.",
+            format_drift_paths(&drift),
+            receipt.domain
+        );
+    }
+    let source = resolve_adapter_source_package(
+        &receipt.source.package,
+        Path::new(&receipt.source.bundle_root),
+    )?;
+    verify_source_identity_paths(receipt, &source)?;
+    let current_source_sha256 = digest_source_bundle(&source.bundle_root)?;
+    let source_changed = current_source_sha256 != receipt.source.bundle_sha256;
+    Ok((source.bundle_root, current_source_sha256, source_changed))
+}
+
 fn source_receipt_drift(
     install_root: &Path,
     home: &Path,
@@ -1165,16 +1125,6 @@ fn absolute_path(path: &Path) -> anyhow::Result<PathBuf> {
     Ok(absolute)
 }
 
-fn install_adapter_from_configured_index(args: &InstallAdapterArgs) -> anyhow::Result<()> {
-    let configured_source = std::env::var(crate::release_index::ADAPTER_RELEASE_INDEX_ENV)
-        .unwrap_or_else(|_| crate::release_index::DEFAULT_ADAPTER_RELEASE_INDEX_URL.to_owned());
-    if args.offline && configured_source.starts_with("http") {
-        bail!("--offline requires LDGR_ADAPTER_INDEX to reference a local file");
-    }
-    let index = crate::release_index::load_release_index(&configured_source)?;
-    install_adapter_from_index(args, &index)
-}
-
 fn install_adapter_from_index(
     args: &InstallAdapterArgs,
     index: &crate::release_index::AdapterReleaseIndex,
@@ -1245,7 +1195,29 @@ fn install_resolved_index_release(
     ));
     let _ = fs::remove_dir_all(&temp);
     fs::create_dir_all(&temp)?;
-    let archive = temp.join("adapter.tar.gz");
+    let mut transaction = InstallTransaction::new(temp.join("rollback"))?;
+    stage_and_apply_resolved_index_release(
+        resolved,
+        install_root,
+        home,
+        offline,
+        &temp,
+        &mut transaction,
+    )?;
+    transaction.commit()?;
+    let _ = fs::remove_dir_all(&temp);
+    Ok(())
+}
+
+pub(crate) fn stage_and_apply_resolved_index_release(
+    resolved: &crate::release_index::ResolvedAdapterRelease<'_>,
+    install_root: &Path,
+    home: &Path,
+    offline: bool,
+    staging_root: &Path,
+    transaction: &mut InstallTransaction,
+) -> anyhow::Result<()> {
+    let archive = staging_root.join("adapter.tar.gz");
     let update_client = crate::update::network::UpdateNetworkClient::new(offline)?;
     update_client.download_artifact(
         &resolved.platform.asset_url,
@@ -1253,7 +1225,7 @@ fn install_resolved_index_release(
         crate::update::network::MAX_UPDATE_ARTIFACT_BYTES,
     )?;
     crate::release_index::verify_file_sha256(&archive, &resolved.platform.sha256)?;
-    let signature = temp.join("adapter.sig");
+    let signature = staging_root.join("adapter.sig");
     update_client.download_artifact(
         &resolved.platform.signature_url,
         &signature,
@@ -1266,8 +1238,12 @@ fn install_resolved_index_release(
         &keyring,
         &resolved.platform.signing_key_id,
     )?;
-    crate::release_index::extract_safe_tar_gz(&archive, &temp, &resolved.platform.archive_root)?;
-    let extracted = temp.join(&resolved.platform.archive_root);
+    crate::release_index::extract_safe_tar_gz(
+        &archive,
+        staging_root,
+        &resolved.platform.archive_root,
+    )?;
+    let extracted = staging_root.join(&resolved.platform.archive_root);
     if !extracted.is_dir() {
         bail!(
             "release archive did not contain expected root {}",
@@ -1275,7 +1251,6 @@ fn install_resolved_index_release(
         );
     }
     validate_adapter_bundle_contract(&extracted, &resolved.adapter.domain)?;
-    let mut transaction = InstallTransaction::new(temp.join("rollback"))?;
     transaction.snapshot(install_root)?;
     let binary_source = extracted
         .join(&resolved.platform.platform)
@@ -1338,8 +1313,6 @@ fn install_resolved_index_release(
         binary_path.as_deref(),
         &resource_targets,
     )?;
-    transaction.commit()?;
-    let _ = fs::remove_dir_all(&temp);
     Ok(())
 }
 
@@ -1460,96 +1433,6 @@ fn collect_digest_files(
         }
     }
     Ok(())
-}
-
-#[derive(Debug)]
-struct InstallSnapshot {
-    target: PathBuf,
-    backup: PathBuf,
-    existed: bool,
-    was_dir: bool,
-}
-
-struct InstallTransaction {
-    backup_root: PathBuf,
-    snapshots: Vec<InstallSnapshot>,
-    committed: bool,
-}
-
-impl InstallTransaction {
-    fn new(backup_root: PathBuf) -> anyhow::Result<Self> {
-        fs::create_dir_all(&backup_root)?;
-        Ok(Self {
-            backup_root,
-            snapshots: Vec::new(),
-            committed: false,
-        })
-    }
-
-    fn snapshot(&mut self, target: &Path) -> anyhow::Result<()> {
-        if self
-            .snapshots
-            .iter()
-            .any(|snapshot| snapshot.target == target)
-        {
-            return Ok(());
-        }
-        let backup = self.backup_root.join(self.snapshots.len().to_string());
-        let existed = target.exists();
-        let was_dir = target.is_dir();
-        if existed {
-            if was_dir {
-                copy_dir_recursive(target, &backup)?;
-            } else {
-                if let Some(parent) = backup.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                fs::copy(target, &backup)?;
-            }
-        }
-        self.snapshots.push(InstallSnapshot {
-            target: target.to_path_buf(),
-            backup,
-            existed,
-            was_dir,
-        });
-        Ok(())
-    }
-
-    fn commit(mut self) -> anyhow::Result<()> {
-        self.committed = true;
-        fs::remove_dir_all(&self.backup_root).or_else(|error| {
-            (error.kind() == io::ErrorKind::NotFound)
-                .then_some(())
-                .ok_or(error)
-        })?;
-        Ok(())
-    }
-
-    fn rollback(&self) -> anyhow::Result<()> {
-        for snapshot in self.snapshots.iter().rev() {
-            remove_path_if_exists(&snapshot.target)?;
-            if snapshot.existed {
-                if snapshot.was_dir {
-                    copy_dir_recursive(&snapshot.backup, &snapshot.target)?;
-                } else {
-                    if let Some(parent) = snapshot.target.parent() {
-                        fs::create_dir_all(parent)?;
-                    }
-                    fs::copy(&snapshot.backup, &snapshot.target)?;
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
-impl Drop for InstallTransaction {
-    fn drop(&mut self) {
-        if !self.committed {
-            let _ = self.rollback();
-        }
-    }
 }
 
 fn remove_path_if_exists(path: &Path) -> anyhow::Result<()> {
@@ -2062,7 +1945,42 @@ fn install_adapter_from_source_root_with_package(
     install_root: &Path,
     home: &Path,
 ) -> anyhow::Result<()> {
+    let temp = std::env::temp_dir().join(format!(
+        "ldgr-adapter-source-install-{adapter}-{}",
+        std::process::id()
+    ));
+    remove_path_if_exists(&temp)?;
+    let mut transaction = InstallTransaction::new(temp.join("rollback"))?;
+    apply_source_adapter_update(
+        adapter,
+        package,
+        source_root,
+        install_root,
+        home,
+        None,
+        &mut transaction,
+    )?;
+    transaction.commit()?;
+    remove_path_if_exists(&temp)
+}
+
+pub(crate) fn apply_source_adapter_update(
+    adapter: &str,
+    package: &str,
+    source_root: &Path,
+    install_root: &Path,
+    home: &Path,
+    expected_source_sha256: Option<&str>,
+    transaction: &mut InstallTransaction,
+) -> anyhow::Result<()> {
     let source = resolve_adapter_source_package(package, source_root)?;
+    if let Some(expected) = expected_source_sha256 {
+        let actual = digest_source_bundle(&source.bundle_root)?;
+        anyhow::ensure!(
+            actual == expected,
+            "local source changed after adapter update planning; inspect and plan again"
+        );
+    }
     let namespace = package.strip_prefix("ldgr-").unwrap_or(package);
     let namespace = namespace.strip_suffix("-adapter").unwrap_or(namespace);
     anyhow::ensure!(
@@ -2076,12 +1994,6 @@ fn install_adapter_from_source_root_with_package(
     );
     validate_adapter_bundle_contract(&source.bundle_root, namespace)?;
     let previous_receipt = prepare_source_reinstall(adapter, install_root, home)?;
-    let temp = std::env::temp_dir().join(format!(
-        "ldgr-adapter-source-install-{adapter}-{}",
-        std::process::id()
-    ));
-    remove_path_if_exists(&temp)?;
-    let mut transaction = InstallTransaction::new(temp.join("rollback"))?;
     transaction.snapshot(install_root)?;
     let marker = home.join(".ldgr/installed-adapters").join(adapter);
     transaction.snapshot(&marker)?;
@@ -2157,8 +2069,6 @@ fn install_adapter_from_source_root_with_package(
         &marker,
         &resource_plan,
     )?;
-    transaction.commit()?;
-    remove_path_if_exists(&temp)?;
     Ok(())
 }
 
@@ -4950,6 +4860,40 @@ argv = ["ldgr-example-adapter", "manifest-summary"]
             "fn main() { println!(); }\n",
         )?;
         assert_ne!(digest_source_bundle(source.path())?, original);
+        Ok(())
+    }
+
+    #[test]
+    fn source_update_rejects_content_changed_after_planning_before_mutation() -> anyhow::Result<()>
+    {
+        let source = tempfile::tempdir()?;
+        let home = tempfile::tempdir()?;
+        let install_root = home.path().join("installed-fixture");
+        std::fs::write(
+            source.path().join("Cargo.toml"),
+            "[package]\nname='ldgr-fixture-adapter'\nversion='0.0.0'\n",
+        )?;
+        std::fs::write(
+            source.path().join("adapter.toml"),
+            "[adapter]\nslug='fixture'\n",
+        )?;
+        let mut transaction = InstallTransaction::new(home.path().join("rollback"))?;
+
+        let error = apply_source_adapter_update(
+            "fixture",
+            "ldgr-fixture-adapter",
+            source.path(),
+            &install_root,
+            home.path(),
+            Some("stale-planned-digest"),
+            &mut transaction,
+        )
+        .expect_err("source changed after planning must fail closed");
+
+        assert!(error
+            .to_string()
+            .contains("local source changed after adapter update planning"));
+        assert!(!install_root.exists());
         Ok(())
     }
 
