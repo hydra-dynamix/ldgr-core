@@ -197,6 +197,8 @@ enum Command {
     Web(WebArgs),
     /// Run the prompt-driven autonomous event loop runtime.
     Loop(LoopArgs),
+    /// Check for compatibility-bound Core, agentctl, and adapter updates.
+    Update(UpdateArgs),
     /// Discover installed adapter manifests and command metadata.
     #[command(alias = "adapters")]
     Adapter(AdapterArgs),
@@ -238,6 +240,10 @@ where
             return Ok(());
         }
         Err(error) => {
+            if requests_machine_update_output(&args) {
+                error.print()?;
+                std::process::exit(2);
+            }
             if try_dispatch_adapter_namespace(&args)? {
                 return Ok(());
             }
@@ -248,6 +254,16 @@ where
         }
     };
     handle_cli(cli)
+}
+
+fn requests_machine_update_output(args: &[OsString]) -> bool {
+    first_command_arg_index(args).is_some_and(|index| {
+        args.get(index).and_then(|arg| arg.to_str()) == Some("update")
+            && args
+                .iter()
+                .skip(index + 1)
+                .any(|arg| arg.to_str() == Some("--json"))
+    })
 }
 
 pub fn command() -> clap::Command {
@@ -460,6 +476,7 @@ fn handle_cli(cli: Cli) -> anyhow::Result<()> {
         }
         Command::Web(args) => commands::ops::handle_web(&cli.db, &cli.artifact_root, args),
         Command::Loop(args) => commands::ops::handle_loop_entry(&cli.db, &cli.artifact_root, args),
+        Command::Update(args) => commands::update::handle_update(args),
         Command::Adapter(args) => commands::adapters::handle_adapter(args),
         Command::Telemetry(args) => commands::ops::handle_telemetry(args),
         Command::Next(args) => commands::work::handle_next(&open_store(&cli.db)?, args),

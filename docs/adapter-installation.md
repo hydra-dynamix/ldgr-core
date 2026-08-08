@@ -96,6 +96,21 @@ The `source-target` directory is a generated Cargo cache owned by the
 installation. It may change during normal dispatch and is excluded from drift
 checks; uninstall removes it with the tracked install root.
 
+## Top-level update checks
+
+`ldgr update --check` verifies signed catalog snapshots and reports the Core,
+paired `agentctl`, and every eligible user adapter as one deterministic plan.
+Use `--adapter <slug>` repeatedly for a subset, `--adapters-only` to leave Core
+unchanged, or `--core-only` to leave adapters unchanged. Project adapters,
+`LDGR_ADAPTER_PATH` development overrides, and adapters without valid receipts
+are reported as skipped and are never bulk-mutated.
+
+`--offline` forbids network access and therefore requires local catalog,
+signature, keyring, and artifact references. `--prerelease` opts into
+prerelease targets. `--json` emits the schema-v1 result document on stdout while
+warnings and failures remain on stderr. Check mode does not fetch archive or
+archive-signature payloads and does not invoke adapter installers.
+
 ## Dynamic command surface
 
 Adapters declare namespaces in `adapter.toml`:

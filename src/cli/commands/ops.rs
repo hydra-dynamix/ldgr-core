@@ -55,7 +55,7 @@ const LDGR_CORE_LOOP_PROMPT_FILE: &str = "ldgr-core-loop.md";
 const LDGR_RELEASE_KEYRING: &str = include_str!("../../../release-keyring.json");
 const LDGR_RELEASE_KEYRING_FILE: &str = "release-keyring.json";
 const AGENTCTL_REPO: &str = "https://github.com/hydra-dynamix/agentctl";
-const AGENTCTL_VERSION: &str = "0.1.2";
+pub(crate) const AGENTCTL_VERSION: &str = "0.1.2";
 const AGENTCTL_REQUIREMENT: &str = ">=0.1.2, <0.2.0";
 const LAUNCHER_COMPATIBILITY_SCHEMA: &str = "ldgr.launcher-compatibility.v1";
 const ERROR_RECOVERY_SCHEMA_VERSION: u32 = 1;
@@ -946,6 +946,44 @@ pub(crate) fn inspect_source_installation_for_update(
     let current_source_sha256 = digest_source_bundle(&source.bundle_root)?;
     let source_changed = current_source_sha256 != receipt.source.bundle_sha256;
     Ok((source.bundle_root, current_source_sha256, source_changed))
+}
+
+pub(crate) fn inspect_release_installation_for_update(
+    install_root: &Path,
+    home: &Path,
+    receipt: &crate::release_index::InstallationReceipt,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        digest_bundle(install_root)? == receipt.bundle_sha256,
+        "modified adapter-owned bundle"
+    );
+    let allowed_roots = source_allowed_resource_roots(home)?;
+    for resource in &receipt.owned_resources {
+        let path = absolute_path(Path::new(&resource.path))?;
+        anyhow::ensure!(
+            allowed_roots
+                .iter()
+                .any(|root| path != *root && path.starts_with(root)),
+            "adapter-owned resource is outside configured harness boundaries"
+        );
+        anyhow::ensure!(
+            path.exists() && digest_path(&path)? == resource.sha256,
+            "modified adapter-owned resource"
+        );
+    }
+    if let (Some(path), Some(expected)) = (&receipt.binary_path, &receipt.binary_sha256) {
+        let path = Path::new(path);
+        anyhow::ensure!(
+            path.is_absolute() && path.is_file() && digest_path(path)? == *expected,
+            "modified adapter-owned binary"
+        );
+    } else {
+        anyhow::ensure!(
+            receipt.binary_path.is_none() && receipt.binary_sha256.is_none(),
+            "adapter binary ownership fields must be paired"
+        );
+    }
+    Ok(())
 }
 
 fn source_receipt_drift(

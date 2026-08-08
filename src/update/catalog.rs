@@ -8,9 +8,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
 use crate::release_index::{
-    extract_safe_tar_gz, parse_detached_signature, parse_release_keyring, validate_archive_root,
-    validate_release_keyring, validate_sha256, verify_detached_signature_bytes,
-    verify_file_sha256_for, DetachedSignature, ReleaseChannel, ReleaseKeyring, ReleasePublicKey,
+    extract_safe_tar_gz, parse_detached_signature, parse_release_index, parse_release_keyring,
+    validate_archive_root, validate_release_keyring, validate_sha256,
+    verify_detached_signature_bytes, verify_file_sha256_for, AdapterReleaseIndex,
+    DetachedSignature, ReleaseChannel, ReleaseKeyring, ReleasePublicKey, ADAPTER_RELEASE_INDEX_ENV,
+    ADAPTER_RELEASE_KEYRING_ENV, DEFAULT_ADAPTER_RELEASE_INDEX_URL,
 };
 use crate::update::network::{
     CatalogFetch, UpdateNetworkClient, MAX_UPDATE_KEYRING_BYTES, MAX_UPDATE_SIGNATURE_BYTES,
@@ -103,6 +105,23 @@ pub enum CoreCatalogFetch {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifiedAdapterUpdateCatalog {
+    pub catalog: AdapterReleaseIndex,
+    pub catalog_signing_key_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AdapterCatalogFetch {
+    Modified {
+        verified: VerifiedAdapterUpdateCatalog,
+        etag: Option<String>,
+    },
+    NotModified {
+        etag: Option<String>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResolvedCoreRelease {
     pub version: Version,
     pub release: CoreRelease,
@@ -128,6 +147,14 @@ pub struct CoreReleaseMetadata {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CoreCatalogSources {
+    pub index: String,
+    pub signature: String,
+    pub keyring: Option<String>,
+    pub offline: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdapterCatalogSources {
     pub index: String,
     pub signature: String,
     pub keyring: Option<String>,
@@ -163,6 +190,35 @@ impl CoreCatalogSources {
     }
 }
 
+impl AdapterCatalogSources {
+    pub fn new(
+        index: impl Into<String>,
+        keyring: Option<String>,
+        offline: bool,
+    ) -> anyhow::Result<Self> {
+        let index = index.into();
+        validate_source_location(&index, offline, "adapter update index")?;
+        let signature = format!("{index}.sig");
+        validate_source_location(&signature, offline, "adapter update index signature")?;
+        if let Some(source) = keyring.as_deref() {
+            validate_source_location(source, offline, "adapter release keyring")?;
+        }
+        Ok(Self {
+            index,
+            signature,
+            keyring,
+            offline,
+        })
+    }
+
+    pub fn configured(offline: bool) -> anyhow::Result<Self> {
+        let index = std::env::var(ADAPTER_RELEASE_INDEX_ENV)
+            .unwrap_or_else(|_| DEFAULT_ADAPTER_RELEASE_INDEX_URL.to_owned());
+        let keyring = std::env::var(ADAPTER_RELEASE_KEYRING_ENV).ok();
+        Self::new(index, keyring, offline)
+    }
+}
+
 pub fn embedded_core_release_keyring() -> anyhow::Result<ReleaseKeyring> {
     parse_release_keyring(EMBEDDED_CORE_RELEASE_KEYRING)
         .context("embedded Core release keyring is invalid")
@@ -179,6 +235,35 @@ pub fn canonical_catalog_bytes(catalog: &CoreUpdateCatalog) -> anyhow::Result<Ve
     let value = serde_json::to_value(catalog).context("failed to encode Core update catalog")?;
     let canonical = canonical_json_value(value);
     serde_json::to_vec(&canonical).context("failed to serialize canonical Core update catalog")
+}
+
+pub fn canonical_adapter_catalog_bytes(catalog: &AdapterReleaseIndex) -> anyhow::Result<Vec<u8>> {
+    let value = serde_json::to_value(catalog).context("failed to encode adapter update catalog")?;
+    let canonical = canonical_json_value(value);
+    serde_json::to_vec(&canonical).context("failed to serialize canonical adapter update catalog")
+}
+
+pub fn verify_signed_adapter_update_catalog(
+    catalog_json: &str,
+    signature_json: &str,
+    trusted_keyring: &ReleaseKeyring,
+) -> anyhow::Result<VerifiedAdapterUpdateCatalog> {
+    validate_release_keyring(trusted_keyring)
+        .context("trusted adapter release keyring is invalid")?;
+    let catalog = parse_release_index(catalog_json)?;
+    let signature = parse_detached_signature(signature_json)?;
+    let canonical = canonical_adapter_catalog_bytes(&catalog)?;
+    verify_detached_signature_bytes(
+        &canonical,
+        &signature,
+        trusted_keyring,
+        &signature.key_id,
+        "adapter update catalog",
+    )?;
+    Ok(VerifiedAdapterUpdateCatalog {
+        catalog,
+        catalog_signing_key_id: signature.key_id,
+    })
 }
 
 pub fn verify_signed_core_update_catalog(
@@ -260,6 +345,44 @@ pub fn fetch_signed_core_update_catalog(
         verify_signed_core_update_catalog(&catalog_json, &signature_json, &trusted_keyring)
             .with_context(|| format!("untrusted Core update catalog from {}", sources.index))?;
     Ok(CoreCatalogFetch::Modified { verified, etag })
+}
+
+pub fn fetch_signed_adapter_update_catalog(
+    client: &UpdateNetworkClient,
+    sources: &AdapterCatalogSources,
+    previous_etag: Option<&str>,
+) -> anyhow::Result<AdapterCatalogFetch> {
+    let (catalog_bytes, etag) = match client.fetch_catalog(&sources.index, previous_etag)? {
+        CatalogFetch::Modified { bytes, etag } => (bytes, etag),
+        CatalogFetch::NotModified { etag } => {
+            return Ok(AdapterCatalogFetch::NotModified { etag });
+        }
+    };
+    let signature_bytes = client.fetch_bounded(
+        &sources.signature,
+        MAX_UPDATE_SIGNATURE_BYTES,
+        "adapter update index signature",
+    )?;
+    let catalog_json =
+        String::from_utf8(catalog_bytes).context("adapter update catalog is not UTF-8")?;
+    let signature_json = String::from_utf8(signature_bytes)
+        .context("adapter update catalog signature is not UTF-8")?;
+    let trusted_keyring = match sources.keyring.as_deref() {
+        Some(source) => {
+            let bytes = client.fetch_bounded(
+                source,
+                MAX_UPDATE_KEYRING_BYTES,
+                "adapter release keyring",
+            )?;
+            let text = String::from_utf8(bytes).context("adapter release keyring is not UTF-8")?;
+            parse_release_keyring(&text)?
+        }
+        None => embedded_core_release_keyring()?,
+    };
+    let verified =
+        verify_signed_adapter_update_catalog(&catalog_json, &signature_json, &trusted_keyring)
+            .with_context(|| format!("untrusted adapter update catalog from {}", sources.index))?;
+    Ok(AdapterCatalogFetch::Modified { verified, etag })
 }
 
 pub fn resolve_newer_core_release(
@@ -787,6 +910,18 @@ mod tests {
         .unwrap()
     }
 
+    fn adapter_signature(catalog: &AdapterReleaseIndex, key_id: &str, key: &SigningKey) -> String {
+        serde_json::to_string(&DetachedSignature {
+            algorithm: "Ed25519".to_owned(),
+            key_id: key_id.to_owned(),
+            signature: STANDARD.encode(
+                key.sign(&canonical_adapter_catalog_bytes(catalog).unwrap())
+                    .to_bytes(),
+            ),
+        })
+        .unwrap()
+    }
+
     fn verified_fixture() -> anyhow::Result<VerifiedCoreUpdateCatalog> {
         let catalog = parse_core_update_catalog(CATALOG_FIXTURE)?;
         let anchor = signing_key(42);
@@ -810,6 +945,33 @@ mod tests {
         );
         assert_eq!(release.platforms[0].platform, "linux-x86_64");
         assert_eq!(release.platforms[0].archive_root, "ldgr-core-0.1.15");
+        Ok(())
+    }
+
+    #[test]
+    fn adapter_catalog_snapshot_requires_a_trusted_canonical_signature() -> anyhow::Result<()> {
+        let text = include_str!("../../tests/fixtures/release-index/open-and-commercial.json");
+        let catalog = parse_release_index(text)?;
+        let anchor = signing_key(19);
+        let signature = adapter_signature(&catalog, "adapter-anchor", &anchor);
+        let verified = verify_signed_adapter_update_catalog(
+            text,
+            &signature,
+            &keyring("adapter-anchor", &anchor),
+        )?;
+        assert_eq!(verified.catalog, catalog);
+        assert_eq!(verified.catalog_signing_key_id, "adapter-anchor");
+
+        let mut tampered = catalog;
+        tampered.adapters[0].title.push_str(" tampered");
+        assert!(verify_signed_adapter_update_catalog(
+            &serde_json::to_string(&tampered)?,
+            &signature,
+            &keyring("adapter-anchor", &anchor),
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("did not verify"));
         Ok(())
     }
 

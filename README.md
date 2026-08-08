@@ -60,6 +60,27 @@ migration plan atomically and refuses unknown shapes or incompatible sidecars.
 See `docs/database-upgrade-and-recovery.md` in the LDGR repository for the
 backup and restore procedure.
 
+## Check for updates
+
+The top-level updater can authenticate the configured Core and adapter catalogs
+and resolve one compatibility-bound plan without changing the installation:
+
+```sh
+ldgr update --check
+ldgr update --check --json
+ldgr update --check --core-only
+ldgr update --check --adapters-only
+ldgr update --check --adapter research --adapter conduct
+ldgr update --check --prerelease
+ldgr update --check --offline
+```
+
+`--json` writes exactly one schema-versioned result to stdout; diagnostics stay
+on stderr. Check mode may update the user-level check cache under `~/.ldgr`, but
+never downloads release archives, runs installers, or changes installed files
+or the current project. Applying a plan remains disabled until verified staging
+and plan-wide rollback are available.
+
 ## Numerical sequence telemetry
 
 LDGR can optionally share numerical state-transition sequences for research.

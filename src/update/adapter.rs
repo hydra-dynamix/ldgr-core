@@ -3,14 +3,15 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context};
-use semver::Version;
+use semver::{Version, VersionReq};
 
-use crate::adapter_registry::AdapterRegistry;
+use crate::adapter_registry::{AdapterRegistry, DiscoveredAdapter};
 use crate::harness_config::UpdateChannel;
 use crate::release_index::{
     AdapterPlatformRelease, AdapterRelease, AdapterReleaseProduct, InstallationReceipt,
     ResolvedAdapterRelease, SourceInstallationReceipt,
 };
+use crate::update::plan::AdapterInstallationKind;
 
 #[derive(Debug)]
 pub(crate) struct AdapterInstallationInspection {
@@ -139,6 +140,58 @@ pub(crate) fn inspect_adapter_installation(
         home,
         receipt,
     })
+}
+
+pub(crate) fn snapshot_adapter_installation(
+    installed: &DiscoveredAdapter,
+    home: &Path,
+) -> anyhow::Result<AdapterInstallationKind> {
+    let value = installed
+        .installation_receipt
+        .clone()
+        .context("installed adapter has no tracked installation receipt")?;
+    match parse_installation_receipt(value)? {
+        AdapterInstallationReceipt::Release(receipt) => {
+            anyhow::ensure!(
+                receipt.schema_version == 1,
+                "unsupported release receipt schema"
+            );
+            anyhow::ensure!(
+                receipt.domain == installed.slug,
+                "release receipt domain does not match the discovered adapter"
+            );
+            Version::parse(&receipt.version).context("release receipt version is invalid")?;
+            VersionReq::parse(&receipt.core_compatibility)
+                .context("release receipt Core compatibility is invalid")?;
+            crate::cli::commands::ops::inspect_release_installation_for_update(
+                &installed.root_path,
+                home,
+                &receipt,
+            )?;
+            Ok(AdapterInstallationKind::Release {
+                version: receipt.version,
+                core_compatibility: receipt.core_compatibility,
+            })
+        }
+        AdapterInstallationReceipt::Source { receipt, .. } => {
+            anyhow::ensure!(
+                receipt.domain == installed.slug,
+                "source receipt domain does not match the discovered adapter"
+            );
+            let (_, current_source_sha256, source_changed) =
+                crate::cli::commands::ops::inspect_source_installation_for_update(
+                    &installed.root_path,
+                    home,
+                    &receipt,
+                )?;
+            Ok(AdapterInstallationKind::LocalSource {
+                package: receipt.source.package,
+                installed_source_sha256: receipt.source.bundle_sha256,
+                current_source_sha256,
+                source_changed,
+            })
+        }
+    }
 }
 
 pub(crate) fn plan_adapter_update(

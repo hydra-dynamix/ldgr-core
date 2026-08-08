@@ -1182,6 +1182,219 @@ fn top_level_help_shows_core_loop_and_hides_mature_project_surface() -> anyhow::
 }
 
 #[test]
+fn update_help_and_command_map_expose_the_public_check_surface() -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    let mut help = isolated_command(project.path())?;
+    help.args(["update", "--help"]);
+    help.assert()
+        .success()
+        .stdout(predicate::str::contains("Usage: ldgr update"))
+        .stdout(predicate::str::contains("--check"))
+        .stdout(predicate::str::contains("--json"))
+        .stdout(predicate::str::contains("--yes"))
+        .stdout(predicate::str::contains("--core-only"))
+        .stdout(predicate::str::contains("--adapters-only"))
+        .stdout(predicate::str::contains("--adapter <SLUG>"))
+        .stdout(predicate::str::contains("--prerelease"))
+        .stdout(predicate::str::contains("--offline"));
+
+    let mut conflict = isolated_command(project.path())?;
+    conflict.args([
+        "update",
+        "--check",
+        "--json",
+        "--core-only",
+        "--adapter",
+        "research",
+    ]);
+    conflict
+        .assert()
+        .failure()
+        .stdout(predicate::str::is_empty())
+        .stderr(
+            predicate::str::contains("cannot be used with")
+                .and(predicate::str::contains("--core-only"))
+                .and(predicate::str::contains("--adapter")),
+        );
+
+    let mut apply = isolated_command(project.path())?;
+    apply.args(["update", "--json"]);
+    apply
+        .assert()
+        .failure()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("update.apply-unavailable"));
+    Ok(())
+}
+
+#[test]
+fn update_check_json_resolves_signed_catalogs_without_downloading_or_mutating_installation(
+) -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    let fixture = write_update_check_fixture(project.path())?;
+    let adapter_before = fs::read(fixture.adapter_root.join("adapter.toml"))?;
+    let receipt_before = fs::read(fixture.adapter_root.join("installation-receipt.json"))?;
+
+    let mut stable = isolated_command(project.path())?;
+    stable
+        .env("LDGR_ADAPTER_INDEX", &fixture.index)
+        .env("LDGR_ADAPTER_RELEASE_KEYRING", &fixture.keyring)
+        .args([
+            "update",
+            "--check",
+            "--json",
+            "--offline",
+            "--yes",
+            "--adapter",
+            "fixture",
+            "--adapter",
+            "fixture",
+        ]);
+    let output = stable.output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(result["schema_version"], 1);
+    assert_eq!(result["mode"], "check");
+    assert_eq!(result["status"], "updates_available");
+    assert_eq!(result["channel"], "stable");
+    assert_eq!(result["components"].as_array().unwrap().len(), 1);
+    assert_eq!(result["components"][0]["kind"], "adapter");
+    assert_eq!(result["components"][0]["name"], "fixture");
+    assert_eq!(result["components"][0]["current"], "1.2.3");
+    assert_eq!(result["components"][0]["target"], "1.2.4");
+    assert_eq!(result["components"][0]["action"], "update");
+
+    let mut prerelease = isolated_command(project.path())?;
+    prerelease
+        .env("LDGR_ADAPTER_INDEX", &fixture.index)
+        .env("LDGR_ADAPTER_RELEASE_KEYRING", &fixture.keyring)
+        .args([
+            "update",
+            "--check",
+            "--json",
+            "--adapters-only",
+            "--prerelease",
+            "--offline",
+        ]);
+    let output = prerelease.output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(result["channel"], "prerelease");
+    assert_eq!(result["components"][0]["target"], "1.3.0-beta.1");
+
+    assert_eq!(
+        fs::read(fixture.adapter_root.join("adapter.toml"))?,
+        adapter_before
+    );
+    assert_eq!(
+        fs::read(fixture.adapter_root.join("installation-receipt.json"))?,
+        receipt_before
+    );
+    assert!(!fixture.stable_archive.exists());
+    assert!(!fixture.prerelease_archive.exists());
+    assert!(!project.path().join(".ldgr/ldgr.db").exists());
+    assert!(fixture.home.join(".ldgr/update-state.json").is_file());
+    Ok(())
+}
+
+#[test]
+fn update_check_rejects_an_untrusted_catalog_without_stdout() -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    let fixture = write_update_check_fixture(project.path())?;
+    fs::write(fixture.index.with_extension("json.sig"), "{}")?;
+    let mut command = isolated_command(project.path())?;
+    command
+        .env("LDGR_ADAPTER_INDEX", &fixture.index)
+        .env("LDGR_ADAPTER_RELEASE_KEYRING", &fixture.keyring)
+        .args([
+            "update",
+            "--check",
+            "--json",
+            "--adapters-only",
+            "--offline",
+        ]);
+    command
+        .assert()
+        .failure()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("update.catalog-untrusted"));
+    assert!(!fixture.stable_archive.exists());
+    Ok(())
+}
+
+#[test]
+fn update_check_skips_a_modified_receipt_owned_adapter() -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    let fixture = write_update_check_fixture(project.path())?;
+    fs::OpenOptions::new()
+        .append(true)
+        .open(fixture.adapter_root.join("adapter.toml"))?
+        .write_all(b"\n# local drift\n")?;
+    let modified = fs::read(fixture.adapter_root.join("adapter.toml"))?;
+    let mut command = isolated_command(project.path())?;
+    command.args([
+        "update",
+        "--check",
+        "--json",
+        "--adapters-only",
+        "--offline",
+    ]);
+    let output = command.output()?;
+    assert!(output.status.success());
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(result["status"], "current");
+    assert_eq!(result["components"][0]["action"], "skip_unmanaged");
+    assert!(result["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|warning| warning
+            .as_str()
+            .is_some_and(|text| text.contains("modified"))));
+    assert_eq!(
+        fs::read(fixture.adapter_root.join("adapter.toml"))?,
+        modified
+    );
+    assert!(!fixture.stable_archive.exists());
+    Ok(())
+}
+
+#[test]
+fn update_core_check_authenticates_catalog_but_never_fetches_the_archive() -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    let (index, keyring, archive) = write_core_update_check_fixture(project.path())?;
+    let mut command = isolated_command(project.path())?;
+    command
+        .env("LDGR_CORE_UPDATE_INDEX", &index)
+        .env("LDGR_CORE_RELEASE_KEYRING", &keyring)
+        .args(["update", "--check", "--json", "--core-only", "--offline"]);
+    let output = command.output()?;
+    assert!(!output.status.success());
+    assert!(
+        !output.stdout.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(result["mode"], "check");
+    assert_eq!(result["status"], "blocked");
+    assert_eq!(result["components"][0]["kind"], "core_bundle");
+    assert_eq!(result["components"][0]["target"], "0.1.15");
+    assert!(String::from_utf8(output.stderr)?.contains("update.no-compatible-release"));
+    assert!(!archive.exists());
+    Ok(())
+}
+
+#[test]
 fn focused_subcommand_help_omits_adapter_discovery_blocks() -> anyhow::Result<()> {
     let project = TempDir::new()?;
     let mut command = isolated_command(project.path())?;
@@ -1273,6 +1486,7 @@ fn full_help_is_derived_from_the_complete_clap_command_graph() -> anyhow::Result
         "  adapter update",
         "  adapter uninstall",
         "  adapter reconcile",
+        "  update",
         "  error record",
         "  error list",
         "  error show",
@@ -5902,6 +6116,224 @@ fn isolated_command(project: &Path) -> anyhow::Result<Command> {
         .env("XDG_STATE_HOME", project.join(".ldgr/test-state"))
         .env("HOME", project.join(".ldgr/test-empty-home"));
     Ok(command)
+}
+
+struct UpdateCheckFixture {
+    home: std::path::PathBuf,
+    adapter_root: std::path::PathBuf,
+    index: std::path::PathBuf,
+    keyring: std::path::PathBuf,
+    stable_archive: std::path::PathBuf,
+    prerelease_archive: std::path::PathBuf,
+}
+
+fn write_update_check_fixture(project: &Path) -> anyhow::Result<UpdateCheckFixture> {
+    let home = project.join(".ldgr/test-empty-home");
+    let adapter_root = home.join(".ldgr/adapters/fixture");
+    write_adapter_namespace_fixture(&adapter_root, "fixture", "fixture", "[\"true\"]")?;
+    let installed_bundle_sha256 = digest_update_fixture_bundle(&adapter_root)?;
+    let platform = format!(
+        "{}-{}",
+        std::env::consts::OS,
+        match std::env::consts::ARCH {
+            "aarch64" => "aarch64",
+            "x86_64" => "x86_64",
+            other => other,
+        }
+    );
+    fs::write(
+        adapter_root.join("installation-receipt.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "domain": "fixture",
+            "version": "1.2.3",
+            "source_url": "file://installed-fixture.tar.gz",
+            "sha256": "00".repeat(32),
+            "signing_key_id": "fixture-update-key",
+            "core_compatibility": ">=0.1.0, <0.2.0",
+            "platform": platform,
+            "resource_manifest": "adapter-resources.json",
+            "installed_at_unix_seconds": 1,
+            "bundle_sha256": installed_bundle_sha256,
+            "binary_path": null,
+            "binary_sha256": null,
+            "owned_resources": []
+        }))?,
+    )?;
+    let stable_archive = project.join("must-not-download-stable.tar.gz");
+    let prerelease_archive = project.join("must-not-download-prerelease.tar.gz");
+    let release = |version: &str, channel: &str, archive: &Path| {
+        serde_json::json!({
+            "version": version,
+            "channel": channel,
+            "core_compatibility": ">=0.1.0, <0.2.0",
+            "platforms": [{
+                "platform": platform,
+                "asset_url": format!("file://{}", archive.display()),
+                "archive_root": format!("fixture-{version}"),
+                "binary": "ldgr-fixture",
+                "sha256": "22".repeat(32),
+                "signature_url": format!("file://{}.sig", archive.display()),
+                "signing_key_id": "fixture-update-key",
+                "resource_manifest": "adapter-resources.json"
+            }]
+        })
+    };
+    let index_value = serde_json::json!({
+        "schema_version": 1,
+        "adapters": [{
+            "domain": "fixture",
+            "primary_namespace": "fixture",
+            "title": "Fixture adapter",
+            "classification": "open_source",
+            "releases": [
+                release("1.2.4", "stable", &stable_archive),
+                release("1.3.0-beta.1", "prerelease", &prerelease_archive)
+            ]
+        }]
+    });
+    let index = project.join("update-index.json");
+    let index_text = serde_json::to_string_pretty(&index_value)?;
+    fs::write(&index, &index_text)?;
+    let catalog = ldgr_core::release_index::parse_release_index(&index_text)?;
+    let signing_key = SigningKey::from_bytes(&[73; 32]);
+    fs::write(
+        format!("{}.sig", index.display()),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "algorithm": "Ed25519",
+            "key_id": "fixture-update-key",
+            "signature": STANDARD.encode(
+                signing_key
+                    .sign(&ldgr_core::update::catalog::canonical_adapter_catalog_bytes(&catalog)?)
+                    .to_bytes()
+            )
+        }))?,
+    )?;
+    let keyring = project.join("update-keyring.json");
+    fs::write(
+        &keyring,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "keys": [{
+                "key_id": "fixture-update-key",
+                "public_key": STANDARD.encode(signing_key.verifying_key().to_bytes())
+            }]
+        }))?,
+    )?;
+    Ok(UpdateCheckFixture {
+        home,
+        adapter_root,
+        index,
+        keyring,
+        stable_archive,
+        prerelease_archive,
+    })
+}
+
+fn digest_update_fixture_bundle(root: &Path) -> anyhow::Result<String> {
+    fn collect(
+        root: &Path,
+        current: &Path,
+        files: &mut Vec<(String, Vec<u8>)>,
+    ) -> anyhow::Result<()> {
+        for entry in fs::read_dir(current)? {
+            let path = entry?.path();
+            if path.is_dir() {
+                collect(root, &path, files)?;
+            } else if path.is_file() {
+                files.push((
+                    path.strip_prefix(root)?
+                        .to_string_lossy()
+                        .replace('\\', "/"),
+                    fs::read(path)?,
+                ));
+            }
+        }
+        Ok(())
+    }
+    let mut files = Vec::new();
+    collect(root, root, &mut files)?;
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut hasher = Sha256::new();
+    for (relative, bytes) in files {
+        hasher.update(relative.as_bytes());
+        hasher.update([0]);
+        hasher.update(bytes);
+        hasher.update([0]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn write_core_update_check_fixture(
+    project: &Path,
+) -> anyhow::Result<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)> {
+    fs::create_dir_all(project.join(".ldgr/test-empty-home"))?;
+    let platform = format!(
+        "{}-{}",
+        std::env::consts::OS,
+        match std::env::consts::ARCH {
+            "aarch64" => "aarch64",
+            "x86_64" => "x86_64",
+            other => other,
+        }
+    );
+    let archive = project.join("must-not-download-core.tar.gz");
+    let catalog_value = serde_json::json!({
+        "schema_version": 1,
+        "release_keys": [],
+        "releases": [{
+            "version": "0.1.15",
+            "channel": "stable",
+            "minimum_updater_version": "0.1.14",
+            "core_commit": "1111111111111111111111111111111111111111",
+            "source_repository": "hydra-dynamix/ldgr-core",
+            "agentctl": {
+                "version": "0.1.3",
+                "repository": "hydra-dynamix/agentctl",
+                "commit": "2222222222222222222222222222222222222222"
+            },
+            "compatibility": {
+                "launcher_compatibility_schema": "ldgr.launcher-compatibility.v1",
+                "error_recovery_schema": 1,
+                "release_metadata_schema": 1
+            },
+            "platforms": [{
+                "platform": platform,
+                "archive_url": format!("file://{}", archive.display()),
+                "archive_root": "ldgr-core-0.1.15",
+                "sha256": "33".repeat(32),
+                "signature_url": format!("file://{}.sig", archive.display()),
+                "signing_key_id": "fixture-core-key"
+            }]
+        }]
+    });
+    let catalog_text = serde_json::to_string_pretty(&catalog_value)?;
+    let catalog = ldgr_core::update::catalog::parse_core_update_catalog(&catalog_text)?;
+    let signing_key = SigningKey::from_bytes(&[91; 32]);
+    let index = project.join("core-update-index.json");
+    fs::write(&index, &catalog_text)?;
+    fs::write(
+        format!("{}.sig", index.display()),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "algorithm": "Ed25519",
+            "key_id": "fixture-core-key",
+            "signature": STANDARD.encode(
+                signing_key
+                    .sign(&ldgr_core::update::catalog::canonical_catalog_bytes(&catalog)?)
+                    .to_bytes()
+            )
+        }))?,
+    )?;
+    let keyring = project.join("core-update-keyring.json");
+    fs::write(
+        &keyring,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "keys": [{
+                "key_id": "fixture-core-key",
+                "public_key": STANDARD.encode(signing_key.verifying_key().to_bytes())
+            }]
+        }))?,
+    )?;
+    Ok((index, keyring, archive))
 }
 
 fn write_startup_recovery_fixture(
