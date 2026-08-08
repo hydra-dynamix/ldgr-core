@@ -86,7 +86,8 @@ pub struct CorePlatformArchive {
     pub signing_key_id: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct VerifiedCoreUpdateCatalog {
     pub catalog: CoreUpdateCatalog,
     pub catalog_signing_key_id: String,
@@ -104,7 +105,8 @@ pub enum CoreCatalogFetch {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct VerifiedAdapterUpdateCatalog {
     pub catalog: AdapterReleaseIndex,
     pub catalog_signing_key_id: String,

@@ -61,20 +61,23 @@ pub struct VerifiedStagingCatalogs<'a> {
     pub adapters: &'a VerifiedAdapterUpdateCatalog,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "receipt", rename_all = "snake_case")]
 pub enum AdapterOwnershipReceipt {
     Release(InstallationReceipt),
     LocalSource(SourceInstallationReceipt),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AdapterStagingOwnership {
     pub install_root: PathBuf,
     pub user_adapter_root: PathBuf,
     pub receipt: AdapterOwnershipReceipt,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PlanStagingOwnership {
     pub home: PathBuf,
     pub core: Option<CoreInstallationReceipt>,
@@ -165,9 +168,9 @@ pub(crate) fn apply_staged_update_plan(
     transaction: &mut InstallTransaction,
     quiet: bool,
 ) -> Result<Vec<ComponentResult>, UpdateApplyError> {
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     let core_selected = selected_core_component(plan).is_some();
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     if core_selected {
         return Err(rollback_apply_failure(
             transaction,
@@ -177,9 +180,6 @@ pub(crate) fn apply_staged_update_plan(
             failed_plan_components(plan),
         ));
     }
-    #[cfg(unix)]
-    let probe = ProcessCompatibilityProbe;
-    #[cfg(not(unix))]
     let probe = ProcessCompatibilityProbe;
     apply_staged_update_plan_with_services(
         plan,
@@ -1597,6 +1597,43 @@ impl InstallTransaction {
         })
     }
 
+    /// Reopens a Windows finalizer transaction and reports whether activation
+    /// had already begun. Ready journals continue application; applying or
+    /// rolling-back journals may only be restored.
+    pub(crate) fn resume_for_finalizer(
+        backup_root: PathBuf,
+        plan_id: &str,
+        targets: &[OwnedTarget],
+    ) -> anyhow::Result<(Self, bool)> {
+        validate_plan_id(plan_id)?;
+        validate_target_manifest(targets)?;
+        let journal = read_journal(&backup_root.join(JOURNAL_FILE))?;
+        ensure!(
+            journal.plan_id.as_deref() == Some(plan_id),
+            "transaction journal belongs to another update plan"
+        );
+        ensure_manifest_matches(&journal.snapshots, targets)?;
+        ensure!(
+            journal.snapshots.len() == targets.len(),
+            "transaction journal is missing resolved update targets"
+        );
+        match journal.phase {
+            JournalPhase::Ready => Ok((
+                Self {
+                    journal_path: backup_root.join(JOURNAL_FILE),
+                    backup_root,
+                    journal,
+                    committed: false,
+                },
+                false,
+            )),
+            JournalPhase::Applying | JournalPhase::RollingBack | JournalPhase::RolledBack => {
+                Ok((Self::resume_for_rollback(backup_root)?, true))
+            }
+            phase => bail!("transaction journal cannot be finalized from {phase:?}"),
+        }
+    }
+
     pub fn snapshot(&mut self, target: &Path) -> anyhow::Result<()> {
         let absolute = absolute_lexical(target)?;
         let boundary = absolute
@@ -1775,6 +1812,19 @@ impl InstallTransaction {
         self.persist()?;
         self.committed = true;
         remove_dir_if_exists(&self.backup_root)
+    }
+
+    /// Leaves a sealed, unmodified transaction journal for a detached
+    /// finalizer. Consuming self prevents Drop from interpreting the
+    /// intentional process handoff as an activation failure.
+    pub(crate) fn preserve_for_finalizer(mut self) -> anyhow::Result<()> {
+        ensure!(
+            self.journal.phase == JournalPhase::Ready,
+            "only a sealed, unmodified transaction can be handed to a finalizer"
+        );
+        self.persist()?;
+        self.committed = true;
+        Ok(())
     }
 
     fn snapshot_index(&self, target: &Path) -> anyhow::Result<usize> {
@@ -2262,7 +2312,7 @@ mod tests {
         CoreInstallationSnapshot, CorePlanOwnership, UpdateInventory, UpdatePlanRequest,
         VerifiedCatalogSnapshots,
     };
-    use crate::update::state::{TerminalError, TerminalOutcome, UpdateMode};
+    use crate::update::state::{RecoveryAction, TerminalError, TerminalOutcome, UpdateMode};
 
     fn target(root: &Path, component: &str, role: &str, name: &str) -> OwnedTarget {
         OwnedTarget::new(component, role, root, root.join(name))
@@ -2608,6 +2658,26 @@ mod tests {
         assert_eq!(history[0].outcome, TerminalOutcome::Applied);
         assert_eq!(history[0].components[0].status, "applied");
         lock.release()?;
+        Ok(())
+    }
+
+    #[test]
+    fn resolved_plan_recovery_validates_its_embedded_digest() -> anyhow::Result<()> {
+        let fixture = core_fixture()?;
+        let (store, lock, staged) = stage_core_fixture(&fixture)?;
+        store.mark_applying(&lock, fixture.plan.plan_id())?;
+        staged.transaction.preserve_for_finalizer()?;
+        lock.release()?;
+        let recovery = store.acquire_lock(
+            UpdateMode::Recover,
+            None,
+            std::time::Duration::from_secs(60),
+        )?;
+        let records = store.recover_interrupted(&recovery)?;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].plan_id, fixture.plan.plan_id());
+        assert_eq!(records[0].action, RecoveryAction::RollbackRequired);
+        recovery.release()?;
         Ok(())
     }
 

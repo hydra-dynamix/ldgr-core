@@ -131,6 +131,16 @@ enum Command {
         #[arg(long, hide = true)]
         token: String,
     },
+    #[cfg(windows)]
+    #[command(name = "__update-finalizer", hide = true)]
+    UpdateFinalizer {
+        #[arg(long, hide = true)]
+        parent_pid: u32,
+        #[arg(long, hide = true)]
+        plan: PathBuf,
+        #[arg(long, hide = true)]
+        token: String,
+    },
     #[command(name = "__record-core-installation", hide = true)]
     RecordCoreInstallation {
         #[arg(long)]
@@ -261,6 +271,16 @@ where
             std::process::exit(2);
         }
     };
+    #[cfg(windows)]
+    if !matches!(cli.command, Some(Command::UpdateFinalizer { .. })) {
+        match crate::update::finalizer::recover_and_report_pending() {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(error) => {
+                eprintln!("warning: update startup recovery could not complete: {error:#}");
+            }
+        }
+    }
     if should_run_startup_update_hook(&cli, &args) {
         crate::update::startup::maybe_schedule_update_check();
     }
@@ -276,6 +296,10 @@ fn should_run_startup_update_hook(cli: &Cli, args: &[OsString]) -> bool {
             )
         })
     {
+        return false;
+    }
+    #[cfg(windows)]
+    if matches!(cli.command, Some(Command::UpdateFinalizer { .. })) {
         return false;
     }
     !matches!(
@@ -440,6 +464,12 @@ fn handle_cli(cli: Cli) -> anyhow::Result<()> {
         Command::UpdateCheckWorker { token } => {
             commands::update::handle_startup_check_worker(&token)
         }
+        #[cfg(windows)]
+        Command::UpdateFinalizer {
+            parent_pid,
+            plan,
+            token,
+        } => crate::update::finalizer::handle_finalizer(parent_pid, &plan, &token),
         Command::RecordCoreInstallation {
             home,
             agentctl_binary,

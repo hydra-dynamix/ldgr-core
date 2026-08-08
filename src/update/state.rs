@@ -21,6 +21,7 @@ const CACHE: &str = "update-state.json";
 const LOCK: &str = "update.lock";
 const PLAN: &str = "plan.json";
 const STATE: &str = "state.json";
+const PENDING_REPORT: &str = "pending-report.json";
 
 #[derive(Clone, Debug)]
 pub struct UpdateStateStore {
@@ -136,6 +137,8 @@ pub struct StagingState {
     pub created_at_unix_ms: u64,
     pub updated_at_unix_ms: u64,
     pub internal_token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finalizer_payload_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub components: Vec<ComponentResult>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -153,6 +156,16 @@ pub struct TerminalHistory {
     pub outcome: TerminalOutcome,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub components: Vec<ComponentResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<TerminalError>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PendingUpdateReport {
+    pub schema_version: u32,
+    pub plan_id: String,
+    pub outcome: TerminalOutcome,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<TerminalError>,
 }
@@ -260,6 +273,42 @@ impl UpdateLock {
         );
         self.record.pid = pid;
         self.record.process_start_identity = process_start(pid);
+        atomic_json(&self.path, &self.record)?;
+        self.released = true;
+        Ok(())
+    }
+
+    /// Transfers a foreground apply lock to the detached Windows finalizer.
+    /// The per-plan token becomes the lock token so the child must prove both
+    /// possession of durable plan state and ownership of the handed-off PID.
+    pub(crate) fn handoff_to_finalizer(
+        mut self,
+        pid: u32,
+        plan_id: &str,
+        internal_token: &str,
+    ) -> anyhow::Result<()> {
+        ensure!(pid > 0, "update finalizer PID must be positive");
+        validate_id(plan_id)?;
+        ensure!(
+            internal_token.len() == 64 && lower_hex(internal_token),
+            "invalid internal update finalizer token"
+        );
+        ensure!(
+            matches!(self.record.mode, UpdateMode::Apply | UpdateMode::Recover)
+                && self.record.plan_id.is_none(),
+            "only an unbound foreground apply or recovery lock can be handed to a finalizer"
+        );
+        let current: UpdateLockRecord = read_json(&self.path, "update lock")?;
+        validate_lock(&current)?;
+        ensure!(
+            current.owner_token == self.record.owner_token && current.pid == std::process::id(),
+            "update lock ownership changed before finalizer handoff"
+        );
+        self.record.pid = pid;
+        self.record.process_start_identity = process_start(pid);
+        self.record.mode = UpdateMode::Finalize;
+        self.record.plan_id = Some(plan_id.to_owned());
+        self.record.owner_token = internal_token.to_owned();
         atomic_json(&self.path, &self.record)?;
         self.released = true;
         Ok(())
@@ -385,6 +434,51 @@ impl UpdateStateStore {
         })
     }
 
+    pub(crate) fn claim_handed_off_finalizer_lock(
+        &self,
+        owner_token: &str,
+        plan_id: &str,
+    ) -> anyhow::Result<UpdateLock> {
+        self.verify_paths()?;
+        validate_id(plan_id)?;
+        ensure!(
+            owner_token.len() == 64 && lower_hex(owner_token),
+            "invalid internal update finalizer token"
+        );
+        let path = self.updates.join(LOCK);
+        let record: UpdateLockRecord = read_json(&path, "update lock")?;
+        validate_lock(&record)?;
+        ensure!(
+            record.mode == UpdateMode::Finalize && record.plan_id.as_deref() == Some(plan_id),
+            "internal update finalizer requires the matching plan lock"
+        );
+        ensure!(
+            record.owner_token == owner_token,
+            "internal update finalizer token does not own the update lock"
+        );
+        ensure!(
+            record.pid == std::process::id(),
+            "update lock was not handed to this finalizer process"
+        );
+        ensure!(
+            now_ms()? < record.lease_expires_at_unix_ms,
+            "internal update finalizer lock lease expired"
+        );
+        let actual_start = process_start(std::process::id());
+        ensure!(
+            !matches!(
+                (&record.process_start_identity, &actual_start),
+                (Some(expected), Some(actual)) if expected != actual
+            ),
+            "internal update finalizer process identity changed"
+        );
+        Ok(UpdateLock {
+            path,
+            record,
+            released: false,
+        })
+    }
+
     fn acquire_lock_at(
         &self,
         mode: UpdateMode,
@@ -490,6 +584,7 @@ impl UpdateStateStore {
                     created_at_unix_ms: now,
                     updated_at_unix_ms: now,
                     internal_token: token()?,
+                    finalizer_payload_sha256: None,
                     components: Vec::new(),
                     error: None,
                 },
@@ -553,6 +648,7 @@ impl UpdateStateStore {
                     created_at_unix_ms: now,
                     updated_at_unix_ms: now,
                     internal_token: token()?,
+                    finalizer_payload_sha256: None,
                     components: Vec::new(),
                     error: None,
                 },
@@ -618,6 +714,27 @@ impl UpdateStateStore {
         atomic_json(&self.stage_dir(plan_id)?.join(STATE), &state)
     }
 
+    pub(crate) fn bind_finalizer_payload(
+        &self,
+        lock: &UpdateLock,
+        plan_id: &str,
+        sha256: &str,
+    ) -> anyhow::Result<()> {
+        self.verify_plan_lock(lock, plan_id)?;
+        ensure!(
+            sha256.len() == 64 && lower_hex(sha256),
+            "invalid Windows finalizer payload digest"
+        );
+        let mut state = self.load_staging_state(plan_id)?;
+        ensure!(
+            state.phase == StagingPhase::Staged,
+            "finalizer payload can only be bound to staged plans"
+        );
+        state.finalizer_payload_sha256 = Some(sha256.to_owned());
+        state.updated_at_unix_ms = now_ms()?;
+        atomic_json(&self.stage_dir(plan_id)?.join(STATE), &state)
+    }
+
     pub fn complete_plan(
         &self,
         lock: &UpdateLock,
@@ -641,6 +758,65 @@ impl UpdateStateStore {
         self.persist_history(&history)?;
         self.remove_stage(plan_id)?;
         Ok(history)
+    }
+
+    /// Writes terminal state and immutable history while retaining staging.
+    /// A Windows finalizer runs from the staging tree, so cleanup must wait
+    /// until a later process can remove the exited executable.
+    pub(crate) fn complete_plan_deferred_cleanup(
+        &self,
+        lock: &UpdateLock,
+        plan_id: &str,
+        outcome: TerminalOutcome,
+        components: Vec<ComponentResult>,
+        error: Option<TerminalError>,
+    ) -> anyhow::Result<TerminalHistory> {
+        self.verify_plan_lock(lock, plan_id)?;
+        let mut state = self.load_staging_state(plan_id)?;
+        ensure!(
+            matches!(state.phase, StagingPhase::Staged | StagingPhase::Applying),
+            "staged plan is already terminal"
+        );
+        state.phase = outcome.phase();
+        state.updated_at_unix_ms = now_ms()?;
+        state.components = components;
+        state.error = error;
+        atomic_json(&self.stage_dir(plan_id)?.join(STATE), &state)?;
+        let history = history_from(&state)?;
+        self.persist_history(&history)?;
+        Ok(history)
+    }
+
+    pub(crate) fn write_pending_report(&self, history: &TerminalHistory) -> anyhow::Result<()> {
+        validate_history(history, &history.plan_id)?;
+        atomic_json(
+            &self.updates.join(PENDING_REPORT),
+            &PendingUpdateReport {
+                schema_version: SCHEMA_VERSION,
+                plan_id: history.plan_id.clone(),
+                outcome: history.outcome,
+                error: history.error.clone(),
+            },
+        )
+    }
+
+    pub(crate) fn take_pending_report(&self) -> anyhow::Result<Option<PendingUpdateReport>> {
+        let path = self.updates.join(PENDING_REPORT);
+        let report: PendingUpdateReport = match read_json(&path, "pending update report") {
+            Ok(report) => report,
+            Err(error) if not_found(&error) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        schema(report.schema_version, "pending update report")?;
+        validate_id(&report.plan_id)?;
+        reject_link(&path)?;
+        fs::remove_file(&path)?;
+        sync_parent(&path)?;
+        Ok(Some(report))
+    }
+
+    pub(crate) fn plan_path(&self, plan_id: &str) -> anyhow::Result<PathBuf> {
+        Ok(self.stage_dir(plan_id)?.join(PLAN))
     }
 
     pub fn read_history(&self) -> anyhow::Result<Vec<TerminalHistory>> {
@@ -702,7 +878,7 @@ impl UpdateStateStore {
                 });
                 continue;
             }
-            let _: PlanEnvelope<Value> = self.load_staged_plan(&plan_id)?;
+            validate_staged_plan_file(&directory, &plan_id)?;
             let state = self.load_staging_state(&plan_id)?;
             let action = match state.phase {
                 StagingPhase::Staged => RecoveryAction::ResumeStaging,
@@ -861,6 +1037,31 @@ fn validate_envelope(envelope: &PlanEnvelope<Value>) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn validate_staged_plan_file(directory: &Path, plan_id: &str) -> anyhow::Result<()> {
+    let envelope: PlanEnvelope<Value> = read_json(&directory.join(PLAN), "staged update plan")?;
+    schema(envelope.schema_version, "staged update plan")?;
+    ensure!(
+        envelope.plan_id == plan_id,
+        "staged plan id does not match its directory"
+    );
+    if envelope.plan.get("plan_id").is_some() {
+        let plan: UpdatePlan = serde_json::from_value(envelope.plan)
+            .context("staged resolved update plan is invalid")?;
+        ensure!(
+            plan.plan_id() == plan_id,
+            "staged resolved plan id does not match its directory"
+        );
+        plan.verify_plan_id()?;
+    } else {
+        validate_envelope(&PlanEnvelope {
+            schema_version: envelope.schema_version,
+            plan_id: envelope.plan_id,
+            plan: envelope.plan,
+        })?;
+    }
+    Ok(())
+}
+
 fn validate_state(state: &StagingState, plan_id: &str) -> anyhow::Result<()> {
     schema(state.schema_version, "staged state")?;
     ensure!(state.plan_id == plan_id, "staged state plan id mismatch");
@@ -872,6 +1073,12 @@ fn validate_state(state: &StagingState, plan_id: &str) -> anyhow::Result<()> {
         state.internal_token.len() == 64 && lower_hex(&state.internal_token),
         "invalid internal token"
     );
+    if let Some(digest) = &state.finalizer_payload_sha256 {
+        ensure!(
+            digest.len() == 64 && lower_hex(digest),
+            "invalid Windows finalizer payload digest"
+        );
+    }
     ensure!(
         state.phase.terminal() || (state.components.is_empty() && state.error.is_none()),
         "non-terminal state has terminal fields"
@@ -1603,6 +1810,36 @@ mod tests {
     }
 
     #[test]
+    fn deferred_terminal_report_is_durable_and_one_shot() -> anyhow::Result<()> {
+        let (_directory, store) = fixture()?;
+        let plan = plan(22);
+        let lock = store.acquire_lock(UpdateMode::Apply, None, Duration::from_secs(60))?;
+        let id = store.stage_plan(&lock, &plan)?;
+        store.mark_applying(&lock, &id)?;
+        let history = store.complete_plan_deferred_cleanup(
+            &lock,
+            &id,
+            TerminalOutcome::RolledBack,
+            vec![ComponentResult {
+                kind: "core_bundle".to_owned(),
+                name: "core".to_owned(),
+                status: "rolled_back".to_owned(),
+            }],
+            Some(TerminalError {
+                code: "update.activation-failed".to_owned(),
+                summary: "injected failure".to_owned(),
+            }),
+        )?;
+        store.write_pending_report(&history)?;
+        let report = store.take_pending_report()?.expect("pending report");
+        assert_eq!(report.plan_id, id);
+        assert_eq!(report.outcome, TerminalOutcome::RolledBack);
+        assert!(store.take_pending_report()?.is_none());
+        lock.release()?;
+        Ok(())
+    }
+
+    #[test]
     fn recovery_discards_incomplete_staging_and_orphaned_claim_files() -> anyhow::Result<()> {
         let (_directory, store) = fixture()?;
         let id = deterministic_plan_id(&plan(99))?;
@@ -1702,6 +1939,26 @@ mod tests {
         assert_eq!(worker.record().pid, std::process::id());
         worker.release()?;
         assert!(store.claim_handed_off_check_lock(&token).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn finalizer_handoff_binds_plan_pid_and_durable_token() -> anyhow::Result<()> {
+        let (_directory, store) = fixture()?;
+        let plan = plan(44);
+        let lock = store.acquire_lock(UpdateMode::Apply, None, Duration::from_secs(60))?;
+        let id = store.stage_plan(&lock, &plan)?;
+        let token = store.load_staging_state(&id)?.internal_token;
+        store.bind_finalizer_payload(&lock, &id, &"b".repeat(64))?;
+        assert!(store.claim_handed_off_finalizer_lock(&token, &id).is_err());
+        lock.handoff_to_finalizer(std::process::id(), &id, &token)?;
+        assert!(store
+            .claim_handed_off_finalizer_lock(&"f".repeat(64), &id)
+            .is_err());
+        let finalizer = store.claim_handed_off_finalizer_lock(&token, &id)?;
+        assert_eq!(finalizer.record().mode, UpdateMode::Finalize);
+        assert_eq!(finalizer.record().plan_id.as_deref(), Some(id.as_str()));
+        finalizer.release()?;
         Ok(())
     }
 

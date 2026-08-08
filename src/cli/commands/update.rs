@@ -101,7 +101,7 @@ fn handle_apply(args: UpdateArgs) -> anyhow::Result<()> {
         lock.release()?;
         bail!("update.no-compatible-release: the resolved update plan is blocked");
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     if resolved.plan.components().iter().any(|component| {
         component.kind() == UpdateComponentKind::CoreBundle
             && component.action() == UpdateAction::Update
@@ -153,6 +153,34 @@ fn handle_apply(args: UpdateArgs) -> anyhow::Result<()> {
             return Err(anyhow::anyhow!("update.staging-failed: {error:#}"));
         }
     };
+    #[cfg(windows)]
+    if resolved.plan.components().iter().any(|component| {
+        component.kind() == UpdateComponentKind::CoreBundle
+            && component.action() == UpdateAction::Update
+    }) {
+        let (executable, token) = crate::update::finalizer::prepare_foreground_finalizer(
+            &state,
+            &lock,
+            &resolved.plan,
+            staged,
+            &resolved.ownership,
+            &resolved.adapter_catalog,
+        )?;
+        crate::update::finalizer::launch_foreground_finalizer(
+            &state,
+            lock,
+            resolved.plan.plan_id(),
+            &executable,
+            &token,
+        )?;
+        let result = apply_result(
+            &resolved.plan,
+            UpdateResultStatus::StagedPendingRestart,
+            &[],
+        );
+        render_result(&result, args.json)?;
+        return Ok(());
+    }
     state.mark_applying(&lock, resolved.plan.plan_id())?;
     let StagedUpdatePlan {
         manifest,
