@@ -841,6 +841,37 @@ fn atomic_replace(source: &Path, destination: &Path) -> anyhow::Result<()> {
         .context("failed to atomically replace Core installation receipt")
 }
 
+#[cfg(windows)]
+fn atomic_replace(source: &Path, destination: &Path) -> anyhow::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+    let source = source
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let destination = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let ok = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    ensure!(
+        ok != 0,
+        "failed to atomically replace Core installation receipt: {}",
+        std::io::Error::last_os_error()
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1064,7 +1095,7 @@ mod tests {
         ] {
             let version = script.rfind("--version").expect("version validation");
             let compatibility = script
-                .rfind("compatibility --agentctl-version")
+                .rfind("--agentctl-version")
                 .expect("compatibility validation");
             let record = script
                 .rfind("__record-core-installation")
@@ -1155,35 +1186,4 @@ mod tests {
         assert!(resolve_core_installation_ownership(&context, &FixedProbe(evidence())).is_err());
         Ok(())
     }
-}
-
-#[cfg(windows)]
-fn atomic_replace(source: &Path, destination: &Path) -> anyhow::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::{
-        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
-    };
-    let source = source
-        .as_os_str()
-        .encode_wide()
-        .chain(Some(0))
-        .collect::<Vec<_>>();
-    let destination = destination
-        .as_os_str()
-        .encode_wide()
-        .chain(Some(0))
-        .collect::<Vec<_>>();
-    let ok = unsafe {
-        MoveFileExW(
-            source.as_ptr(),
-            destination.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    };
-    ensure!(
-        ok != 0,
-        "failed to atomically replace Core installation receipt: {}",
-        std::io::Error::last_os_error()
-    );
-    Ok(())
 }

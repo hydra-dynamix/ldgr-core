@@ -2533,8 +2533,15 @@ fn context_exits_cleanly_when_stdout_pipe_is_closed() -> anyhow::Result<()> {
 
     run(project.path(), &db_path, &artifact_root, ["init"])?;
 
+    let isolated_home = project.path().join(".ldgr/test-empty-home");
+    fs::create_dir_all(&isolated_home)?;
     let mut child = StdCommand::new(assert_cmd::cargo::cargo_bin("ldgr"))
         .current_dir(project.path())
+        .env(
+            "LDGR_HOME",
+            project.path().join(".ldgr/test-empty-ldgr-home"),
+        )
+        .env("HOME", &isolated_home)
         .arg("--db")
         .arg(&db_path)
         .arg("--artifact-root")
