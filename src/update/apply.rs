@@ -2,10 +2,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{ErrorKind, Write};
 use std::path::{Component, Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, ensure, Context};
 use semver::Version;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::release_index::{
     parse_detached_signature, verify_detached_signature_bytes, verify_file_sha256_for,
@@ -17,11 +19,12 @@ use super::catalog::{
     VerifiedAdapterUpdateCatalog, VerifiedCoreUpdateCatalog,
 };
 use super::installation::{
-    core_installation_receipt_path, validate_receipt, CoreInstallationReceipt,
+    core_installation_receipt_path, validate_receipt, CompatibilityProbe, CoreArchiveProvenance,
+    CoreInstallationReceipt, CoreInstallerKind, ProcessCompatibilityProbe,
 };
 use super::network::{UpdateNetworkClient, MAX_UPDATE_ARTIFACT_BYTES, MAX_UPDATE_SIGNATURE_BYTES};
 use super::plan::{AdapterReleaseArtifact, UpdateAction, UpdatePlan, UpdatePlanComponent};
-use super::state::{atomic_json, UpdateLock, UpdateStateStore};
+use super::state::{atomic_json, ComponentResult, UpdateLock, UpdateStateStore};
 
 const JOURNAL_SCHEMA_VERSION: u32 = 1;
 const JOURNAL_FILE: &str = "journal.json";
@@ -115,6 +118,503 @@ pub struct StagingManifest {
 pub struct StagedUpdatePlan {
     pub manifest: StagingManifest,
     pub transaction: InstallTransaction,
+}
+
+#[derive(Debug)]
+pub(crate) struct UpdateApplyError {
+    pub(crate) source: anyhow::Error,
+    pub(crate) components: Vec<ComponentResult>,
+}
+
+impl std::fmt::Display for UpdateApplyError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{:#}", self.source)
+    }
+}
+
+impl std::error::Error for UpdateApplyError {}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ActivationStep {
+    DestinationStaged,
+    AgentctlBackup,
+    CoreBackup,
+    AgentctlActivated,
+    CoreActivated,
+    PairValidated,
+    ReceiptActivated,
+    AdaptersActivated,
+    AdapterDiscoveryValidated,
+}
+
+trait ActivationHook {
+    fn after(&self, _step: ActivationStep) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+struct NoopActivationHook;
+
+impl ActivationHook for NoopActivationHook {}
+
+pub(crate) fn apply_staged_update_plan(
+    plan: &UpdatePlan,
+    manifest: &StagingManifest,
+    adapter_catalog: &VerifiedAdapterUpdateCatalog,
+    ownership: &PlanStagingOwnership,
+    transaction: &mut InstallTransaction,
+    quiet: bool,
+) -> Result<Vec<ComponentResult>, UpdateApplyError> {
+    #[cfg(not(unix))]
+    let core_selected = selected_core_component(plan).is_some();
+    #[cfg(not(unix))]
+    if core_selected {
+        return Err(rollback_apply_failure(
+            transaction,
+            anyhow::anyhow!(
+                "update.apply-platform-unavailable: synchronous Core activation requires Unix"
+            ),
+            failed_plan_components(plan),
+        ));
+    }
+    #[cfg(unix)]
+    let probe = ProcessCompatibilityProbe;
+    #[cfg(not(unix))]
+    let probe = ProcessCompatibilityProbe;
+    apply_staged_update_plan_with_services(
+        plan,
+        manifest,
+        adapter_catalog,
+        ownership,
+        transaction,
+        quiet,
+        &probe,
+        &NoopActivationHook,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_staged_update_plan_with_services(
+    plan: &UpdatePlan,
+    manifest: &StagingManifest,
+    adapter_catalog: &VerifiedAdapterUpdateCatalog,
+    ownership: &PlanStagingOwnership,
+    transaction: &mut InstallTransaction,
+    quiet: bool,
+    probe: &dyn CompatibilityProbe,
+    hook: &dyn ActivationHook,
+) -> Result<Vec<ComponentResult>, UpdateApplyError> {
+    let mut components = Vec::new();
+    if let Some(component) = plan
+        .components()
+        .iter()
+        .find(|component| component.kind() == super::plan::UpdateComponentKind::CoreBundle)
+    {
+        if component.action() == UpdateAction::Update {
+            match apply_core_bundle(plan, manifest, ownership, transaction, probe, hook) {
+                Ok(result) => components.push(result),
+                Err(error) => {
+                    return Err(rollback_apply_failure(
+                        transaction,
+                        error,
+                        failed_plan_components(plan),
+                    ));
+                }
+            }
+        } else {
+            components.push(component_result(component, action_name(component.action())));
+        }
+    }
+
+    let adapter_components = match crate::update::adapter::apply_staged_adapter_updates(
+        plan,
+        manifest,
+        adapter_catalog,
+        ownership,
+        transaction,
+        quiet,
+    ) {
+        Ok(results) => results,
+        Err(failure) => {
+            for result in &mut components {
+                if result.status == "applied" {
+                    result.status = "rolled_back".to_owned();
+                }
+            }
+            components.extend(failure.components);
+            return Err(UpdateApplyError {
+                source: failure.source,
+                components,
+            });
+        }
+    };
+    components.extend(adapter_components);
+
+    if let Err(error) = hook.after(ActivationStep::AdaptersActivated) {
+        return Err(rollback_apply_failure(
+            transaction,
+            error,
+            rolled_back_components(components),
+        ));
+    }
+    if let Err(error) = validate_adapter_discovery(plan, ownership) {
+        return Err(rollback_apply_failure(
+            transaction,
+            error,
+            rolled_back_components(components),
+        ));
+    }
+    if let Err(error) = hook.after(ActivationStep::AdapterDiscoveryValidated) {
+        return Err(rollback_apply_failure(
+            transaction,
+            error,
+            rolled_back_components(components),
+        ));
+    }
+    Ok(components)
+}
+
+fn selected_core_component(
+    plan: &UpdatePlan,
+) -> Option<(&str, &str, &str, &super::plan::CoreBundleArtifact)> {
+    plan.components().iter().find_map(|component| {
+        let UpdatePlanComponent::CoreBundle {
+            name,
+            target,
+            target_agentctl,
+            action: UpdateAction::Update,
+            artifact: Some(artifact),
+            ..
+        } = component
+        else {
+            return None;
+        };
+        Some((
+            name.as_str(),
+            target.as_str(),
+            target_agentctl.as_str(),
+            artifact,
+        ))
+    })
+}
+
+fn apply_core_bundle(
+    plan: &UpdatePlan,
+    manifest: &StagingManifest,
+    ownership: &PlanStagingOwnership,
+    transaction: &mut InstallTransaction,
+    probe: &dyn CompatibilityProbe,
+    hook: &dyn ActivationHook,
+) -> anyhow::Result<ComponentResult> {
+    let (name, target_core, target_agentctl, artifact) =
+        selected_core_component(plan).context("selected Core update has incomplete metadata")?;
+    let receipt = ownership
+        .core
+        .as_ref()
+        .context("selected Core update has no installation receipt")?;
+    validate_receipt(receipt)?;
+    ensure!(
+        receipt.installer_kind == CoreInstallerKind::Official,
+        "only an official receipt-managed Core installation may self-update"
+    );
+    let staged = manifest
+        .artifacts
+        .iter()
+        .find(|staged| matches!(staged, StagedArtifact::CoreBundle { name: staged_name, .. } if staged_name == name))
+        .context("selected Core update has no staged bundle")?;
+    let StagedArtifact::CoreBundle {
+        core_binary,
+        agentctl_binary,
+        ..
+    } = staged
+    else {
+        unreachable!();
+    };
+    let destination_staging = DestinationStagedPair::prepare(
+        plan.plan_id(),
+        core_binary,
+        agentctl_binary,
+        &receipt.core_binary_path,
+        &receipt.agentctl_binary_path,
+    )?;
+    hook.after(ActivationStep::DestinationStaged)?;
+
+    let agentctl_backup = previous_path(&receipt.agentctl_binary_path)?;
+    let core_backup = previous_path(&receipt.core_binary_path)?;
+    transaction.backup_file(&receipt.agentctl_binary_path, &agentctl_backup)?;
+    hook.after(ActivationStep::AgentctlBackup)?;
+    transaction.backup_file(&receipt.core_binary_path, &core_backup)?;
+    hook.after(ActivationStep::CoreBackup)?;
+    transaction.activate_file(&destination_staging.agentctl, &receipt.agentctl_binary_path)?;
+    hook.after(ActivationStep::AgentctlActivated)?;
+    transaction.activate_file(&destination_staging.core, &receipt.core_binary_path)?;
+    hook.after(ActivationStep::CoreActivated)?;
+
+    let evidence = probe
+        .probe(&receipt.core_binary_path, &receipt.agentctl_binary_path)
+        .context("absolute-path Core/agentctl compatibility validation failed")?;
+    ensure!(
+        evidence.core_version == target_core
+            && evidence.core_version == artifact.version
+            && evidence.agentctl_version == target_agentctl
+            && evidence.agentctl_version == artifact.agentctl_version
+            && evidence.compatibility_schema
+                == artifact.release.compatibility.launcher_compatibility_schema,
+        "installed Core/agentctl evidence differs from the resolved release"
+    );
+    hook.after(ActivationStep::PairValidated)?;
+
+    let updated_receipt = updated_core_receipt(plan, receipt, artifact)?;
+    let receipt_target = core_installation_receipt_path(&ownership.home);
+    let receipt_staged = destination_staged_path(&receipt_target, plan.plan_id(), "receipt")?;
+    remove_path_if_exists(&receipt_staged)?;
+    atomic_json(&receipt_staged, &updated_receipt)?;
+    let activation = transaction.activate_file(&receipt_staged, &receipt_target);
+    let cleanup = remove_path_if_exists(&receipt_staged);
+    activation?;
+    cleanup?;
+    hook.after(ActivationStep::ReceiptActivated)?;
+    Ok(ComponentResult {
+        kind: "core_bundle".to_owned(),
+        name: name.to_owned(),
+        status: "applied".to_owned(),
+    })
+}
+
+fn updated_core_receipt(
+    plan: &UpdatePlan,
+    receipt: &CoreInstallationReceipt,
+    artifact: &super::plan::CoreBundleArtifact,
+) -> anyhow::Result<CoreInstallationReceipt> {
+    let updated = CoreInstallationReceipt {
+        schema_version: receipt.schema_version,
+        installer_kind: CoreInstallerKind::Official,
+        managed_by: None,
+        core_version: artifact.version.clone(),
+        agentctl_version: artifact.agentctl_version.clone(),
+        archive: Some(CoreArchiveProvenance {
+            url: artifact.platform.archive_url.clone(),
+            sha256: artifact.platform.sha256.clone(),
+            signing_key_id: artifact.platform.signing_key_id.clone(),
+            platform: artifact.platform.platform.clone(),
+            release_commit: artifact.release.core_commit.clone(),
+        }),
+        install_root: receipt.install_root.clone(),
+        core_binary_path: receipt.core_binary_path.clone(),
+        agentctl_binary_path: receipt.agentctl_binary_path.clone(),
+        core_binary_sha256: file_sha256(&receipt.core_binary_path)?,
+        agentctl_binary_sha256: file_sha256(&receipt.agentctl_binary_path)?,
+        compatibility_schema: artifact
+            .release
+            .compatibility
+            .launcher_compatibility_schema
+            .clone(),
+        previous_successful_plan_id: Some(plan.plan_id().to_owned()),
+        installed_at_unix_seconds: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("system clock is before Unix epoch")?
+            .as_secs(),
+    };
+    validate_receipt(&updated)?;
+    Ok(updated)
+}
+
+struct DestinationStagedPair {
+    core: PathBuf,
+    agentctl: PathBuf,
+}
+
+impl DestinationStagedPair {
+    fn prepare(
+        plan_id: &str,
+        core_source: &Path,
+        agentctl_source: &Path,
+        core_target: &Path,
+        agentctl_target: &Path,
+    ) -> anyhow::Result<Self> {
+        let core = destination_staged_path(core_target, plan_id, "core")?;
+        let agentctl = destination_staged_path(agentctl_target, plan_id, "agentctl")?;
+        remove_path_if_exists(&core)?;
+        remove_path_if_exists(&agentctl)?;
+        copy_executable(core_source, &core)?;
+        if let Err(error) = copy_executable(agentctl_source, &agentctl) {
+            let cleanup = remove_path_if_exists(&core);
+            if let Err(cleanup) = cleanup {
+                return Err(anyhow::anyhow!(
+                    "{error:#}; destination staging cleanup failed: {cleanup:#}"
+                ));
+            }
+            return Err(error);
+        }
+        Ok(Self { core, agentctl })
+    }
+}
+
+impl Drop for DestinationStagedPair {
+    fn drop(&mut self) {
+        let _ = remove_path_if_exists(&self.core);
+        let _ = remove_path_if_exists(&self.agentctl);
+    }
+}
+
+fn destination_staged_path(target: &Path, plan_id: &str, role: &str) -> anyhow::Result<PathBuf> {
+    validate_plan_id(plan_id)?;
+    let parent = target.parent().context("activation target has no parent")?;
+    let name = target
+        .file_name()
+        .context("activation target has no file name")?;
+    let mut staged = std::ffi::OsString::from(format!(".ldgr-update-{plan_id}-{role}-"));
+    staged.push(name);
+    staged.push(".staged");
+    Ok(parent.join(staged))
+}
+
+fn previous_path(target: &Path) -> anyhow::Result<PathBuf> {
+    let name = target.file_name().context("Core binary has no file name")?;
+    let mut previous = name.to_os_string();
+    previous.push(".previous");
+    Ok(target
+        .parent()
+        .context("Core binary has no parent")?
+        .join(previous))
+}
+
+fn copy_executable(source: &Path, destination: &Path) -> anyhow::Result<()> {
+    copy_file_synced(source, destination)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(destination)?.permissions();
+        permissions.set_mode(permissions.mode() | 0o111);
+        fs::set_permissions(destination, permissions)?;
+        File::open(destination)?.sync_all()?;
+    }
+    sync_directory(
+        destination
+            .parent()
+            .context("destination-staged binary has no parent")?,
+    )
+}
+
+fn file_sha256(path: &Path) -> anyhow::Result<String> {
+    let mut file = File::open(path)?;
+    let mut digest = Sha256::new();
+    std::io::copy(&mut file, &mut digest)?;
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn validate_adapter_discovery(
+    plan: &UpdatePlan,
+    ownership: &PlanStagingOwnership,
+) -> anyhow::Result<()> {
+    let selected = plan
+        .components()
+        .iter()
+        .filter(|component| {
+            matches!(component, UpdatePlanComponent::Adapter { .. })
+                && matches!(
+                    component.action(),
+                    UpdateAction::Update | UpdateAction::ReinstallLocalSource
+                )
+        })
+        .collect::<Vec<_>>();
+    if selected.is_empty() {
+        return Ok(());
+    }
+    let roots = selected
+        .iter()
+        .filter_map(|component| ownership.adapters.get(component.name()))
+        .map(|owned| owned.user_adapter_root.clone())
+        .collect::<BTreeSet<_>>();
+    let registry = crate::adapter_registry::AdapterRegistry::discover_from_roots(roots);
+    for component in selected {
+        let owned = ownership
+            .adapters
+            .get(component.name())
+            .with_context(|| format!("updated adapter `{}` lost ownership", component.name()))?;
+        ensure!(
+            !registry
+                .warnings
+                .iter()
+                .any(|warning| warning.manifest_path.starts_with(&owned.install_root)),
+            "updated adapter `{}` emitted a discovery warning",
+            component.name()
+        );
+        let discovered = registry.find(component.name()).with_context(|| {
+            format!("updated adapter `{}` is not discoverable", component.name())
+        })?;
+        ensure!(
+            paths_equal(&discovered.root_path, &owned.install_root),
+            "updated adapter `{}` resolved from a different installation root",
+            component.name()
+        );
+    }
+    Ok(())
+}
+
+fn component_result(component: &UpdatePlanComponent, status: &str) -> ComponentResult {
+    ComponentResult {
+        kind: match component {
+            UpdatePlanComponent::CoreBundle { .. } => "core_bundle",
+            UpdatePlanComponent::Adapter { .. } => "adapter",
+        }
+        .to_owned(),
+        name: component.name().to_owned(),
+        status: status.to_owned(),
+    }
+}
+
+fn action_name(action: UpdateAction) -> &'static str {
+    match action {
+        UpdateAction::None => "none",
+        UpdateAction::Update => "update",
+        UpdateAction::ReinstallLocalSource => "reinstall_local_source",
+        UpdateAction::SkipUnmanaged => "skip_unmanaged",
+        UpdateAction::Blocked => "blocked",
+        UpdateAction::Applied => "applied",
+        UpdateAction::RolledBack => "rolled_back",
+        UpdateAction::Failed => "failed",
+    }
+}
+
+fn failed_plan_components(plan: &UpdatePlan) -> Vec<ComponentResult> {
+    plan.components()
+        .iter()
+        .map(|component| {
+            let status = if matches!(
+                component.action(),
+                UpdateAction::Update | UpdateAction::ReinstallLocalSource
+            ) {
+                "failed"
+            } else {
+                action_name(component.action())
+            };
+            component_result(component, status)
+        })
+        .collect()
+}
+
+fn rolled_back_components(mut components: Vec<ComponentResult>) -> Vec<ComponentResult> {
+    for component in &mut components {
+        if component.status == "applied" {
+            component.status = "rolled_back".to_owned();
+        }
+    }
+    components
+}
+
+fn rollback_apply_failure(
+    transaction: &mut InstallTransaction,
+    error: anyhow::Error,
+    components: Vec<ComponentResult>,
+) -> UpdateApplyError {
+    let source = match transaction.rollback() {
+        Ok(()) => error,
+        Err(rollback_error) => {
+            anyhow::anyhow!("{error:#}; whole-plan rollback also failed: {rollback_error:#}")
+        }
+    };
+    UpdateApplyError { source, components }
 }
 
 /// Downloads and authenticates every selected artifact before taking the first
@@ -732,6 +1232,18 @@ fn core_targets(
         ),
         OwnedTarget::new(
             "ldgr-core",
+            "core_backup",
+            &receipt.install_root,
+            previous_path(&receipt.core_binary_path)?,
+        ),
+        OwnedTarget::new(
+            "ldgr-core",
+            "agentctl_backup",
+            &receipt.install_root,
+            previous_path(&receipt.agentctl_binary_path)?,
+        ),
+        OwnedTarget::new(
+            "ldgr-core",
             "installation_receipt",
             &ldgr_home,
             core_installation_receipt_path(home),
@@ -1180,6 +1692,34 @@ impl InstallTransaction {
             phase => bail!("cannot activate transaction from {phase:?}"),
         }
     }
+    pub fn backup_file(&mut self, target: &Path, backup: &Path) -> anyhow::Result<()> {
+        self.begin_activation()?;
+        let target_index = self.snapshot_index(target)?;
+        let backup_index = self.snapshot_index(backup)?;
+        let target = self.journal.snapshots[target_index].target.clone();
+        let backup = self.journal.snapshots[backup_index].target.clone();
+        ensure!(
+            target.parent() == backup.parent(),
+            "paired binary backup must share its destination filesystem"
+        );
+        ensure_regular_staged_path(&target, "installed binary")?;
+        remove_path_if_exists(&backup)?;
+        fs::rename(&target, &backup).with_context(|| {
+            format!(
+                "failed to rename installed binary {} to backup {}",
+                target.display(),
+                backup.display()
+            )
+        })?;
+        sync_directory(
+            backup
+                .parent()
+                .context("paired binary backup has no parent")?,
+        )?;
+        self.journal.snapshots[target_index].state = SnapshotState::Activated;
+        self.journal.snapshots[backup_index].state = SnapshotState::Activated;
+        self.persist()
+    }
 
     pub fn activate_file(&mut self, staged: &Path, target: &Path) -> anyhow::Result<()> {
         self.begin_activation()?;
@@ -1541,6 +2081,8 @@ fn copy_file_synced(source: &Path, destination: &Path) -> anyhow::Result<()> {
     let mut output = File::create(destination)?;
     std::io::copy(&mut input, &mut output)?;
     output.flush()?;
+    let permissions = fs::metadata(source)?.permissions();
+    fs::set_permissions(destination, permissions)?;
     output.sync_all()?;
     Ok(())
 }
@@ -1709,15 +2251,18 @@ mod tests {
         CorePlatformArchive, CoreRelease, CoreReleaseCompatibility, CoreReleaseMetadata,
         CoreUpdateCatalog, PairedAgentctlRelease, VerifiedAdapterUpdateCatalog,
     };
+    #[cfg(unix)]
+    use crate::update::installation::ProcessCompatibilityProbe;
     use crate::update::installation::{
-        CoreArchiveProvenance, CoreInstallerKind, LAUNCHER_COMPATIBILITY_SCHEMA,
+        CompatibilityEvidence, CompatibilityProbe, CoreArchiveProvenance, CoreInstallerKind,
+        LAUNCHER_COMPATIBILITY_SCHEMA,
     };
     use crate::update::plan::{
         build_update_plan, AdapterInstallationKind, AdapterInstallationSnapshot, AdapterOrigin,
         CoreInstallationSnapshot, CorePlanOwnership, UpdateInventory, UpdatePlanRequest,
         VerifiedCatalogSnapshots,
     };
-    use crate::update::state::UpdateMode;
+    use crate::update::state::{TerminalError, TerminalOutcome, UpdateMode};
 
     fn target(root: &Path, component: &str, role: &str, name: &str) -> OwnedTarget {
         OwnedTarget::new(component, role, root, root.join(name))
@@ -1957,6 +2502,259 @@ mod tests {
         })
     }
 
+    struct FixedCoreProbe;
+
+    impl CompatibilityProbe for FixedCoreProbe {
+        fn probe(&self, _core: &Path, _agentctl: &Path) -> anyhow::Result<CompatibilityEvidence> {
+            Ok(CompatibilityEvidence {
+                core_version: "0.2.0".to_owned(),
+                agentctl_version: "0.2.0".to_owned(),
+                compatibility_schema: LAUNCHER_COMPATIBILITY_SCHEMA.to_owned(),
+            })
+        }
+    }
+
+    struct FailAfter(ActivationStep);
+
+    impl ActivationHook for FailAfter {
+        fn after(&self, step: ActivationStep) -> anyhow::Result<()> {
+            ensure!(step != self.0, "injected failure after {step:?}");
+            Ok(())
+        }
+    }
+
+    fn stage_core_fixture(
+        fixture: &CoreFixture,
+    ) -> anyhow::Result<(UpdateStateStore, UpdateLock, StagedUpdatePlan)> {
+        let store = UpdateStateStore::open(fixture.home.path().join(".ldgr"))?;
+        let lock = store.acquire_lock(
+            UpdateMode::Apply,
+            Some(fixture.plan.plan_id()),
+            std::time::Duration::from_secs(30),
+        )?;
+        let client = UpdateNetworkClient::new(true)?;
+        let catalogs = VerifiedStagingCatalogs {
+            core: &fixture.core_catalog,
+            adapters: &fixture.adapter_catalog,
+        };
+        let staged = stage_verified_update_plan(
+            &store,
+            &lock,
+            &client,
+            &fixture.plan,
+            &catalogs,
+            &fixture.ownership,
+        )?;
+        Ok((store, lock, staged))
+    }
+
+    #[test]
+    fn paired_core_apply_writes_backups_receipt_and_terminal_component() -> anyhow::Result<()> {
+        let fixture = core_fixture()?;
+        let (store, lock, staged) = stage_core_fixture(&fixture)?;
+        let StagedUpdatePlan {
+            manifest,
+            mut transaction,
+        } = staged;
+        store.mark_applying(&lock, fixture.plan.plan_id())?;
+        let components = apply_staged_update_plan_with_services(
+            &fixture.plan,
+            &manifest,
+            &fixture.adapter_catalog,
+            &fixture.ownership,
+            &mut transaction,
+            true,
+            &FixedCoreProbe,
+            &NoopActivationHook,
+        )?;
+        assert_eq!(components.len(), 1);
+        assert_eq!(components[0].kind, "core_bundle");
+        assert_eq!(components[0].status, "applied");
+        assert_eq!(fs::read_to_string(&fixture.installed_core)?, "new-core");
+        assert_eq!(
+            fs::read_to_string(&fixture.installed_agentctl)?,
+            "new-agentctl"
+        );
+        assert_eq!(
+            fs::read_to_string(previous_path(&fixture.installed_core)?)?,
+            "old-core"
+        );
+        assert_eq!(
+            fs::read_to_string(previous_path(&fixture.installed_agentctl)?)?,
+            "old-agentctl"
+        );
+        let receipt: CoreInstallationReceipt = serde_json::from_slice(&fs::read(
+            core_installation_receipt_path(fixture.home.path()),
+        )?)?;
+        assert_eq!(receipt.core_version, "0.2.0");
+        assert_eq!(receipt.agentctl_version, "0.2.0");
+        assert_eq!(
+            receipt.previous_successful_plan_id.as_deref(),
+            Some(fixture.plan.plan_id())
+        );
+        assert_eq!(
+            receipt.core_binary_sha256,
+            file_sha256(&fixture.installed_core)?
+        );
+        transaction.commit()?;
+        store.complete_plan(
+            &lock,
+            fixture.plan.plan_id(),
+            TerminalOutcome::Applied,
+            components,
+            None,
+        )?;
+        let history = store.read_history()?;
+        assert_eq!(history[0].outcome, TerminalOutcome::Applied);
+        assert_eq!(history[0].components[0].status, "applied");
+        lock.release()?;
+        Ok(())
+    }
+
+    #[test]
+    fn injected_failure_after_each_paired_activation_checkpoint_restores_every_target(
+    ) -> anyhow::Result<()> {
+        let steps = [
+            ActivationStep::DestinationStaged,
+            ActivationStep::AgentctlBackup,
+            ActivationStep::CoreBackup,
+            ActivationStep::AgentctlActivated,
+            ActivationStep::CoreActivated,
+            ActivationStep::PairValidated,
+            ActivationStep::ReceiptActivated,
+            ActivationStep::AdaptersActivated,
+            ActivationStep::AdapterDiscoveryValidated,
+        ];
+        for step in steps {
+            let fixture = core_fixture()?;
+            let (store, lock, staged) = stage_core_fixture(&fixture)?;
+            let StagedUpdatePlan {
+                manifest,
+                mut transaction,
+            } = staged;
+            store.mark_applying(&lock, fixture.plan.plan_id())?;
+            let failure = apply_staged_update_plan_with_services(
+                &fixture.plan,
+                &manifest,
+                &fixture.adapter_catalog,
+                &fixture.ownership,
+                &mut transaction,
+                true,
+                &FixedCoreProbe,
+                &FailAfter(step),
+            )
+            .expect_err("injected activation failure should fail the whole plan");
+            let summary = format!("{:#}", failure.source);
+            assert!(summary.contains("injected failure"));
+            assert_eq!(fs::read_to_string(&fixture.installed_core)?, "old-core");
+            assert_eq!(
+                fs::read_to_string(&fixture.installed_agentctl)?,
+                "old-agentctl"
+            );
+            assert!(!previous_path(&fixture.installed_core)?.exists());
+            assert!(!previous_path(&fixture.installed_agentctl)?.exists());
+            assert!(!core_installation_receipt_path(fixture.home.path()).exists());
+            assert!(!fixture
+                .ownership
+                .core
+                .as_ref()
+                .map(|receipt| destination_staged_path(
+                    &receipt.core_binary_path,
+                    fixture.plan.plan_id(),
+                    "core"
+                ))
+                .transpose()?
+                .expect("fixture has Core ownership")
+                .exists());
+            store.complete_plan(
+                &lock,
+                fixture.plan.plan_id(),
+                TerminalOutcome::RolledBack,
+                failure.components,
+                Some(TerminalError {
+                    code: "update.activation-failed".to_owned(),
+                    summary,
+                }),
+            )?;
+            let history = store.read_history()?;
+            assert_eq!(history[0].outcome, TerminalOutcome::RolledBack);
+            assert!(matches!(
+                history[0].components[0].status.as_str(),
+                "failed" | "rolled_back"
+            ));
+            lock.release()?;
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_pair_runs_absolute_smoke_tests_and_preserves_executable_mode() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = core_fixture()?;
+        let (_store, lock, staged) = stage_core_fixture(&fixture)?;
+        let StagedUpdatePlan {
+            manifest,
+            mut transaction,
+        } = staged;
+        let StagedArtifact::CoreBundle {
+            core_binary,
+            agentctl_binary,
+            ..
+        } = &manifest.artifacts[0]
+        else {
+            panic!("expected staged Core bundle");
+        };
+        let report = serde_json::json!({
+            "schema": LAUNCHER_COMPATIBILITY_SCHEMA,
+            "compatible": true,
+            "core_version": "0.2.0",
+            "core_executable": fixture.installed_core,
+            "agentctl_version": "0.2.0",
+            "agentctl_requirement": ">=0.2.0, <0.3.0",
+            "error_recovery_schema": 1
+        });
+        fs::write(
+            core_binary,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'ldgr 0.2.0'; exit 0; fi\nprintf '%s\\n' '{}'\n",
+                serde_json::to_string(&report)?
+            ),
+        )?;
+        fs::write(agentctl_binary, "#!/bin/sh\necho 'agentctl 0.2.0'\n")?;
+        for binary in [core_binary, agentctl_binary] {
+            let mut permissions = fs::metadata(binary)?.permissions();
+            permissions.set_mode(0o750);
+            fs::set_permissions(binary, permissions)?;
+        }
+        let components = apply_staged_update_plan_with_services(
+            &fixture.plan,
+            &manifest,
+            &fixture.adapter_catalog,
+            &fixture.ownership,
+            &mut transaction,
+            true,
+            &ProcessCompatibilityProbe,
+            &NoopActivationHook,
+        )?;
+        assert_eq!(components[0].status, "applied");
+        assert_ne!(
+            fs::metadata(&fixture.installed_core)?.permissions().mode() & 0o111,
+            0
+        );
+        assert_ne!(
+            fs::metadata(&fixture.installed_agentctl)?
+                .permissions()
+                .mode()
+                & 0o111,
+            0
+        );
+        transaction.commit()?;
+        lock.release()?;
+        Ok(())
+    }
+
     #[test]
     fn verified_staging_persists_plan_and_snapshots_before_activation() -> anyhow::Result<()> {
         let fixture = core_fixture()?;
@@ -1988,7 +2786,7 @@ mod tests {
             store.load_staged_update_plan(fixture.plan.plan_id())?.plan,
             fixture.plan
         );
-        assert_eq!(staged.manifest.targets.len(), 3);
+        assert_eq!(staged.manifest.targets.len(), 5);
         let StagedArtifact::CoreBundle {
             core_binary,
             agentctl_binary,

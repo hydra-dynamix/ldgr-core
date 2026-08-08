@@ -13,7 +13,8 @@ use crate::cli::args::UpdateArgs;
 use crate::harness_config::UpdateChannel;
 use crate::release_index::{AdapterReleaseIndex, ReleaseKeyring};
 use crate::update::apply::{
-    stage_verified_update_plan, PlanStagingOwnership, StagedUpdatePlan, VerifiedStagingCatalogs,
+    apply_staged_update_plan, stage_verified_update_plan, PlanStagingOwnership, StagedUpdatePlan,
+    VerifiedStagingCatalogs,
 };
 use crate::update::catalog::{
     fetch_signed_adapter_update_catalog, fetch_signed_core_update_catalog, AdapterCatalogFetch,
@@ -100,6 +101,7 @@ fn handle_apply(args: UpdateArgs) -> anyhow::Result<()> {
         lock.release()?;
         bail!("update.no-compatible-release: the resolved update plan is blocked");
     }
+    #[cfg(not(unix))]
     if resolved.plan.components().iter().any(|component| {
         component.kind() == UpdateComponentKind::CoreBundle
             && component.action() == UpdateAction::Update
@@ -156,7 +158,7 @@ fn handle_apply(args: UpdateArgs) -> anyhow::Result<()> {
         manifest,
         mut transaction,
     } = staged;
-    match crate::update::adapter::apply_staged_adapter_updates(
+    match apply_staged_update_plan(
         &resolved.plan,
         &manifest,
         &resolved.adapter_catalog,

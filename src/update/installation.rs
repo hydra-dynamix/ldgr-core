@@ -110,6 +110,23 @@ struct CompatibilityReport {
 
 impl CompatibilityProbe for ProcessCompatibilityProbe {
     fn probe(&self, core: &Path, agentctl: &Path) -> anyhow::Result<CompatibilityEvidence> {
+        let output = Command::new(core)
+            .arg("--version")
+            .output()
+            .with_context(|| format!("failed to run {} --version", core.display()))?;
+        ensure!(
+            output.status.success(),
+            "{} --version failed with {}",
+            core.display(),
+            output.status
+        );
+        let text = String::from_utf8(output.stdout).context("Core --version is not UTF-8")?;
+        let core_version = text
+            .trim()
+            .strip_prefix("ldgr ")
+            .context("Core --version must report ldgr followed by a version")?
+            .to_owned();
+        Version::parse(&core_version).context("Core version is not semantic")?;
         let output = Command::new(agentctl)
             .arg("--version")
             .output()
@@ -162,12 +179,16 @@ impl CompatibilityProbe for ProcessCompatibilityProbe {
             "compatibility report changed agentctl version"
         );
         ensure!(
+            report.core_version == core_version,
+            "compatibility report changed Core version"
+        );
+        ensure!(
             !report.agentctl_requirement.is_empty() && report.error_recovery_schema > 0,
             "compatibility report omitted recovery metadata"
         );
         Version::parse(&report.core_version).context("Core version is not semantic")?;
         Ok(CompatibilityEvidence {
-            core_version: report.core_version,
+            core_version,
             agentctl_version,
             compatibility_schema: report.schema,
         })
