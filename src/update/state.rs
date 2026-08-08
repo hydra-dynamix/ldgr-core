@@ -40,6 +40,8 @@ pub struct UpdateCache {
     pub consecutive_failures: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_notice: Option<CachedNotice>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notice_history: Vec<CachedNotice>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -230,6 +232,37 @@ impl UpdateLock {
         self.release_inner()
     }
 
+    pub(crate) fn owner_token(&self) -> &str {
+        &self.record.owner_token
+    }
+
+    /// Transfers a startup-check lock to a detached child without opening a
+    /// race in which another foreground invocation can schedule a second
+    /// worker. The child must prove possession of the owner token before it
+    /// can use or release the lock.
+    pub(crate) fn handoff_to_pid(mut self, pid: u32) -> anyhow::Result<()> {
+        ensure!(pid > 0, "update lock handoff PID must be positive");
+        ensure!(
+            self.record.mode == UpdateMode::Check && self.record.plan_id.is_none(),
+            "only an unbound update-check lock can be handed to a worker"
+        );
+        let current: UpdateLockRecord = read_json(&self.path, "update lock")?;
+        validate_lock(&current)?;
+        ensure!(
+            current.owner_token == self.record.owner_token,
+            "update lock ownership changed before worker handoff"
+        );
+        ensure!(
+            current.pid == std::process::id(),
+            "update lock is not owned by the foreground process"
+        );
+        self.record.pid = pid;
+        self.record.process_start_identity = process_start(pid);
+        atomic_json(&self.path, &self.record)?;
+        self.released = true;
+        Ok(())
+    }
+
     fn release_inner(&mut self) -> anyhow::Result<()> {
         if self.released {
             return Ok(());
@@ -302,6 +335,52 @@ impl UpdateStateStore {
         lease: Duration,
     ) -> anyhow::Result<UpdateLock> {
         self.acquire_lock_at(mode, plan_id, lease, now_ms()?)
+    }
+
+    /// Claims a check lock that the foreground process atomically handed to
+    /// this detached worker. A guessed hidden command is insufficient: both
+    /// the unguessable token and the recorded child PID must match.
+    pub(crate) fn claim_handed_off_check_lock(
+        &self,
+        owner_token: &str,
+    ) -> anyhow::Result<UpdateLock> {
+        self.verify_paths()?;
+        ensure!(
+            owner_token.len() == 64 && lower_hex(owner_token),
+            "invalid internal update worker token"
+        );
+        let path = self.updates.join(LOCK);
+        let record: UpdateLockRecord = read_json(&path, "update lock")?;
+        validate_lock(&record)?;
+        ensure!(
+            record.mode == UpdateMode::Check && record.plan_id.is_none(),
+            "internal update worker requires an unbound check lock"
+        );
+        ensure!(
+            record.owner_token == owner_token,
+            "internal update worker token does not own the update lock"
+        );
+        ensure!(
+            record.pid == std::process::id(),
+            "update lock was not handed to this worker process"
+        );
+        ensure!(
+            now_ms()? < record.lease_expires_at_unix_ms,
+            "internal update worker lock lease expired"
+        );
+        let actual_start = process_start(std::process::id());
+        ensure!(
+            !matches!(
+                (&record.process_start_identity, &actual_start),
+                (Some(expected), Some(actual)) if expected != actual
+            ),
+            "internal update worker process identity changed"
+        );
+        Ok(UpdateLock {
+            path,
+            record,
+            released: false,
+        })
     }
 
     fn acquire_lock_at(
@@ -678,6 +757,13 @@ fn validate_cache(cache: &UpdateCache) -> anyhow::Result<()> {
         CachedCheckResult::Current => {}
     }
     if let Some(notice) = &cache.last_notice {
+        validate_id(&notice.plan_id)?;
+    }
+    ensure!(
+        cache.notice_history.len() <= 32,
+        "cached update notice history exceeds 32 entries"
+    );
+    for notice in &cache.notice_history {
         validate_id(&notice.plan_id)?;
     }
     Ok(())
@@ -1359,6 +1445,7 @@ mod tests {
             catalog_etag: Some("v1".to_owned()),
             consecutive_failures: 0,
             last_notice: None,
+            notice_history: Vec::new(),
         };
         store.write_cache(&old)?;
         let new = UpdateCache {
@@ -1523,6 +1610,20 @@ mod tests {
     }
 
     #[test]
+    fn detached_worker_must_claim_the_handed_off_pid_and_token() -> anyhow::Result<()> {
+        let (_directory, store) = fixture()?;
+        let lock = store.acquire_lock(UpdateMode::Check, None, Duration::from_secs(60))?;
+        let token = lock.owner_token().to_owned();
+        assert!(store.claim_handed_off_check_lock(&"f".repeat(64)).is_err());
+        lock.handoff_to_pid(std::process::id())?;
+        let worker = store.claim_handed_off_check_lock(&token)?;
+        assert_eq!(worker.record().pid, std::process::id());
+        worker.release()?;
+        assert!(store.claim_handed_off_check_lock(&token).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn process_start_mismatch_marks_pid_reuse_stale() -> anyhow::Result<()> {
         let now = now_ms()?;
         let record = UpdateLockRecord {
@@ -1562,6 +1663,7 @@ mod tests {
             catalog_etag: None,
             consecutive_failures: 0,
             last_notice: None,
+            notice_history: Vec::new(),
         };
         store.write_cache(&cache)?;
         assert_eq!(

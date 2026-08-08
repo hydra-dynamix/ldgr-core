@@ -1196,7 +1196,8 @@ fn update_help_and_command_map_expose_the_public_check_surface() -> anyhow::Resu
         .stdout(predicate::str::contains("--adapters-only"))
         .stdout(predicate::str::contains("--adapter <SLUG>"))
         .stdout(predicate::str::contains("--prerelease"))
-        .stdout(predicate::str::contains("--offline"));
+        .stdout(predicate::str::contains("--offline"))
+        .stdout(predicate::str::contains("__update-check-worker").not());
 
     let mut conflict = isolated_command(project.path())?;
     conflict.args([
@@ -1224,6 +1225,18 @@ fn update_help_and_command_map_expose_the_public_check_surface() -> anyhow::Resu
         .failure()
         .stdout(predicate::str::is_empty())
         .stderr(predicate::str::contains("update.apply-unavailable"));
+    Ok(())
+}
+
+#[test]
+fn noninteractive_normal_command_does_not_schedule_a_startup_worker() -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    let home = project.path().join(".ldgr/test-empty-home");
+    let mut command = isolated_command(project.path())?;
+    command.arg("workflow");
+    command.assert().success();
+    assert!(!home.join(".ldgr/update-state.json").exists());
+    assert!(!home.join(".ldgr/updates/update.lock").exists());
     Ok(())
 }
 
@@ -1450,7 +1463,10 @@ fn full_help_is_derived_from_the_complete_clap_command_graph() -> anyhow::Result
         .expect("full help keeps the research split after the generated command map");
 
     fn collect_paths(command: &clap::Command, parent: &[&str], paths: &mut Vec<String>) {
-        for subcommand in command.get_subcommands() {
+        for subcommand in command
+            .get_subcommands()
+            .filter(|subcommand| !subcommand.is_hide_set())
+        {
             let mut path = parent.to_vec();
             path.push(subcommand.get_name());
             let aliases = subcommand.get_visible_aliases().collect::<Vec<_>>();
@@ -1468,6 +1484,8 @@ fn full_help_is_derived_from_the_complete_clap_command_graph() -> anyhow::Result
     collect_paths(&ldgr_core::cli::command(), &[], &mut paths);
     let expected_map = format!("Core command tree:\n{}", paths.join("\n"));
     assert_eq!(rendered_map, expected_map);
+    assert!(!stdout.contains("__update-check-worker"));
+    assert!(!stdout.contains("__record-core-installation"));
 
     for required_path in [
         "  install",

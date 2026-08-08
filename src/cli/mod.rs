@@ -82,7 +82,10 @@ fn render_full_command_map() -> String {
 }
 
 fn render_command_paths(command: &clap::Command, parent: &[&str], output: &mut String) {
-    for subcommand in command.get_subcommands() {
+    for subcommand in command
+        .get_subcommands()
+        .filter(|subcommand| !subcommand.is_hide_set())
+    {
         let mut path = parent.to_vec();
         path.push(subcommand.get_name());
         output.push_str("  ");
@@ -123,6 +126,11 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    #[command(name = "__update-check-worker", hide = true)]
+    UpdateCheckWorker {
+        #[arg(long, hide = true)]
+        token: String,
+    },
     #[command(name = "__record-core-installation", hide = true)]
     RecordCoreInstallation {
         #[arg(long)]
@@ -253,7 +261,29 @@ where
             std::process::exit(2);
         }
     };
+    if should_run_startup_update_hook(&cli, &args) {
+        crate::update::startup::maybe_schedule_update_check();
+    }
     handle_cli(cli)
+}
+
+fn should_run_startup_update_hook(cli: &Cli, args: &[OsString]) -> bool {
+    if cli.full
+        || args.iter().any(|argument| {
+            matches!(
+                argument.to_str(),
+                Some("--help" | "-h" | "--version" | "-V")
+            )
+        })
+    {
+        return false;
+    }
+    !matches!(
+        cli.command,
+        None | Some(Command::Update(_))
+            | Some(Command::UpdateCheckWorker { .. })
+            | Some(Command::RecordCoreInstallation { .. })
+    )
 }
 
 fn requests_machine_update_output(args: &[OsString]) -> bool {
@@ -407,6 +437,9 @@ fn handle_cli(cli: Cli) -> anyhow::Result<()> {
         return Ok(());
     };
     match command {
+        Command::UpdateCheckWorker { token } => {
+            commands::update::handle_startup_check_worker(&token)
+        }
         Command::RecordCoreInstallation {
             home,
             agentctl_binary,
@@ -633,6 +666,7 @@ fn dispatch_adapter_namespace(
     argv.extend(request.remaining);
     let mut process = crate::host_process::command_from_argv(&argv)?;
     process
+        .env(crate::update::startup::RECURSION_GUARD_ENV, "1")
         .env("LDGR_DB", &request.db)
         .env("LDGR_ARTIFACT_ROOT", &request.artifact_root)
         .env("LDGR_WORKING_DIR", working_dir)

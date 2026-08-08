@@ -28,7 +28,7 @@ use crate::update::plan::{
     VerifiedCatalogSnapshots,
 };
 use crate::update::state::{
-    CachedCheckResult, UpdateCache, UpdateMode, UpdateStateStore, SCHEMA_VERSION,
+    CachedCheckResult, UpdateCache, UpdateLock, UpdateMode, UpdateStateStore, SCHEMA_VERSION,
 };
 
 const CHECK_LOCK_LEASE: Duration = Duration::from_secs(30);
@@ -47,21 +47,14 @@ fn handle_check(args: UpdateArgs) -> anyhow::Result<()> {
     let state = UpdateStateStore::open(home.join(".ldgr"))?;
     let previous_cache = state.load_cache()?;
     let lock = state.acquire_lock(UpdateMode::Check, None, CHECK_LOCK_LEASE)?;
-    let resolved = resolve_check(&args, &home);
-    let (plan, core_etag) = match resolved {
-        Ok(value) => value,
-        Err(error) => {
-            let code = stable_error_code(&error);
-            let cache = failed_cache(previous_cache.as_ref(), code)?;
-            state
-                .write_cache(&cache)
-                .context("failed to persist failed update check state")?;
-            lock.release()?;
-            return Err(error);
-        }
-    };
-    state.write_cache(&success_cache(previous_cache.as_ref(), &plan, core_etag)?)?;
-    lock.release()?;
+    let plan = run_check(
+        &args,
+        &home,
+        &state,
+        previous_cache.as_ref(),
+        lock,
+        "explicit update check failed",
+    )?;
 
     let result = plan.check_result();
     render_result(&result, args.json)?;
@@ -69,6 +62,56 @@ fn handle_check(args: UpdateArgs) -> anyhow::Result<()> {
         bail!("update.no-compatible-release: the resolved update plan is blocked");
     }
     Ok(())
+}
+
+pub fn handle_startup_check_worker(owner_token: &str) -> anyhow::Result<()> {
+    let (home, config, state, lock) = crate::update::startup::startup_worker_context(owner_token)?;
+    let args = UpdateArgs {
+        check: true,
+        json: true,
+        yes: false,
+        core_only: !config.include_adapters,
+        adapters_only: false,
+        adapters: Vec::new(),
+        prerelease: config.channel == UpdateChannel::Prerelease,
+        offline: false,
+    };
+    let previous_cache = state.load_cache()?;
+    run_check(
+        &args,
+        &home,
+        &state,
+        previous_cache.as_ref(),
+        lock,
+        "automatic update check failed",
+    )?;
+    Ok(())
+}
+
+fn run_check(
+    args: &UpdateArgs,
+    home: &Path,
+    state: &UpdateStateStore,
+    previous_cache: Option<&UpdateCache>,
+    lock: UpdateLock,
+    failure_summary: &str,
+) -> anyhow::Result<UpdatePlan> {
+    let resolved = resolve_check(args, home);
+    let (plan, core_etag) = match resolved {
+        Ok(value) => value,
+        Err(error) => {
+            let code = stable_error_code(&error);
+            let cache = failed_cache(previous_cache, code, failure_summary)?;
+            state
+                .write_cache(&cache)
+                .context("failed to persist failed update check state")?;
+            lock.release()?;
+            return Err(error);
+        }
+    };
+    state.write_cache(&success_cache(previous_cache, &plan, core_etag)?)?;
+    lock.release()?;
+    Ok(plan)
 }
 
 fn resolve_check(args: &UpdateArgs, home: &Path) -> anyhow::Result<(UpdatePlan, Option<String>)> {
@@ -354,21 +397,31 @@ fn success_cache(
         catalog_etag,
         consecutive_failures: 0,
         last_notice: previous.and_then(|cache| cache.last_notice.clone()),
+        notice_history: previous
+            .map(|cache| cache.notice_history.clone())
+            .unwrap_or_default(),
     })
 }
 
-fn failed_cache(previous: Option<&UpdateCache>, code: &str) -> anyhow::Result<UpdateCache> {
+fn failed_cache(
+    previous: Option<&UpdateCache>,
+    code: &str,
+    summary: &str,
+) -> anyhow::Result<UpdateCache> {
     Ok(UpdateCache {
         schema_version: SCHEMA_VERSION,
         checked_at_unix_ms: now_ms()?,
         result: CachedCheckResult::Failed {
             code: code.to_owned(),
-            summary: "explicit update check failed".to_owned(),
+            summary: summary.to_owned(),
         },
         catalog_etag: previous.and_then(|cache| cache.catalog_etag.clone()),
         consecutive_failures: previous
             .map_or(1, |cache| cache.consecutive_failures.saturating_add(1)),
         last_notice: previous.and_then(|cache| cache.last_notice.clone()),
+        notice_history: previous
+            .map(|cache| cache.notice_history.clone())
+            .unwrap_or_default(),
     })
 }
 
