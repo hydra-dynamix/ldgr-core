@@ -73,7 +73,7 @@ fn release_workflow_catalog_publication_is_last_and_matrix_gated() -> anyhow::Re
 #[test]
 fn release_workflow_runs_actionlint_and_signed_installer_fixtures() -> anyhow::Result<()> {
     let workflow = fs::read_to_string(repository().join(".github/workflows/release.yml"))?;
-    ensure!(workflow.contains("docker://rhysd/actionlint:1.7.7"));
+    ensure!(workflow.contains("docker://rhysd/actionlint:1.7.12"));
     ensure!(workflow.contains("if [[ \"$version\" == *-* ]]; then prerelease=\"true\"; fi"));
     ensure!(workflow.contains("prerelease input must match the semantic version channel"));
     ensure!(workflow.contains("default: false"));
