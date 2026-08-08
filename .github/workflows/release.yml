@@ -13,13 +13,28 @@ on:
       prerelease:
         description: "Mark the GitHub release as prerelease"
         required: true
-        default: true
+        default: false
         type: boolean
 
 permissions:
   contents: write
 
 jobs:
+  static:
+    name: Validate release workflow
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run actionlint
+        uses: docker://rhysd/actionlint:1.7.7
+
+      - name: Run release contract static fixtures
+        run: cargo test --locked --test release_pipeline release_workflow_
+
   metadata:
     name: Validate release metadata
     runs-on: ubuntu-latest
@@ -52,16 +67,21 @@ jobs:
             echo "tag ${GITHUB_REF_NAME} does not match Cargo.toml version v${version}" >&2
             exit 1
           fi
-          prerelease="true"
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            prerelease="${{ inputs.prerelease }}"
+          prerelease="false"
+          if [[ "$version" == *-* ]]; then prerelease="true"; fi
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" &&
+                "${{ inputs.prerelease }}" != "$prerelease" ]]; then
+            echo "prerelease input must match the semantic version channel" >&2
+            exit 1
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
 
   build:
     name: Build ${{ matrix.platform }} binary release
-    needs: metadata
+    needs:
+      - static
+      - metadata
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     strategy:
@@ -117,7 +137,9 @@ jobs:
       - name: Test Windows installer PATH handling
         if: matrix.platform == 'windows-x86_64'
         shell: powershell
-        run: tests/install_path.ps1
+        run: |
+          tests/install_path.ps1
+          tests/install_catalog.ps1
 
       - name: Build paired agentctl dependency
         shell: bash
@@ -179,8 +201,8 @@ jobs:
             dist/ldgr-core-${{ needs.metadata.outputs.version }}-${{ matrix.platform }}.tar.gz.sha256
           if-no-files-found: error
 
-  publish:
-    name: Publish complete release
+  sign:
+    name: Sign complete release candidate
     needs:
       - metadata
       - build
@@ -188,8 +210,21 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       RELEASE_NAME: ldgr-core
+      LDGR_CATALOG_SIGNING_KEY: ${{ secrets.LDGR_CATALOG_SIGNING_KEY }}
+      LDGR_ARCHIVE_SIGNING_KEY: ${{ secrets.LDGR_ARCHIVE_SIGNING_KEY || secrets.LDGR_CATALOG_SIGNING_KEY }}
+      CATALOG_KEY_ID: ${{ vars.LDGR_CATALOG_SIGNING_KEY_ID || 'ldgr-release-2026-01' }}
+      ARCHIVE_KEY_ID: ${{ vars.LDGR_ARCHIVE_SIGNING_KEY_ID || vars.LDGR_CATALOG_SIGNING_KEY_ID || 'ldgr-release-2026-01' }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Checkout published catalog
+        uses: actions/checkout@v4
+        with:
+          repository: hydra-dynamix/ldgr-releases
+          path: catalog-repository
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Download all platform artifacts
         uses: actions/download-artifact@v4
@@ -198,22 +233,31 @@ jobs:
           merge-multiple: true
           path: dist
 
-      - name: Verify complete release matrix
+      - name: Generate archive signatures and catalog candidate
         shell: bash
         run: |
           set -euo pipefail
+          test -n "$LDGR_CATALOG_SIGNING_KEY"
+          test -n "$LDGR_ARCHIVE_SIGNING_KEY"
           version="${{ needs.metadata.outputs.version }}"
-          platforms=(linux-x86_64 linux-aarch64 macos-x86_64 macos-aarch64 windows-x86_64)
-          for platform in "${platforms[@]}"; do
-            archive="dist/${RELEASE_NAME}-${version}-${platform}.tar.gz"
-            test -s "$archive"
-            test -s "${archive}.sha256"
-            sha256sum -c "${archive}.sha256"
-          done
-          test "$(find dist -maxdepth 1 -type f -name '*.tar.gz' | wc -l)" -eq 5
-          test "$(find dist -maxdepth 1 -type f -name '*.tar.gz.sha256' | wc -l)" -eq 5
+          channel=stable
+          if [[ "${{ needs.metadata.outputs.prerelease }}" == "true" ]]; then channel=prerelease; fi
+          mkdir -p candidate
+          cargo run --locked --features release-tooling --bin ldgr-release -- \
+            --existing-catalog catalog-repository/core-index.json \
+            --existing-signature catalog-repository/core-index.json.sig \
+            --trusted-keyring release-keyring.json --dist dist \
+            --output-catalog candidate/core-index.json \
+            --output-signature candidate/core-index.json.sig \
+            --previous-version-output candidate/previous-version.txt \
+            --version "$version" --channel "$channel" \
+            --minimum-updater-version \
+              "$(jq -r '.releases[-1].version' catalog-repository/core-index.json)" \
+            --archive-base-url "https://github.com/${GITHUB_REPOSITORY}/releases/download/v${version}" \
+            --catalog-key-id "$CATALOG_KEY_ID" --archive-key-id "$ARCHIVE_KEY_ID"
+          cp release-keyring.json candidate/release-keyring.json
 
-      - name: Create or update GitHub release
+      - name: Stage signed release assets
         shell: bash
         run: |
           set -euo pipefail
@@ -225,6 +269,171 @@ jobs:
             prerelease_flag="--prerelease"
           fi
           if ! gh release view "$tag" >/dev/null 2>&1; then
-            gh release create "$tag" --title "$title" --notes "${RELEASE_NAME} ${version} binary release from ${GITHUB_SHA}." $prerelease_flag
+            gh release create "$tag" --title "$title" \
+              --notes "${RELEASE_NAME} ${version} signed release candidate from ${GITHUB_SHA}." \
+              $prerelease_flag
           fi
-          gh release upload "$tag" dist/*.tar.gz dist/*.tar.gz.sha256 --clobber
+          gh release upload "$tag" dist/*.tar.gz dist/*.tar.gz.sha256 dist/*.tar.gz.sig --clobber
+
+      - name: Upload signed release candidate
+        uses: actions/upload-artifact@v4
+        with:
+          name: signed-release-candidate
+          path: |
+            candidate/core-index.json
+            candidate/core-index.json.sig
+            candidate/previous-version.txt
+            candidate/release-keyring.json
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+            dist/*.tar.gz.sig
+          if-no-files-found: error
+
+  release-gate:
+    name: Previous-version update ${{ matrix.platform }}
+    needs:
+      - metadata
+      - sign
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux-x86_64
+          - os: ubuntu-24.04-arm
+            platform: linux-aarch64
+          - os: macos-15-intel
+            platform: macos-x86_64
+          - os: macos-14
+            platform: macos-aarch64
+          - os: windows-latest
+            platform: windows-x86_64
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download signed candidate
+        uses: actions/download-artifact@v4
+        with:
+          name: signed-release-candidate
+          path: candidate
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Prove rollback checkpoints
+        run: cargo test --locked --lib update::apply::tests::injected_failure_after_each_paired_activation_checkpoint_restores_every_target -- --exact
+      - name: Test signed installers and previous-version update
+        if: matrix.platform != 'windows-x86_64'
+        shell: bash
+        env:
+          TARGET_VERSION: ${{ needs.metadata.outputs.version }}
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/ldgr-release-gate"
+          previous="$(tr -d '\r\n' < candidate/candidate/previous-version.txt)"
+          catalog="file://$PWD/candidate/candidate/core-index.json"
+          helper="file://$PWD/scripts/core-catalog.py"
+          keyring="file://$PWD/candidate/candidate/release-keyring.json"
+          HOME="$root/home" LDGR_INSTALL_DIR="$root/previous" LDGR_VERSION="$previous" \
+            LDGR_CORE_UPDATE_INDEX="$catalog" LDGR_CORE_CATALOG_HELPER="$helper" \
+            LDGR_CORE_RELEASE_KEYRING="$keyring" sh scripts/install.sh
+          HOME="$root/home" LDGR_CORE_UPDATE_INDEX="$catalog" \
+            LDGR_CORE_RELEASE_KEYRING="$keyring" \
+            "$root/previous/ldgr" update --core-only --yes
+          test "$("$root/previous/ldgr" --version)" = "ldgr $TARGET_VERSION"
+          HOME="$root/current-home" LDGR_INSTALL_DIR="$root/current" \
+            LDGR_VERSION="$TARGET_VERSION" LDGR_CORE_UPDATE_INDEX="$catalog" \
+            LDGR_CORE_CATALOG_HELPER="$helper" LDGR_CORE_RELEASE_KEYRING="$keyring" \
+            sh scripts/install.sh
+          test "$("$root/current/ldgr" --version)" = "ldgr $TARGET_VERSION"
+          "$root/current/ldgr" compatibility \
+            --agentctl-version "$("$root/current/agentctl" --version | awk '{print $2}')" --json
+      - name: Test signed Windows installer and previous-version update
+        if: matrix.platform == 'windows-x86_64'
+        shell: powershell
+        env:
+          TARGET_VERSION: ${{ needs.metadata.outputs.version }}
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP "ldgr-release-gate"
+          $catalog = [Uri](Resolve-Path "candidate/candidate/core-index.json")
+          $helper = [Uri](Resolve-Path "scripts/core-catalog.py")
+          $keyring = [Uri](Resolve-Path "candidate/candidate/release-keyring.json")
+          $previous = (Get-Content -Raw "candidate/candidate/previous-version.txt").Trim()
+          $env:HOME = Join-Path $root "home"
+          $env:USERPROFILE = $env:HOME
+          $env:LDGR_INSTALL_DIR = Join-Path $root "previous"
+          $env:LDGR_VERSION = $previous
+          $env:LDGR_CORE_UPDATE_INDEX = $catalog.AbsoluteUri
+          $env:LDGR_CORE_CATALOG_HELPER = $helper.AbsoluteUri
+          $env:LDGR_CORE_RELEASE_KEYRING = $keyring.AbsoluteUri
+          & scripts/install.ps1
+          & "$env:LDGR_INSTALL_DIR/ldgr.exe" update --core-only --yes
+          $deadline = [DateTime]::UtcNow.AddSeconds(30)
+          do {
+            Start-Sleep -Milliseconds 250
+            $installed = (& "$env:LDGR_INSTALL_DIR/ldgr.exe" --version).Trim()
+          } while ($installed -ne "ldgr $env:TARGET_VERSION" -and [DateTime]::UtcNow -lt $deadline)
+          if ($installed -ne "ldgr $env:TARGET_VERSION") { throw "Previous-version update did not finalize." }
+          $env:HOME = Join-Path $root "current-home"
+          $env:USERPROFILE = $env:HOME
+          $env:LDGR_INSTALL_DIR = Join-Path $root "current"
+          $env:LDGR_VERSION = $env:TARGET_VERSION
+          & scripts/install.ps1
+          if ((& "$env:LDGR_INSTALL_DIR/ldgr.exe" --version).Trim() -ne "ldgr $env:TARGET_VERSION") {
+            throw "Current signed installer version check failed."
+          }
+
+  publish:
+    name: Publish signed catalog last
+    needs:
+      - metadata
+      - sign
+      - release-gate
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      CATALOG_TOKEN: ${{ secrets.LDGR_CATALOG_REPOSITORY_TOKEN }}
+    steps:
+      - name: Checkout catalog repository
+        uses: actions/checkout@v4
+        with:
+          repository: hydra-dynamix/ldgr-releases
+          token: ${{ env.CATALOG_TOKEN }}
+          path: catalog-repository
+      - name: Download signed candidate
+        uses: actions/download-artifact@v4
+        with:
+          name: signed-release-candidate
+          path: candidate
+      - name: Verify staged release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.metadata.outputs.version }}"
+          assets="$(gh release view "v${version}" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')"
+          for platform in linux-x86_64 linux-aarch64 macos-x86_64 macos-aarch64 windows-x86_64; do
+            archive="ldgr-core-${version}-${platform}.tar.gz"
+            grep -Fx "$archive" <<<"$assets"
+            grep -Fx "$archive.sha256" <<<"$assets"
+            grep -Fx "$archive.sig" <<<"$assets"
+            (cd candidate && sha256sum -c "dist/$archive.sha256")
+            test -s "candidate/dist/$archive.sig"
+          done
+      - name: Finalize GitHub release metadata
+        shell: bash
+        run: |
+          args=(--draft=false)
+          if [[ "${{ needs.metadata.outputs.prerelease }}" == "true" ]]; then args+=(--prerelease); else args+=(--latest); fi
+          gh release edit "v${{ needs.metadata.outputs.version }}" "${args[@]}"
+      - name: Publish signed Core catalog
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp candidate/candidate/core-index.json catalog-repository/core-index.json
+          cp candidate/candidate/core-index.json.sig catalog-repository/core-index.json.sig
+          cd catalog-repository
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add core-index.json core-index.json.sig
+          git diff --cached --check
+          git commit -m "release(core): publish v${{ needs.metadata.outputs.version }}"
+          git push origin HEAD:main

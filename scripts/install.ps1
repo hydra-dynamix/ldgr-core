@@ -146,6 +146,96 @@ function Add-InstallDirectoryToUserPath {
     return $true
 }
 
+function Copy-InstallerSource {
+    param(
+        [Parameter(Mandatory = $true)][string]$Source,
+        [Parameter(Mandatory = $true)][string]$Destination,
+        [switch]$Offline
+    )
+    $uri = [Uri]$Source
+    if ($uri.IsFile) {
+        Copy-Item -LiteralPath $uri.LocalPath -Destination $Destination -Force
+        return
+    }
+    if ($uri.Scheme -ne "https") {
+        throw "Installer sources must use HTTPS or file://: $Source"
+    }
+    if ($Offline) {
+        throw "Offline installation requires file:// sources."
+    }
+    Add-Type -AssemblyName System.Net.Http
+    $handler = [System.Net.Http.HttpClientHandler]::new()
+    $handler.AllowAutoRedirect = $false
+    $client = [System.Net.Http.HttpClient]::new($handler)
+    try {
+        $current = $uri
+        for ($redirects = 0; $redirects -le 10; $redirects++) {
+            $response = $client.GetAsync(
+                $current,
+                [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead
+            ).GetAwaiter().GetResult()
+            try {
+                $status = [int]$response.StatusCode
+                if ($status -ge 300 -and $status -lt 400) {
+                    $location = $response.Headers.Location
+                    if (-not $location) {
+                        throw "HTTPS redirect omitted Location: $current"
+                    }
+                    $current = [Uri]::new($current, $location)
+                    if ($current.Scheme -ne "https") {
+                        throw "Installer redirects must remain HTTPS: $current"
+                    }
+                    continue
+                }
+                $response.EnsureSuccessStatusCode() | Out-Null
+                $inputStream = $response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
+                $outputStream = [System.IO.File]::Create($Destination)
+                try {
+                    $inputStream.CopyTo($outputStream)
+                } finally {
+                    $outputStream.Dispose()
+                    $inputStream.Dispose()
+                }
+                return
+            } finally {
+                $response.Dispose()
+            }
+        }
+        throw "Installer source exceeded the HTTPS redirect limit: $Source"
+    } finally {
+        $client.Dispose()
+        $handler.Dispose()
+    }
+}
+
+function Resolve-PythonCommand {
+    foreach ($name in @("python3", "python", "py")) {
+        $command = Get-Command $name -CommandType Application -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        if ($command) {
+            return $command.Source
+        }
+    }
+    throw "The signed Core installer requires Python 3."
+}
+
+function Invoke-CatalogHelper {
+    param(
+        [Parameter(Mandatory = $true)][string]$Python,
+        [Parameter(Mandatory = $true)][string]$Helper,
+        [Parameter(Mandatory = $true)][string[]]$Arguments
+    )
+    $prefix = if ([System.IO.Path]::GetFileNameWithoutExtension($Python) -eq "py") {
+        @("-3")
+    } else {
+        @()
+    }
+    & $Python @prefix $Helper @Arguments
+    if ($LASTEXITCODE -ne 0) {
+        throw "Signed Core catalog verification failed."
+    }
+}
+
 $InstallDirectory = Resolve-InstallDirectory
 $Version = $env:LDGR_VERSION
 $Platform = "windows-x86_64"
@@ -156,45 +246,70 @@ if (-not [Environment]::Is64BitOperatingSystem) {
     throw "ldgr requires 64-bit Windows."
 }
 
-if (-not $Version) {
-    # Windows PowerShell 5.1 can preserve a multi-item REST response as one
-    # nested object, so ask GitHub for exactly one release.
-    $release = Invoke-RestMethod `
-        -Uri "https://api.github.com/repos/$Repository/releases?per_page=1" `
-        -Headers @{ Accept = "application/vnd.github+json" }
-    $tagName = @($release.tag_name)[0]
-    if ($tagName) {
-        $Version = $tagName -replace "^v", ""
-    }
-}
-
-if (-not $Version) {
-    throw "Could not resolve the latest $Repository release."
-}
-
-$archiveName = "ldgr-core-$Version-$Platform.tar.gz"
-$releaseBase = if ($env:LDGR_RELEASE_BASE_URL) {
-    $env:LDGR_RELEASE_BASE_URL.TrimEnd("/")
+$catalogSource = if ($env:LDGR_CORE_UPDATE_INDEX) {
+    $env:LDGR_CORE_UPDATE_INDEX
 } else {
-    "https://github.com/$Repository/releases/download"
+    "https://raw.githubusercontent.com/hydra-dynamix/ldgr-releases/main/core-index.json"
 }
-$downloadBase = "$releaseBase/v$Version/$archiveName"
+$helperSource = if ($env:LDGR_CORE_CATALOG_HELPER) {
+    $env:LDGR_CORE_CATALOG_HELPER
+} else {
+    "https://raw.githubusercontent.com/$Repository/main/scripts/core-catalog.py"
+}
+$offline = $env:LDGR_INSTALL_OFFLINE -eq "1"
 $temporaryDirectory = Join-Path ([System.IO.Path]::GetTempPath()) "ldgr-install-$([guid]::NewGuid())"
 
 try {
     New-Item -ItemType Directory -Path $temporaryDirectory | Out-Null
+    $python = Resolve-PythonCommand
+    $helperPath = Join-Path $temporaryDirectory "core-catalog.py"
+    $catalogPath = Join-Path $temporaryDirectory "core-index.json"
+    $catalogSignaturePath = "$catalogPath.sig"
+    $keyringPath = Join-Path $temporaryDirectory "release-keyring.json"
+    $resolvedPath = Join-Path $temporaryDirectory "resolved.json"
+    Copy-InstallerSource -Source $helperSource -Destination $helperPath -Offline:$offline
+    Copy-InstallerSource -Source $catalogSource -Destination $catalogPath -Offline:$offline
+    Copy-InstallerSource -Source "$catalogSource.sig" -Destination $catalogSignaturePath -Offline:$offline
+    if ($env:LDGR_CORE_RELEASE_KEYRING) {
+        Copy-InstallerSource -Source $env:LDGR_CORE_RELEASE_KEYRING -Destination $keyringPath -Offline:$offline
+    } else {
+        [System.IO.File]::WriteAllText(
+            $keyringPath,
+            '{"keys":[{"key_id":"ldgr-release-2026-01","public_key":"3wI34tu3PrqWp6VdNrNsFfX1W5PWSeQ3vsR04B69d+I="}]}'
+        )
+    }
+    $resolveArgs = @(
+        "resolve", "--catalog", $catalogPath,
+        "--signature", $catalogSignaturePath,
+        "--keyring", $keyringPath,
+        "--platform", $Platform,
+        "--output", $resolvedPath
+    )
+    if ($Version) { $resolveArgs += @("--version", $Version) }
+    if ($env:LDGR_PRERELEASE -eq "1") { $resolveArgs += "--prerelease" }
+    if ($offline) { $resolveArgs += "--offline" }
+    Invoke-CatalogHelper -Python $python -Helper $helperPath -Arguments $resolveArgs
+    $resolvedRelease = Get-Content -Raw -LiteralPath $resolvedPath | ConvertFrom-Json
+    $Version = [string]$resolvedRelease.version
+    $expectedAgentctlVersion = [string]$resolvedRelease.agentctl.version
+    $downloadBase = [string]$resolvedRelease.platform.archive_url
+    $signatureUrl = [string]$resolvedRelease.platform.signature_url
+    $actualHash = [string]$resolvedRelease.platform.sha256
+    $signingKeyId = [string]$resolvedRelease.platform.signing_key_id
+    $archiveName = "ldgr-core-$Version-$Platform.tar.gz"
     $archivePath = Join-Path $temporaryDirectory $archiveName
     $checksumPath = "$archivePath.sha256"
+    $signaturePath = "$archivePath.sig"
 
-    Write-Host "Installing ldgr $Version for $Platform"
-    Invoke-WebRequest -UseBasicParsing -Uri $downloadBase -OutFile $archivePath
-    Invoke-WebRequest -UseBasicParsing -Uri "$downloadBase.sha256" -OutFile $checksumPath
-
-    $expectedHash = ((Get-Content -Raw $checksumPath).Trim() -split "\s+")[0].ToLowerInvariant()
-    $actualHash = (Get-FileHash -Algorithm SHA256 $archivePath).Hash.ToLowerInvariant()
-    if ($expectedHash -ne $actualHash) {
-        throw "Checksum mismatch for $archiveName."
-    }
+    Write-Host "Installing signed ldgr $Version for $Platform"
+    Copy-InstallerSource -Source $downloadBase -Destination $archivePath -Offline:$offline
+    Copy-InstallerSource -Source "$downloadBase.sha256" -Destination $checksumPath -Offline:$offline
+    Copy-InstallerSource -Source $signatureUrl -Destination $signaturePath -Offline:$offline
+    Invoke-CatalogHelper -Python $python -Helper $helperPath -Arguments @(
+        "verify-archive", "--resolved", $resolvedPath,
+        "--archive", $archivePath, "--checksum", $checksumPath,
+        "--signature", $signaturePath
+    )
 
     tar -xzf $archivePath -C $temporaryDirectory
     if ($LASTEXITCODE -ne 0) {
@@ -252,22 +367,17 @@ try {
         throw "Installed Core version validation failed: expected ldgr $Version; got $coreVersionOutput."
     }
     $agentctlVersionOutput = (& $agentctlDestination --version).Trim()
-    if ($LASTEXITCODE -ne 0 -or $agentctlVersionOutput -notmatch '^agentctl\s+(.+)$') {
-        throw "Installed agentctl version validation failed: $agentctlVersionOutput."
+    if ($LASTEXITCODE -ne 0 -or
+        $agentctlVersionOutput -ne "agentctl $expectedAgentctlVersion") {
+        throw "Installed agentctl version validation failed: expected agentctl $expectedAgentctlVersion; got $agentctlVersionOutput."
     }
-    $agentctlVersion = $Matches[1]
-    & $destination compatibility --agentctl-version $agentctlVersion --json
+    & $destination compatibility --agentctl-version $expectedAgentctlVersion --json
     if ($LASTEXITCODE -ne 0) {
         throw "Installed Core/agentctl compatibility validation failed."
     }
     $homeDirectory = if ($env:USERPROFILE) { $env:USERPROFILE } else { $env:HOME }
     if (-not $homeDirectory) {
         throw "Could not determine the user home for the Core installation receipt."
-    }
-    $signingKeyId = if ($env:LDGR_SIGNING_KEY_ID) {
-        $env:LDGR_SIGNING_KEY_ID
-    } else {
-        "ldgr-release-2026-01"
     }
     $receiptArgs = @(
         "__record-core-installation",

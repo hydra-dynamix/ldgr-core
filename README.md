@@ -33,15 +33,19 @@ On native Windows, run this from PowerShell:
 irm https://raw.githubusercontent.com/hydra-dynamix/ldgr-core/main/scripts/install.ps1 | iex
 ```
 
-The installer detects the current OS/CPU, downloads the matching release archive,
-verifies its SHA-256 checksum when checksum tooling is available, and installs
-`ldgr` to `~/.local/bin` by default. Override with:
+The installer requires Python 3, verifies the signed Core catalog with an
+embedded Ed25519 trust root, checks the archive checksum and detached signature,
+binds RELEASE-METADATA.json, and installs paired `ldgr` and `agentctl`.
+It installs to `~/.local/bin` by default. Override with:
 
 ```sh
 LDGR_VERSION=0.1.9 LDGR_INSTALL_DIR="$HOME/bin" sh -c "$(curl -fsSL https://raw.githubusercontent.com/hydra-dynamix/ldgr-core/main/scripts/install.sh)"
 ```
 
 Source install remains available:
+Key rotation, release ordering, mirrors, and air-gapped installer inputs are
+documented in [docs/release-signing.md](docs/release-signing.md).
+
 
 ```sh
 cargo install --git https://github.com/hydra-dynamix/ldgr-core --locked --force --package ldgr-core
