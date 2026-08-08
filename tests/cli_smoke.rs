@@ -1222,14 +1222,43 @@ fn update_help_and_command_map_expose_the_public_check_surface() -> anyhow::Resu
 }
 
 #[test]
-fn noninteractive_normal_command_does_not_schedule_a_startup_worker() -> anyhow::Result<()> {
+fn noninteractive_normal_command_schedules_a_due_startup_worker_without_notice(
+) -> anyhow::Result<()> {
     let project = TempDir::new()?;
+    let adapter_fixture = write_update_check_fixture(project.path())?;
+    let (core_index, core_keyring, _) = write_core_update_check_fixture(project.path())?;
     let home = project.path().join(".ldgr/test-empty-home");
+    let state_path = home.join(".ldgr/update-state.json");
+    let lock_path = home.join(".ldgr/updates/update.lock");
+
     let mut command = isolated_command(project.path())?;
-    command.arg("workflow");
-    command.assert().success();
-    assert!(!home.join(".ldgr/update-state.json").exists());
-    assert!(!home.join(".ldgr/updates/update.lock").exists());
+    command
+        .env_remove("LDGR_NO_UPDATE_CHECK")
+        .env("LDGR_ADAPTER_INDEX", &adapter_fixture.index)
+        .env("LDGR_ADAPTER_RELEASE_KEYRING", &adapter_fixture.keyring)
+        .env("LDGR_CORE_UPDATE_INDEX", &core_index)
+        .env("LDGR_CORE_RELEASE_KEYRING", &core_keyring)
+        .arg("workflow");
+    command
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while (!state_path.is_file() || lock_path.exists()) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        state_path.is_file(),
+        "detached worker did not write update state"
+    );
+    assert!(
+        !lock_path.exists(),
+        "detached worker did not release its lock"
+    );
+    let state: serde_json::Value = serde_json::from_slice(&fs::read(&state_path)?)?;
+    assert_eq!(state["schema_version"], 1);
+    assert!(!project.path().join(".ldgr/ldgr.db").exists());
     Ok(())
 }
 
@@ -6369,6 +6398,7 @@ fn isolated_command(project: &Path) -> anyhow::Result<Command> {
             project.join(".ldgr/test-empty-adapters"),
         )
         .env("LDGR_HOME", project.join(".ldgr/test-empty-ldgr-home"))
+        .env("LDGR_NO_UPDATE_CHECK", "1")
         .env("LOCALAPPDATA", project.join(".ldgr/test-state"))
         .env("XDG_STATE_HOME", project.join(".ldgr/test-state"))
         .env("HOME", project.join(".ldgr/test-empty-home"));

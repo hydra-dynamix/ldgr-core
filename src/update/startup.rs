@@ -32,13 +32,10 @@ const WORKER_HANDOFF_RETRY: Duration = Duration::from_millis(25);
 /// best-effort: no local-state or process-spawn failure can affect the
 /// foreground command.
 pub fn maybe_schedule_update_check() {
-    if !foreground_is_interactive() {
-        return;
-    }
-    let _ = try_schedule_update_check();
+    let _ = try_schedule_update_check(foreground_is_interactive());
 }
 
-fn try_schedule_update_check() -> Result<()> {
+fn try_schedule_update_check(show_notice: bool) -> Result<()> {
     if recursion_guarded() || process_update_check_disabled() {
         return Ok(());
     }
@@ -56,7 +53,11 @@ fn try_schedule_update_check() -> Result<()> {
         Err(error) => return Err(error),
     };
     let now = now_ms()?;
-    let notice = claim_cached_notice(&store, cache, &config, now)?;
+    let notice = if show_notice {
+        claim_cached_notice(&store, cache, &config, now)?
+    } else {
+        None
+    };
     let due = store
         .load_cache()?
         .as_ref()
