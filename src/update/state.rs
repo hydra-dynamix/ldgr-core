@@ -11,6 +11,8 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use super::plan::UpdatePlan;
+
 pub const SCHEMA_VERSION: u32 = 1;
 pub const MAX_STATE_BYTES: u64 = 1024 * 1024;
 pub const MAX_HISTORY: usize = 32;
@@ -496,6 +498,69 @@ impl UpdateStateStore {
         Ok(plan_id)
     }
 
+    pub(crate) fn stage_update_plan(
+        &self,
+        lock: &UpdateLock,
+        plan: &UpdatePlan,
+    ) -> anyhow::Result<String> {
+        self.verify_lock(lock)?;
+        plan.verify_plan_id()?;
+        let plan_id = plan.plan_id().to_owned();
+        if let Some(bound) = lock.record.plan_id.as_deref() {
+            ensure!(
+                bound == plan_id,
+                "update lock plan id does not match resolved plan"
+            );
+        }
+        let directory = self.stage_dir(&plan_id)?;
+        secure_dir(&directory, "update staging plan directory")?;
+        sync_parent(&directory)?;
+        let plan_path = directory.join(PLAN);
+        if plan_path.exists() {
+            let existing: PlanEnvelope<UpdatePlan> =
+                read_json(&plan_path, "staged resolved update plan")?;
+            schema(existing.schema_version, "staged resolved update plan")?;
+            ensure!(
+                existing.plan_id == plan_id && existing.plan == *plan,
+                "staged resolved plan changed for deterministic plan id"
+            );
+            existing.plan.verify_plan_id()?;
+        } else {
+            atomic_json(
+                &plan_path,
+                &PlanEnvelope {
+                    schema_version: SCHEMA_VERSION,
+                    plan_id: plan_id.clone(),
+                    plan,
+                },
+            )?;
+        }
+        let state_path = directory.join(STATE);
+        if state_path.exists() {
+            ensure!(
+                self.load_staging_state(&plan_id)?.phase == StagingPhase::Staged,
+                "staged resolved plan is no longer resumable"
+            );
+        } else {
+            let now = now_ms()?;
+            atomic_json(
+                &state_path,
+                &StagingState {
+                    schema_version: SCHEMA_VERSION,
+                    plan_id: plan_id.clone(),
+                    mode: lock.record.mode,
+                    phase: StagingPhase::Staged,
+                    created_at_unix_ms: now,
+                    updated_at_unix_ms: now,
+                    internal_token: token()?,
+                    components: Vec::new(),
+                    error: None,
+                },
+            )?;
+        }
+        Ok(plan_id)
+    }
+
     pub fn load_staged_plan<T: DeserializeOwned + Serialize>(
         &self,
         plan_id: &str,
@@ -512,6 +577,23 @@ impl UpdateStateStore {
             deterministic_plan_id(&envelope.plan)? == plan_id,
             "staged plan digest mismatch"
         );
+        Ok(envelope)
+    }
+
+    pub fn load_staged_update_plan(
+        &self,
+        plan_id: &str,
+    ) -> anyhow::Result<PlanEnvelope<UpdatePlan>> {
+        let directory = self.stage_dir(plan_id)?;
+        verify_dir(&directory, "update staging plan directory")?;
+        let envelope: PlanEnvelope<UpdatePlan> =
+            read_json(&directory.join(PLAN), "staged resolved update plan")?;
+        schema(envelope.schema_version, "staged resolved update plan")?;
+        ensure!(
+            envelope.plan_id == plan_id && envelope.plan.plan_id() == plan_id,
+            "staged resolved plan id does not match its directory"
+        );
+        envelope.plan.verify_plan_id()?;
         Ok(envelope)
     }
 
@@ -655,7 +737,7 @@ impl UpdateStateStore {
         boundary(&self.home, &self.history)
     }
 
-    fn stage_dir(&self, plan_id: &str) -> anyhow::Result<PathBuf> {
+    pub(crate) fn stage_dir(&self, plan_id: &str) -> anyhow::Result<PathBuf> {
         validate_id(plan_id)?;
         let path = self.staging.join(plan_id);
         boundary(&self.staging, &path)?;
@@ -1039,7 +1121,7 @@ fn read_json<T: DeserializeOwned>(path: &Path, label: &str) -> anyhow::Result<T>
     serde_json::from_slice(&bytes).with_context(|| format!("failed to parse {label}"))
 }
 
-fn atomic_json<T: Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
+pub(crate) fn atomic_json<T: Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
     atomic_json_fault(path, value, WriteFault::None)
 }
 

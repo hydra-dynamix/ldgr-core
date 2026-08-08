@@ -1506,7 +1506,7 @@ fn activate_bundle_atomically(extracted: &Path, install_root: &Path) -> anyhow::
     })
 }
 
-fn typed_harness_resource_plan(
+pub(crate) fn typed_harness_resource_plan(
     bundle: &Path,
     home: &Path,
     manifest_path: &str,
@@ -2111,13 +2111,13 @@ pub(crate) fn apply_source_adapter_update(
 }
 
 #[derive(Debug)]
-struct SourceHarnessResource {
-    source: PathBuf,
-    target: PathBuf,
-    root: PathBuf,
+pub(crate) struct SourceHarnessResource {
+    pub(crate) source: PathBuf,
+    pub(crate) target: PathBuf,
+    pub(crate) root: PathBuf,
 }
 
-fn source_harness_resource_plan(
+pub(crate) fn source_harness_resource_plan(
     install_root: &Path,
     home: &Path,
 ) -> anyhow::Result<Vec<SourceHarnessResource>> {
@@ -2190,7 +2190,7 @@ fn install_source_harness_resources(plan: &[SourceHarnessResource]) -> anyhow::R
     Ok(())
 }
 
-fn source_allowed_resource_roots(home: &Path) -> anyhow::Result<Vec<PathBuf>> {
+pub(crate) fn source_allowed_resource_roots(home: &Path) -> anyhow::Result<Vec<PathBuf>> {
     let config = read_ldgr_harness_config(home);
     let mut roots = configured_prompt_dirs(home, &config);
     roots.extend(configured_skill_dirs(home, &config));
@@ -2455,7 +2455,7 @@ fn verify_source_identity_paths(
     Ok(())
 }
 
-fn validate_adapter_bundle_contract(bundle: &Path, adapter: &str) -> anyhow::Result<()> {
+pub(crate) fn validate_adapter_bundle_contract(bundle: &Path, adapter: &str) -> anyhow::Result<()> {
     let manifest_path = bundle.join("adapter.toml");
     if manifest_path.is_file() {
         let manifest: toml::Value = toml::from_str(&fs::read_to_string(&manifest_path)?)

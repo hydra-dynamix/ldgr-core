@@ -1,5 +1,4 @@
 use std::fs;
-use std::io;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context};
@@ -12,6 +11,8 @@ use crate::release_index::{
     ResolvedAdapterRelease, SourceInstallationReceipt,
 };
 use crate::update::plan::AdapterInstallationKind;
+
+pub(crate) use crate::update::apply::InstallTransaction;
 
 #[derive(Debug)]
 pub(crate) struct AdapterInstallationInspection {
@@ -447,120 +448,6 @@ fn home_dir() -> anyhow::Result<PathBuf> {
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
         .ok_or_else(|| anyhow::anyhow!("could not determine home directory from HOME/USERPROFILE"))
-}
-
-#[derive(Debug)]
-struct InstallSnapshot {
-    target: PathBuf,
-    backup: PathBuf,
-    existed: bool,
-    was_dir: bool,
-}
-
-pub(crate) struct InstallTransaction {
-    backup_root: PathBuf,
-    snapshots: Vec<InstallSnapshot>,
-    committed: bool,
-}
-
-impl InstallTransaction {
-    pub(crate) fn new(backup_root: PathBuf) -> anyhow::Result<Self> {
-        fs::create_dir_all(&backup_root)?;
-        Ok(Self {
-            backup_root,
-            snapshots: Vec::new(),
-            committed: false,
-        })
-    }
-
-    pub(crate) fn snapshot(&mut self, target: &Path) -> anyhow::Result<()> {
-        if self
-            .snapshots
-            .iter()
-            .any(|snapshot| snapshot.target == target)
-        {
-            return Ok(());
-        }
-        let backup = self.backup_root.join(self.snapshots.len().to_string());
-        let existed = target.exists();
-        let was_dir = target.is_dir();
-        if existed {
-            if was_dir {
-                copy_dir_recursive(target, &backup)?;
-            } else {
-                if let Some(parent) = backup.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                fs::copy(target, &backup)?;
-            }
-        }
-        self.snapshots.push(InstallSnapshot {
-            target: target.to_path_buf(),
-            backup,
-            existed,
-            was_dir,
-        });
-        Ok(())
-    }
-
-    pub(crate) fn commit(mut self) -> anyhow::Result<()> {
-        self.committed = true;
-        fs::remove_dir_all(&self.backup_root).or_else(|error| {
-            (error.kind() == io::ErrorKind::NotFound)
-                .then_some(())
-                .ok_or(error)
-        })?;
-        Ok(())
-    }
-
-    fn rollback(&self) -> anyhow::Result<()> {
-        for snapshot in self.snapshots.iter().rev() {
-            remove_path_if_exists(&snapshot.target)?;
-            if snapshot.existed {
-                if snapshot.was_dir {
-                    copy_dir_recursive(&snapshot.backup, &snapshot.target)?;
-                } else {
-                    if let Some(parent) = snapshot.target.parent() {
-                        fs::create_dir_all(parent)?;
-                    }
-                    fs::copy(&snapshot.backup, &snapshot.target)?;
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
-impl Drop for InstallTransaction {
-    fn drop(&mut self) {
-        if !self.committed {
-            let _ = self.rollback();
-        }
-    }
-}
-
-fn remove_path_if_exists(path: &Path) -> anyhow::Result<()> {
-    if path.is_dir() {
-        fs::remove_dir_all(path)?;
-    } else if path.exists() {
-        fs::remove_file(path)?;
-    }
-    Ok(())
-}
-
-fn copy_dir_recursive(source: &Path, destination: &Path) -> anyhow::Result<()> {
-    fs::create_dir_all(destination)?;
-    for entry in fs::read_dir(source)? {
-        let entry = entry?;
-        let source_path = entry.path();
-        let destination_path = destination.join(entry.file_name());
-        if source_path.is_dir() {
-            copy_dir_recursive(&source_path, &destination_path)?;
-        } else {
-            fs::copy(source_path, destination_path)?;
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]

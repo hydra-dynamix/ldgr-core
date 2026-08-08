@@ -1,4 +1,5 @@
 pub(crate) mod adapter;
+pub mod apply;
 pub mod catalog;
 pub mod installation;
 pub mod network;

@@ -108,6 +108,7 @@ pub enum CoreCatalogFetch {
 pub struct VerifiedAdapterUpdateCatalog {
     pub catalog: AdapterReleaseIndex,
     pub catalog_signing_key_id: String,
+    pub archive_keyring: ReleaseKeyring,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -263,6 +264,7 @@ pub fn verify_signed_adapter_update_catalog(
     Ok(VerifiedAdapterUpdateCatalog {
         catalog,
         catalog_signing_key_id: signature.key_id,
+        archive_keyring: trusted_keyring.clone(),
     })
 }
 
