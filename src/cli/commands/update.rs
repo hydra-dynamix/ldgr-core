@@ -1,5 +1,6 @@
+use std::collections::BTreeMap;
 use std::env;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -11,10 +12,13 @@ use crate::adapter_registry::AdapterRegistry;
 use crate::cli::args::UpdateArgs;
 use crate::harness_config::UpdateChannel;
 use crate::release_index::{AdapterReleaseIndex, ReleaseKeyring};
+use crate::update::apply::{
+    stage_verified_update_plan, PlanStagingOwnership, StagedUpdatePlan, VerifiedStagingCatalogs,
+};
 use crate::update::catalog::{
     fetch_signed_adapter_update_catalog, fetch_signed_core_update_catalog, AdapterCatalogFetch,
     AdapterCatalogSources, CoreCatalogFetch, CoreCatalogSources, CoreUpdateCatalog,
-    VerifiedCoreUpdateCatalog,
+    VerifiedAdapterUpdateCatalog, VerifiedCoreUpdateCatalog,
 };
 use crate::update::installation::{
     resolve_current_core_installation, CoreInstallationOwnership, LegacyAdoptionAuthorization,
@@ -24,22 +28,30 @@ use crate::update::network::UpdateNetworkClient;
 use crate::update::plan::{
     build_update_plan, AdapterInstallationKind, AdapterInstallationSnapshot, AdapterOrigin,
     CoreInstallationSnapshot, CorePlanOwnership, UpdateAction, UpdateComponentKind,
-    UpdateInventory, UpdatePlan, UpdatePlanRequest, UpdateResult, UpdateResultStatus,
-    VerifiedCatalogSnapshots,
+    UpdateInventory, UpdatePlan, UpdatePlanRequest, UpdateResult, UpdateResultMode,
+    UpdateResultStatus, VerifiedCatalogSnapshots,
 };
 use crate::update::state::{
-    CachedCheckResult, UpdateCache, UpdateLock, UpdateMode, UpdateStateStore, SCHEMA_VERSION,
+    CachedCheckResult, ComponentResult, TerminalError, TerminalOutcome, UpdateCache, UpdateLock,
+    UpdateMode, UpdateStateStore, SCHEMA_VERSION,
 };
 
 const CHECK_LOCK_LEASE: Duration = Duration::from_secs(30);
+const APPLY_LOCK_LEASE: Duration = Duration::from_secs(60 * 60);
 
 pub fn handle_update(args: UpdateArgs) -> anyhow::Result<()> {
-    if !args.check {
-        bail!(
-            "update.apply-unavailable: update application is not enabled until verified staging and rollback are available; run `ldgr update --check`"
-        );
+    if args.check {
+        return handle_check(args);
     }
-    handle_check(args)
+    handle_apply(args)
+}
+
+struct ResolvedUpdate {
+    plan: UpdatePlan,
+    core_etag: Option<String>,
+    core_catalog: VerifiedCoreUpdateCatalog,
+    adapter_catalog: VerifiedAdapterUpdateCatalog,
+    ownership: PlanStagingOwnership,
 }
 
 fn handle_check(args: UpdateArgs) -> anyhow::Result<()> {
@@ -62,6 +74,139 @@ fn handle_check(args: UpdateArgs) -> anyhow::Result<()> {
         bail!("update.no-compatible-release: the resolved update plan is blocked");
     }
     Ok(())
+}
+
+fn handle_apply(args: UpdateArgs) -> anyhow::Result<()> {
+    let home = user_home()?;
+    let state = UpdateStateStore::open(home.join(".ldgr"))?;
+    let previous_cache = state.load_cache()?;
+    let lock = state.acquire_lock(UpdateMode::Apply, None, APPLY_LOCK_LEASE)?;
+    let resolved = match resolve_update(&args, &home) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            lock.release()?;
+            return Err(error);
+        }
+    };
+    state.write_cache(&success_cache(
+        previous_cache.as_ref(),
+        &resolved.plan,
+        resolved.core_etag.clone(),
+    )?)?;
+
+    if resolved.plan.blocked() {
+        let result = apply_result(&resolved.plan, UpdateResultStatus::Blocked, &[]);
+        render_result(&result, args.json)?;
+        lock.release()?;
+        bail!("update.no-compatible-release: the resolved update plan is blocked");
+    }
+    if resolved.plan.components().iter().any(|component| {
+        component.kind() == UpdateComponentKind::CoreBundle
+            && component.action() == UpdateAction::Update
+    }) {
+        lock.release()?;
+        bail!(
+            "update.apply-platform-unavailable: this build cannot yet activate a selected Core/agentctl bundle; use `--adapters-only` to apply adapter updates"
+        );
+    }
+    if !resolved.plan.update_available() {
+        let result = apply_result(&resolved.plan, UpdateResultStatus::Current, &[]);
+        render_result(&result, args.json)?;
+        lock.release()?;
+        return Ok(());
+    }
+
+    confirm_application(&args, &resolved.plan)?;
+    let client = UpdateNetworkClient::new(args.offline)?;
+    let catalogs = VerifiedStagingCatalogs {
+        core: &resolved.core_catalog,
+        adapters: &resolved.adapter_catalog,
+    };
+    let staged = match stage_verified_update_plan(
+        &state,
+        &lock,
+        &client,
+        &resolved.plan,
+        &catalogs,
+        &resolved.ownership,
+    ) {
+        Ok(staged) => staged,
+        Err(error) => {
+            let components = failed_component_results(&resolved.plan);
+            if state.load_staging_state(resolved.plan.plan_id()).is_ok() {
+                state.complete_plan(
+                    &lock,
+                    resolved.plan.plan_id(),
+                    TerminalOutcome::Failed,
+                    components.clone(),
+                    Some(TerminalError {
+                        code: "update.staging-failed".to_owned(),
+                        summary: format!("{error:#}"),
+                    }),
+                )?;
+            }
+            let result = apply_result(&resolved.plan, UpdateResultStatus::Failed, &components);
+            render_result(&result, args.json)?;
+            lock.release()?;
+            return Err(anyhow::anyhow!("update.staging-failed: {error:#}"));
+        }
+    };
+    state.mark_applying(&lock, resolved.plan.plan_id())?;
+    let StagedUpdatePlan {
+        manifest,
+        mut transaction,
+    } = staged;
+    match crate::update::adapter::apply_staged_adapter_updates(
+        &resolved.plan,
+        &manifest,
+        &resolved.adapter_catalog,
+        &resolved.ownership,
+        &mut transaction,
+        args.json,
+    ) {
+        Ok(components) => {
+            transaction.commit()?;
+            state.complete_plan(
+                &lock,
+                resolved.plan.plan_id(),
+                TerminalOutcome::Applied,
+                components.clone(),
+                None,
+            )?;
+            state.write_cache(&current_cache(
+                previous_cache.as_ref(),
+                resolved.core_etag.clone(),
+            )?)?;
+            let result = apply_result(&resolved.plan, UpdateResultStatus::Applied, &components);
+            render_result(&result, args.json)?;
+            lock.release()?;
+            Ok(())
+        }
+        Err(failure) => {
+            drop(transaction);
+            state.complete_plan(
+                &lock,
+                resolved.plan.plan_id(),
+                TerminalOutcome::RolledBack,
+                failure.components.clone(),
+                Some(TerminalError {
+                    code: "update.activation-failed".to_owned(),
+                    summary: format!("{:#}", failure.source),
+                }),
+            )?;
+            let result = apply_result(
+                &resolved.plan,
+                UpdateResultStatus::Failed,
+                &failure.components,
+            );
+            render_result(&result, args.json)?;
+            lock.release()?;
+            Err(anyhow::anyhow!(
+                "update.activation-failed: {:#}",
+                failure.source
+            ))
+        }
+    }
 }
 
 pub fn handle_startup_check_worker(owner_token: &str) -> anyhow::Result<()> {
@@ -96,8 +241,8 @@ fn run_check(
     lock: UpdateLock,
     failure_summary: &str,
 ) -> anyhow::Result<UpdatePlan> {
-    let resolved = resolve_check(args, home);
-    let (plan, core_etag) = match resolved {
+    let resolved = resolve_update(args, home);
+    let resolved = match resolved {
         Ok(value) => value,
         Err(error) => {
             let code = stable_error_code(&error);
@@ -109,12 +254,16 @@ fn run_check(
             return Err(error);
         }
     };
-    state.write_cache(&success_cache(previous_cache, &plan, core_etag)?)?;
+    state.write_cache(&success_cache(
+        previous_cache,
+        &resolved.plan,
+        resolved.core_etag,
+    )?)?;
     lock.release()?;
-    Ok(plan)
+    Ok(resolved.plan)
 }
 
-fn resolve_check(args: &UpdateArgs, home: &Path) -> anyhow::Result<(UpdatePlan, Option<String>)> {
+fn resolve_update(args: &UpdateArgs, home: &Path) -> anyhow::Result<ResolvedUpdate> {
     let request = UpdatePlanRequest {
         core_only: args.core_only,
         adapters_only: args.adapters_only,
@@ -126,7 +275,7 @@ fn resolve_check(args: &UpdateArgs, home: &Path) -> anyhow::Result<(UpdatePlan, 
         },
         offline: args.offline,
     };
-    let inventory = inspect_inventory(home, args.yes)
+    let (inventory, ownership) = inspect_inventory(home, args.yes)
         .context("update.unmanaged-installation: failed to inspect installed ownership")?;
     let client = UpdateNetworkClient::new(args.offline)?;
     let include_core = args.core_only || (!args.adapters_only && args.adapters.is_empty());
@@ -146,16 +295,13 @@ fn resolve_check(args: &UpdateArgs, home: &Path) -> anyhow::Result<(UpdatePlan, 
     let adapter_catalog = if adapter_catalog_required(args, &inventory) {
         let sources = AdapterCatalogSources::configured(args.offline).map_err(catalog_error)?;
         match fetch_signed_adapter_update_catalog(&client, &sources, None).map_err(catalog_error)? {
-            AdapterCatalogFetch::Modified { verified, .. } => verified.catalog,
+            AdapterCatalogFetch::Modified { verified, .. } => verified,
             AdapterCatalogFetch::NotModified { .. } => {
                 bail!("update.catalog-unavailable: adapter catalog returned not-modified without a cached snapshot")
             }
         }
     } else {
-        AdapterReleaseIndex {
-            schema_version: 1,
-            adapters: Vec::new(),
-        }
+        empty_adapter_catalog()
     };
     let platform = platform_tag()?;
     let updater_version = Version::parse(env!("CARGO_PKG_VERSION"))?;
@@ -163,14 +309,20 @@ fn resolve_check(args: &UpdateArgs, home: &Path) -> anyhow::Result<(UpdatePlan, 
         &request,
         &VerifiedCatalogSnapshots {
             core: &core,
-            adapters: &adapter_catalog,
+            adapters: &adapter_catalog.catalog,
         },
         &inventory,
         &updater_version,
         &platform,
     )
     .context("update.no-compatible-release: failed to resolve a compatible update plan")?;
-    Ok((plan, core_etag))
+    Ok(ResolvedUpdate {
+        plan,
+        core_etag,
+        core_catalog: core,
+        adapter_catalog,
+        ownership,
+    })
 }
 
 fn empty_core_catalog() -> VerifiedCoreUpdateCatalog {
@@ -179,6 +331,17 @@ fn empty_core_catalog() -> VerifiedCoreUpdateCatalog {
             schema_version: 1,
             release_keys: Vec::new(),
             releases: Vec::new(),
+        },
+        catalog_signing_key_id: String::new(),
+        archive_keyring: ReleaseKeyring { keys: Vec::new() },
+    }
+}
+
+fn empty_adapter_catalog() -> VerifiedAdapterUpdateCatalog {
+    VerifiedAdapterUpdateCatalog {
+        catalog: AdapterReleaseIndex {
+            schema_version: 1,
+            adapters: Vec::new(),
         },
         catalog_signing_key_id: String::new(),
         archive_keyring: ReleaseKeyring { keys: Vec::new() },
@@ -197,9 +360,16 @@ fn adapter_catalog_required(args: &UpdateArgs, inventory: &UpdateInventory) -> b
     })
 }
 
-fn inspect_inventory(home: &Path, yes: bool) -> anyhow::Result<UpdateInventory> {
+fn inspect_inventory(
+    home: &Path,
+    yes: bool,
+) -> anyhow::Result<(UpdateInventory, PlanStagingOwnership)> {
     let ownership =
         resolve_current_core_installation(home, LegacyAdoptionConsent::NonInteractive { yes })?;
+    let core_receipt = match &ownership {
+        CoreInstallationOwnership::OfficialInstall(receipt) => Some(receipt.clone()),
+        _ => None,
+    };
     let core = core_snapshot(ownership);
     let registry = AdapterRegistry::discover();
     let mut discovery_warnings = registry
@@ -209,11 +379,30 @@ fn inspect_inventory(home: &Path, yes: bool) -> anyhow::Result<UpdateInventory> 
         .collect::<Vec<_>>();
     let roots = AdapterRoots::discover(home)?;
     let mut adapters = Vec::new();
+    let mut adapter_ownership = BTreeMap::new();
     for installed in &registry.adapters {
         let origin = roots.origin(&installed.root_path);
         let installation = if origin == AdapterOrigin::User {
-            match crate::update::adapter::snapshot_adapter_installation(installed, home) {
-                Ok(snapshot) => snapshot,
+            let Some(user_root) = roots.user_root(&installed.root_path) else {
+                discovery_warnings.push(format!(
+                    "adapter `{}` is not eligible: install root is not a direct child of the user adapter root",
+                    installed.slug
+                ));
+                adapters.push(AdapterInstallationSnapshot {
+                    slug: installed.slug.clone(),
+                    origin,
+                    installation: AdapterInstallationKind::Untracked {
+                        reason: "install root is outside its canonical user adapter boundary"
+                            .to_owned(),
+                    },
+                });
+                continue;
+            };
+            match crate::update::adapter::inspect_adapter_for_bulk(installed, home, user_root) {
+                Ok((snapshot, owned)) => {
+                    adapter_ownership.insert(installed.slug.clone(), owned);
+                    snapshot
+                }
                 Err(error) => {
                     let detail = format!("{error:#}");
                     let reason = if detail.contains("modified") {
@@ -241,11 +430,18 @@ fn inspect_inventory(home: &Path, yes: bool) -> anyhow::Result<UpdateInventory> 
             installation,
         });
     }
-    Ok(UpdateInventory {
-        core,
-        adapters,
-        discovery_warnings,
-    })
+    Ok((
+        UpdateInventory {
+            core,
+            adapters,
+            discovery_warnings,
+        },
+        PlanStagingOwnership {
+            home: home.to_path_buf(),
+            core: core_receipt,
+            adapters: adapter_ownership,
+        },
+    ))
 }
 
 fn core_snapshot(ownership: CoreInstallationOwnership) -> CoreInstallationSnapshot {
@@ -324,6 +520,14 @@ impl AdapterRoots {
         } else {
             AdapterOrigin::EnvironmentOverride
         }
+    }
+
+    fn user_root(&self, path: &Path) -> Option<&Path> {
+        let path = absolute_path(path).ok()?;
+        self.user
+            .iter()
+            .find(|root| path.parent().is_some_and(|parent| parent == root.as_path()))
+            .map(PathBuf::as_path)
     }
 }
 
@@ -425,6 +629,23 @@ fn failed_cache(
     })
 }
 
+fn current_cache(
+    previous: Option<&UpdateCache>,
+    catalog_etag: Option<String>,
+) -> anyhow::Result<UpdateCache> {
+    Ok(UpdateCache {
+        schema_version: SCHEMA_VERSION,
+        checked_at_unix_ms: now_ms()?,
+        result: CachedCheckResult::Current,
+        catalog_etag,
+        consecutive_failures: 0,
+        last_notice: previous.and_then(|cache| cache.last_notice.clone()),
+        notice_history: previous
+            .map(|cache| cache.notice_history.clone())
+            .unwrap_or_default(),
+    })
+}
+
 fn now_ms() -> anyhow::Result<u64> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -432,6 +653,91 @@ fn now_ms() -> anyhow::Result<u64> {
         .as_millis()
         .try_into()
         .context("update check timestamp overflow")
+}
+
+fn confirm_application(args: &UpdateArgs, plan: &UpdatePlan) -> anyhow::Result<()> {
+    if args.yes {
+        return Ok(());
+    }
+    let preview = apply_result(plan, UpdateResultStatus::UpdatesAvailable, &[]);
+    if !io::stdin().is_terminal() {
+        render_result(&preview, args.json)?;
+        bail!("update.confirmation-required: non-interactive update application requires `--yes`");
+    }
+    if !args.json {
+        render_result(&preview, false)?;
+    }
+    eprint!("Apply this update plan? [y/N] ");
+    io::stderr().flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+        if args.json {
+            render_result(&preview, true)?;
+        }
+        bail!("update.confirmation-declined: update plan was not applied");
+    }
+    Ok(())
+}
+
+fn apply_result(
+    plan: &UpdatePlan,
+    status: UpdateResultStatus,
+    terminal: &[ComponentResult],
+) -> UpdateResult {
+    let mut result = plan.check_result();
+    result.mode = UpdateResultMode::Apply;
+    result.status = status;
+    for component in &mut result.components {
+        if let Some(recorded) = terminal
+            .iter()
+            .find(|recorded| recorded.name == component.name)
+        {
+            component.action = action_from_status(&recorded.status);
+        }
+    }
+    result
+}
+
+fn action_from_status(status: &str) -> UpdateAction {
+    match status {
+        "none" => UpdateAction::None,
+        "update" => UpdateAction::Update,
+        "reinstall_local_source" => UpdateAction::ReinstallLocalSource,
+        "skip_unmanaged" => UpdateAction::SkipUnmanaged,
+        "blocked" => UpdateAction::Blocked,
+        "applied" => UpdateAction::Applied,
+        "rolled_back" => UpdateAction::RolledBack,
+        _ => UpdateAction::Failed,
+    }
+}
+
+fn failed_component_results(plan: &UpdatePlan) -> Vec<ComponentResult> {
+    plan.components()
+        .iter()
+        .filter(|component| component.kind() == UpdateComponentKind::Adapter)
+        .map(|component| ComponentResult {
+            kind: "adapter".to_owned(),
+            name: component.name().to_owned(),
+            status: if matches!(
+                component.action(),
+                UpdateAction::Update | UpdateAction::ReinstallLocalSource
+            ) {
+                "failed"
+            } else {
+                match component.action() {
+                    UpdateAction::None => "none",
+                    UpdateAction::SkipUnmanaged => "skip_unmanaged",
+                    UpdateAction::Blocked => "blocked",
+                    UpdateAction::Applied => "applied",
+                    UpdateAction::RolledBack => "rolled_back",
+                    UpdateAction::Failed => "failed",
+                    UpdateAction::Update | UpdateAction::ReinstallLocalSource => unreachable!(),
+                }
+            }
+            .to_owned(),
+        })
+        .collect()
 }
 
 fn render_result(result: &UpdateResult, json: bool) -> anyhow::Result<()> {
@@ -443,7 +749,8 @@ fn render_result(result: &UpdateResult, json: bool) -> anyhow::Result<()> {
         return Ok(());
     }
     println!(
-        "mode=check status={} current_core={} target_core={} platform={} channel={}",
+        "mode={} status={} current_core={} target_core={} platform={} channel={}",
+        json_name(&result.mode)?,
         json_name(&result.status)?,
         result.current_core,
         result.target_core,

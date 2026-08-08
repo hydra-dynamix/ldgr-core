@@ -1,8 +1,8 @@
 use clap::Args;
 
-const UPDATE_HELP: &str = "Examples:\n  ldgr update --check\n  ldgr update --check --json\n  ldgr update --check --core-only\n  ldgr update --check --adapters-only\n  ldgr update --check --adapter research --adapter conduct\n  ldgr update --check --prerelease\n  ldgr update --check --offline\n\nCheck mode authenticates configured catalogs and resolves one compatibility-bound plan. It never downloads release archives, runs installers, or changes installed components or project state.";
+const UPDATE_HELP: &str = "Examples:\n  ldgr update --check\n  ldgr update --check --json\n  ldgr update --adapters-only\n  ldgr update --adapters-only --yes\n  ldgr update --adapter research --adapter conduct\n  ldgr update --check --core-only\n  ldgr update --prerelease\n  ldgr update --offline\n\nCheck mode authenticates configured catalogs and resolves one compatibility-bound plan without downloading or mutating. Apply mode stages every selected adapter artifact before mutation and rolls back the whole adapter set on failure. Non-interactive apply requires --yes.";
 
-/// Check for compatible Core, agentctl, and adapter updates.
+/// Check for or apply compatible Core, agentctl, and adapter updates.
 #[derive(Clone, Debug, Args)]
 #[command(after_help = UPDATE_HELP)]
 pub struct UpdateArgs {
@@ -12,7 +12,7 @@ pub struct UpdateArgs {
     /// Emit exactly one schema-versioned JSON document on stdout.
     #[arg(long)]
     pub json: bool,
-    /// Approve safe legacy-install adoption when applying a future plan.
+    /// Confirm update application and safe legacy-install adoption without prompting.
     #[arg(long)]
     pub yes: bool,
     /// Select only the compatibility-bound Core and agentctl bundle.

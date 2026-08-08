@@ -705,7 +705,7 @@ fn reconcile_installed_adapters(home: &Path, requested: Option<&str>) -> anyhow:
                 remove_path_if_exists(&path)?;
             }
         }
-        install_typed_harness_resources(&desired_plan)?;
+        install_typed_harness_resources(&desired_plan, false)?;
         receipt.owned_resources = desired_targets
             .iter()
             .map(|path| {
@@ -865,7 +865,7 @@ fn reconcile_source_adapter(
             remove_path_if_exists(old)?;
         }
     }
-    install_source_harness_resources(&plan)?;
+    install_source_harness_resources(&plan, false)?;
     receipt.owned_resources = source_owned_resources(&plan)?;
     receipt.ownership.external_resource_roots = source_resource_roots(&plan)?;
     write_source_receipt_file(&adapter.root_path, &receipt)?;
@@ -1310,12 +1310,89 @@ pub(crate) fn stage_and_apply_resolved_index_release(
     for target in &resource_targets {
         transaction.snapshot(target)?;
     }
-    activate_bundle_atomically(&extracted, install_root)?;
+    apply_staged_resolved_index_release(
+        resolved,
+        &extracted,
+        install_root,
+        home,
+        transaction,
+        false,
+    )
+}
+
+pub(crate) fn apply_staged_resolved_index_release(
+    resolved: &crate::release_index::ResolvedAdapterRelease<'_>,
+    extracted: &Path,
+    install_root: &Path,
+    home: &Path,
+    transaction: &mut InstallTransaction,
+    quiet: bool,
+) -> anyhow::Result<()> {
+    validate_adapter_bundle_contract(extracted, &resolved.adapter.domain)?;
+    let binary_source = extracted
+        .join(&resolved.platform.platform)
+        .join(&resolved.platform.binary);
+    let previous_receipt = read_release_update_receipt(install_root, &resolved.adapter.domain)?;
+    let resource_plan =
+        typed_harness_resource_plan(extracted, home, &resolved.platform.resource_manifest)?;
+    let resource_targets = resource_plan
+        .iter()
+        .map(|(_, target)| target.clone())
+        .collect::<Vec<_>>();
+    let previously_owned = previous_receipt
+        .as_ref()
+        .map(|receipt| {
+            receipt
+                .owned_resources
+                .iter()
+                .map(|resource| PathBuf::from(&resource.path))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    for target in &resource_targets {
+        if target.exists() && !previously_owned.iter().any(|owned| owned == target) {
+            bail!(
+                "refusing to overwrite unowned harness resource {}; remove it or choose a different harness resource path",
+                target.display()
+            );
+        }
+        transaction.snapshot(target)?;
+    }
+    if let Some(previous) = &previous_receipt {
+        for resource in &previous.owned_resources {
+            transaction.snapshot(Path::new(&resource.path))?;
+        }
+    }
+    transaction.begin_activation()?;
+    if let Some(previous_binary) = previous_receipt
+        .as_ref()
+        .and_then(|receipt| receipt.binary_path.as_deref())
+    {
+        let desired_binary = binary_source
+            .is_file()
+            .then(|| home.join(".local/bin").join(&resolved.platform.binary));
+        if desired_binary
+            .as_ref()
+            .is_none_or(|desired| desired != Path::new(previous_binary))
+        {
+            remove_path_if_exists(Path::new(previous_binary))?;
+        }
+    }
+    if let Some(previous) = &previous_receipt {
+        for resource in &previous.owned_resources {
+            let path = PathBuf::from(&resource.path);
+            if !resource_targets.iter().any(|desired| desired == &path) {
+                remove_path_if_exists(&path)?;
+            }
+        }
+    }
+    activate_bundle_atomically(extracted, install_root)?;
     let installed_binary = install_release_binary(
         install_root,
         home,
         &resolved.platform.binary,
         &resolved.platform.platform,
+        quiet,
     )?;
     if installed_binary.is_none()
         && adapter_manifest_references_binary(install_root, &resolved.platform.binary)?
@@ -1328,14 +1405,15 @@ pub(crate) fn stage_and_apply_resolved_index_release(
         );
     }
     if let Some(binary_path) = installed_binary {
-        run_adapter_binary_installer(
+        run_adapter_binary_installer_with_output(
             binary_path.as_os_str(),
             &resolved.adapter.domain,
             install_root,
+            quiet,
         )?;
     }
     patch_adapter_argv_to_installed_binary(install_root, &resolved.platform.binary, home)?;
-    install_typed_harness_resources(&resource_plan)?;
+    install_typed_harness_resources(&resource_plan, quiet)?;
     write_file(
         &home
             .join(".ldgr/installed-adapters")
@@ -1352,6 +1430,31 @@ pub(crate) fn stage_and_apply_resolved_index_release(
         &resource_targets,
     )?;
     Ok(())
+}
+
+fn read_release_update_receipt(
+    install_root: &Path,
+    adapter: &str,
+) -> anyhow::Result<Option<crate::release_index::InstallationReceipt>> {
+    if !install_root.exists() {
+        return Ok(None);
+    }
+    let path = install_root.join("installation-receipt.json");
+    let value: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(&path)
+            .with_context(|| format!("installed adapter `{adapter}` has no readable receipt"))?,
+    )
+    .context("installation receipt is invalid JSON")?;
+    let parsed = parse_adapter_installation_receipt(value)?;
+    let AdapterInstallationReceipt::Release(receipt) = parsed else {
+        bail!("refusing to replace local-source adapter `{adapter}` with a signed release");
+    };
+    anyhow::ensure!(
+        receipt.domain == adapter,
+        "release receipt domain `{}` does not match requested adapter `{adapter}`",
+        receipt.domain
+    );
+    Ok(Some(receipt))
 }
 
 fn configured_release_keyring(home: &Path) -> anyhow::Result<PathBuf> {
@@ -1562,7 +1665,7 @@ pub(crate) fn typed_harness_resource_plan(
     Ok(plan)
 }
 
-fn install_typed_harness_resources(plan: &[(PathBuf, PathBuf)]) -> anyhow::Result<()> {
+fn install_typed_harness_resources(plan: &[(PathBuf, PathBuf)], quiet: bool) -> anyhow::Result<()> {
     for (source, target) in plan {
         if source.is_dir() {
             copy_dir_recursive(source, target)?;
@@ -1572,7 +1675,9 @@ fn install_typed_harness_resources(plan: &[(PathBuf, PathBuf)]) -> anyhow::Resul
             }
             fs::copy(source, target)?;
         }
-        println!("├─ Harness resource {}", target.display());
+        if !quiet {
+            println!("├─ Harness resource {}", target.display());
+        }
     }
     Ok(())
 }
@@ -1997,11 +2102,13 @@ fn install_adapter_from_source_root_with_package(
         home,
         None,
         &mut transaction,
+        false,
     )?;
     transaction.commit()?;
     remove_path_if_exists(&temp)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_source_adapter_update(
     adapter: &str,
     package: &str,
@@ -2010,6 +2117,7 @@ pub(crate) fn apply_source_adapter_update(
     home: &Path,
     expected_source_sha256: Option<&str>,
     transaction: &mut InstallTransaction,
+    quiet: bool,
 ) -> anyhow::Result<()> {
     let source = resolve_adapter_source_package(package, source_root)?;
     if let Some(expected) = expected_source_sha256 {
@@ -2064,9 +2172,15 @@ pub(crate) fn apply_source_adapter_update(
         }
         transaction.snapshot(&resource.target)?;
     }
-    println!("├─ Source checkout {}", source_root.display());
-    println!("├─ Adapter manifest {}", source.cargo_manifest.display());
-    let status = source_adapter_install_command(package, &source, install_root).status()?;
+    if !quiet {
+        println!("├─ Source checkout {}", source_root.display());
+        println!("├─ Adapter manifest {}", source.cargo_manifest.display());
+    }
+    let mut command = source_adapter_install_command(package, &source, install_root);
+    if quiet {
+        command.stdout(std::process::Stdio::null());
+    }
+    let status = command.status()?;
     if !status.success() {
         bail!("adapter installer failed for package `{package}` with status {status}");
     }
@@ -2082,6 +2196,7 @@ pub(crate) fn apply_source_adapter_update(
         );
         transaction.snapshot(&resource.target)?;
     }
+    transaction.begin_activation()?;
     if let Some(previous) = &previous_receipt {
         for resource in &previous.owned_resources {
             let path = PathBuf::from(&resource.path);
@@ -2090,7 +2205,7 @@ pub(crate) fn apply_source_adapter_update(
             }
         }
     }
-    install_source_harness_resources(&resource_plan)?;
+    install_source_harness_resources(&resource_plan, quiet)?;
     let normalized_install_root = absolute_path(install_root)?;
     write_file(
         &marker,
@@ -2172,7 +2287,10 @@ fn append_source_resource_children(
     Ok(())
 }
 
-fn install_source_harness_resources(plan: &[SourceHarnessResource]) -> anyhow::Result<()> {
+fn install_source_harness_resources(
+    plan: &[SourceHarnessResource],
+    quiet: bool,
+) -> anyhow::Result<()> {
     for resource in plan {
         if resource.source.is_dir() {
             copy_dir_recursive(&resource.source, &resource.target)?;
@@ -2182,10 +2300,12 @@ fn install_source_harness_resources(plan: &[SourceHarnessResource]) -> anyhow::R
             }
             fs::copy(&resource.source, &resource.target)?;
         }
-        println!(
-            "\u{251c}\u{2500} Harness resource {}",
-            resource.target.display()
-        );
+        if !quiet {
+            println!(
+                "\u{251c}\u{2500} Harness resource {}",
+                resource.target.display()
+            );
+        }
     }
     Ok(())
 }
@@ -2514,14 +2634,27 @@ fn run_adapter_binary_installer(
     adapter: &str,
     install_root: &Path,
 ) -> anyhow::Result<()> {
+    run_adapter_binary_installer_with_output(binary, adapter, install_root, false)
+}
+
+fn run_adapter_binary_installer_with_output(
+    binary: impl AsRef<std::ffi::OsStr>,
+    adapter: &str,
+    install_root: &Path,
+    quiet: bool,
+) -> anyhow::Result<()> {
     let binary_ref = binary.as_ref();
-    let status = Command::new(binary_ref)
+    let mut command = Command::new(binary_ref);
+    command
         .arg("adapter")
         .arg("install")
         .arg("--install-root")
         .arg(install_root)
-        .arg("--print-path")
-        .status()?;
+        .arg("--print-path");
+    if quiet {
+        command.stdout(std::process::Stdio::null());
+    }
+    let status = command.status()?;
     if !status.success() {
         bail!(
             "adapter installer `{}` failed for `{adapter}` with status {status}",
@@ -2614,7 +2747,8 @@ fn install_adapter_from_release(
     }
     let _ = fs::remove_dir_all(install_root);
     copy_dir_recursive(&extracted, install_root)?;
-    let installed_binary = install_release_binary(install_root, home, release.binary, &platform)?;
+    let installed_binary =
+        install_release_binary(install_root, home, release.binary, &platform, false)?;
     if let Some(binary_path) = installed_binary {
         println!("├─ Running adapter installer from release binary");
         run_adapter_binary_installer(binary_path.as_os_str(), entry.slug, install_root)?;
@@ -2629,6 +2763,7 @@ fn install_release_binary(
     home: &Path,
     binary: &str,
     platform: &str,
+    quiet: bool,
 ) -> anyhow::Result<Option<PathBuf>> {
     let source = install_root.join(platform).join(binary);
     if !source.is_file() {
@@ -2645,11 +2780,16 @@ fn install_release_binary(
         perms.set_mode(0o755);
         fs::set_permissions(&dest, perms)?;
     }
-    println!("├─ Installed binary {}", dest.display());
+    if !quiet {
+        println!("├─ Installed binary {}", dest.display());
+    }
     Ok(Some(dest))
 }
 
-fn adapter_manifest_references_binary(install_root: &Path, binary: &str) -> anyhow::Result<bool> {
+pub(crate) fn adapter_manifest_references_binary(
+    install_root: &Path,
+    binary: &str,
+) -> anyhow::Result<bool> {
     let manifest_path = install_root.join("adapter.toml");
     if !manifest_path.is_file() {
         return Ok(false);
@@ -4740,7 +4880,7 @@ argv = ["ldgr-example-adapter", "manifest-summary"]
             &source.cargo_manifest,
         )?;
         let plan = source_harness_resource_plan(install_root.path(), home.path())?;
-        install_source_harness_resources(&plan)?;
+        install_source_harness_resources(&plan, false)?;
         let marker = home.path().join(".ldgr/installed-adapters/example");
         write_file(
             &marker,
@@ -4925,6 +5065,7 @@ argv = ["ldgr-example-adapter", "manifest-summary"]
             home.path(),
             Some("stale-planned-digest"),
             &mut transaction,
+            false,
         )
         .expect_err("source changed after planning must fail closed");
 

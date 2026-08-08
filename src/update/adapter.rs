@@ -10,7 +10,13 @@ use crate::release_index::{
     AdapterPlatformRelease, AdapterRelease, AdapterReleaseProduct, InstallationReceipt,
     ResolvedAdapterRelease, SourceInstallationReceipt,
 };
-use crate::update::plan::AdapterInstallationKind;
+use crate::update::apply::{
+    AdapterOwnershipReceipt, AdapterStagingOwnership, PlanStagingOwnership, StagedArtifact,
+    StagingManifest,
+};
+use crate::update::catalog::VerifiedAdapterUpdateCatalog;
+use crate::update::plan::{AdapterInstallationKind, UpdateAction, UpdatePlan, UpdatePlanComponent};
+use crate::update::state::ComponentResult;
 
 pub(crate) use crate::update::apply::InstallTransaction;
 
@@ -143,10 +149,11 @@ pub(crate) fn inspect_adapter_installation(
     })
 }
 
-pub(crate) fn snapshot_adapter_installation(
+pub(crate) fn inspect_adapter_for_bulk(
     installed: &DiscoveredAdapter,
     home: &Path,
-) -> anyhow::Result<AdapterInstallationKind> {
+    user_adapter_root: &Path,
+) -> anyhow::Result<(AdapterInstallationKind, AdapterStagingOwnership)> {
     let value = installed
         .installation_receipt
         .clone()
@@ -169,10 +176,18 @@ pub(crate) fn snapshot_adapter_installation(
                 home,
                 &receipt,
             )?;
-            Ok(AdapterInstallationKind::Release {
-                version: receipt.version,
-                core_compatibility: receipt.core_compatibility,
-            })
+            let snapshot = AdapterInstallationKind::Release {
+                version: receipt.version.clone(),
+                core_compatibility: receipt.core_compatibility.clone(),
+            };
+            Ok((
+                snapshot,
+                AdapterStagingOwnership {
+                    install_root: installed.root_path.clone(),
+                    user_adapter_root: user_adapter_root.to_path_buf(),
+                    receipt: AdapterOwnershipReceipt::Release(receipt),
+                },
+            ))
         }
         AdapterInstallationReceipt::Source { receipt, .. } => {
             anyhow::ensure!(
@@ -185,13 +200,221 @@ pub(crate) fn snapshot_adapter_installation(
                     home,
                     &receipt,
                 )?;
-            Ok(AdapterInstallationKind::LocalSource {
-                package: receipt.source.package,
-                installed_source_sha256: receipt.source.bundle_sha256,
+            let snapshot = AdapterInstallationKind::LocalSource {
+                package: receipt.source.package.clone(),
+                installed_source_sha256: receipt.source.bundle_sha256.clone(),
                 current_source_sha256,
                 source_changed,
-            })
+            };
+            Ok((
+                snapshot,
+                AdapterStagingOwnership {
+                    install_root: installed.root_path.clone(),
+                    user_adapter_root: user_adapter_root.to_path_buf(),
+                    receipt: AdapterOwnershipReceipt::LocalSource(receipt),
+                },
+            ))
         }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct AdapterBulkApplyError {
+    pub(crate) source: anyhow::Error,
+    pub(crate) components: Vec<ComponentResult>,
+}
+
+impl std::fmt::Display for AdapterBulkApplyError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{:#}", self.source)
+    }
+}
+
+impl std::error::Error for AdapterBulkApplyError {}
+
+pub(crate) fn apply_staged_adapter_updates(
+    plan: &UpdatePlan,
+    manifest: &StagingManifest,
+    catalog: &VerifiedAdapterUpdateCatalog,
+    ownership: &PlanStagingOwnership,
+    transaction: &mut InstallTransaction,
+    quiet: bool,
+) -> Result<Vec<ComponentResult>, AdapterBulkApplyError> {
+    let mut components = Vec::new();
+    for (index, component) in plan.components().iter().enumerate() {
+        let UpdatePlanComponent::Adapter {
+            name,
+            action,
+            release,
+            local_source,
+            ..
+        } = component
+        else {
+            continue;
+        };
+        let applied = match action {
+            UpdateAction::Update => apply_staged_release(
+                name,
+                release.as_ref(),
+                manifest,
+                catalog,
+                ownership,
+                transaction,
+                quiet,
+            ),
+            UpdateAction::ReinstallLocalSource => apply_staged_local_source(
+                name,
+                local_source.as_ref(),
+                manifest,
+                ownership,
+                transaction,
+                quiet,
+            ),
+            _ => {
+                components.push(component_result(component, action_name(*action)));
+                continue;
+            }
+        };
+        match applied {
+            Ok(()) => components.push(component_result(component, "applied")),
+            Err(error) => {
+                let rollback = transaction.rollback();
+                for result in &mut components {
+                    if result.status == "applied" {
+                        result.status = "rolled_back".to_owned();
+                    }
+                }
+                components.push(component_result(component, "failed"));
+                for pending in plan.components().iter().skip(index + 1) {
+                    if matches!(pending, UpdatePlanComponent::Adapter { .. }) {
+                        let status = if matches!(
+                            pending.action(),
+                            UpdateAction::Update | UpdateAction::ReinstallLocalSource
+                        ) {
+                            "failed"
+                        } else {
+                            action_name(pending.action())
+                        };
+                        components.push(component_result(pending, status));
+                    }
+                }
+                let source = match rollback {
+                    Ok(()) => error,
+                    Err(rollback_error) => anyhow::anyhow!(
+                        "{error:#}; whole-plan rollback also failed: {rollback_error:#}"
+                    ),
+                };
+                return Err(AdapterBulkApplyError { source, components });
+            }
+        }
+    }
+    Ok(components)
+}
+
+fn apply_staged_release(
+    name: &str,
+    artifact: Option<&crate::update::plan::AdapterReleaseArtifact>,
+    manifest: &StagingManifest,
+    catalog: &VerifiedAdapterUpdateCatalog,
+    ownership: &PlanStagingOwnership,
+    transaction: &mut InstallTransaction,
+    quiet: bool,
+) -> anyhow::Result<()> {
+    let artifact = artifact.context("selected signed adapter has no resolved artifact")?;
+    let product = catalog
+        .catalog
+        .adapters
+        .iter()
+        .find(|adapter| adapter.domain == name)
+        .context("selected signed adapter is absent from the verified catalog")?;
+    let staged = manifest
+        .artifacts
+        .iter()
+        .find(|staged| matches!(staged, StagedArtifact::AdapterRelease { name: staged_name, .. } if staged_name == name))
+        .context("selected signed adapter has no staged artifact")?;
+    let StagedArtifact::AdapterRelease { extracted_root, .. } = staged else {
+        unreachable!();
+    };
+    let owned = ownership
+        .adapters
+        .get(name)
+        .context("selected signed adapter has no ownership record")?;
+    let resolved = ResolvedAdapterRelease {
+        adapter: product,
+        release: &artifact.release,
+        platform: &artifact.platform,
+        version: Version::parse(&artifact.version)?,
+    };
+    crate::cli::commands::ops::apply_staged_resolved_index_release(
+        &resolved,
+        extracted_root,
+        &owned.install_root,
+        &ownership.home,
+        transaction,
+        quiet,
+    )
+}
+
+fn apply_staged_local_source(
+    name: &str,
+    artifact: Option<&crate::update::plan::LocalSourceArtifact>,
+    manifest: &StagingManifest,
+    ownership: &PlanStagingOwnership,
+    transaction: &mut InstallTransaction,
+    quiet: bool,
+) -> anyhow::Result<()> {
+    let artifact = artifact.context("selected local-source adapter has no resolved artifact")?;
+    let staged = manifest
+        .artifacts
+        .iter()
+        .find(|staged| matches!(staged, StagedArtifact::LocalSource { name: staged_name, .. } if staged_name == name))
+        .context("selected local-source adapter has no staged source")?;
+    let StagedArtifact::LocalSource {
+        source_root,
+        source_sha256,
+        ..
+    } = staged
+    else {
+        unreachable!();
+    };
+    anyhow::ensure!(
+        source_sha256 == &artifact.current_source_sha256,
+        "staged local-source digest differs from the resolved plan"
+    );
+    let owned = ownership
+        .adapters
+        .get(name)
+        .context("selected local-source adapter has no ownership record")?;
+    crate::cli::commands::ops::apply_source_adapter_update(
+        name,
+        &artifact.package,
+        source_root,
+        &owned.install_root,
+        &ownership.home,
+        Some(source_sha256),
+        transaction,
+        quiet,
+    )
+}
+
+fn component_result(component: &UpdatePlanComponent, status: &str) -> ComponentResult {
+    ComponentResult {
+        kind: "adapter".to_owned(),
+        name: component.name().to_owned(),
+        status: status.to_owned(),
+    }
+}
+
+fn action_name(action: UpdateAction) -> &'static str {
+    match action {
+        UpdateAction::None => "none",
+        UpdateAction::Update => "update",
+        UpdateAction::ReinstallLocalSource => "reinstall_local_source",
+        UpdateAction::SkipUnmanaged => "skip_unmanaged",
+        UpdateAction::Blocked => "blocked",
+        UpdateAction::Applied => "applied",
+        UpdateAction::RolledBack => "rolled_back",
+        UpdateAction::Failed => "failed",
     }
 }
 
@@ -337,6 +560,7 @@ pub(crate) fn stage_and_apply_adapter_update(
             home,
             Some(source_sha256),
             transaction,
+            false,
         ),
     }
 }

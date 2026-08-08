@@ -639,6 +639,19 @@ fn stage_adapter_artifact(
             .is_file(),
         "adapter archive is missing its embedded resource manifest"
     );
+    let platform_binary = extracted_root
+        .join(&artifact.platform.platform)
+        .join(&artifact.platform.binary);
+    ensure!(
+        platform_binary.is_file()
+            || !crate::cli::commands::ops::adapter_manifest_references_binary(
+                &extracted_root,
+                &artifact.platform.binary,
+            )?,
+        "adapter archive is missing required executable {}/{}",
+        artifact.platform.platform,
+        artifact.platform.binary
+    );
     Ok(StagedArtifact::AdapterRelease {
         name: name.to_owned(),
         archive,
@@ -750,12 +763,27 @@ fn adapter_release_targets(
         .join(&artifact.platform.platform)
         .join(&artifact.platform.binary);
     if platform_binary.is_file() {
-        let binary_root = home.join(".local/bin");
+        let binary_root = absolute_lexical(&home.join(".local/bin"))?;
+        let binary_target = binary_root.join(&artifact.platform.binary);
+        let previously_owned_binary = receipt
+            .binary_path
+            .as_deref()
+            .map(Path::new)
+            .map(absolute_lexical)
+            .transpose()?;
+        ensure!(
+            !binary_target.exists()
+                || previously_owned_binary
+                    .as_ref()
+                    .is_some_and(|owned| paths_equal(owned, &binary_target)),
+            "refusing to overwrite unowned adapter binary {}",
+            binary_target.display()
+        );
         targets.push(OwnedTarget::new(
             name,
             "adapter_binary",
             &binary_root,
-            binary_root.join(&artifact.platform.binary),
+            binary_target,
         ));
     }
     let resources = crate::cli::commands::ops::typed_harness_resource_plan(
@@ -763,6 +791,11 @@ fn adapter_release_targets(
         home,
         &artifact.platform.resource_manifest,
     )?;
+    let previously_owned = receipt
+        .owned_resources
+        .iter()
+        .map(|resource| absolute_lexical(Path::new(&resource.path)))
+        .collect::<anyhow::Result<Vec<_>>>()?;
     let allowed_roots = crate::cli::commands::ops::source_allowed_resource_roots(home)?;
     for (_, target) in resources {
         let target = absolute_lexical(&target)?;
@@ -777,6 +810,11 @@ fn adapter_release_targets(
                     target.display()
                 )
             })?;
+        ensure!(
+            !target.exists() || previously_owned.iter().any(|owned| paths_equal(owned, &target)),
+            "refusing to overwrite unowned harness resource {}; remove it or choose a different harness resource path",
+            target.display()
+        );
         targets.push(OwnedTarget::new(name, "harness_resource", boundary, target));
     }
     Ok(targets)
@@ -811,6 +849,24 @@ fn adapter_common_targets(
         AdapterOwnershipReceipt::Release(receipt) => &receipt.owned_resources,
         AdapterOwnershipReceipt::LocalSource(receipt) => &receipt.owned_resources,
     };
+    if let AdapterOwnershipReceipt::Release(receipt) = &owned.receipt {
+        if let Some(binary) = receipt.binary_path.as_deref() {
+            let binary_root = absolute_lexical(&home.join(".local/bin"))?;
+            let binary = absolute_lexical(Path::new(binary))?;
+            ensure!(
+                binary
+                    .parent()
+                    .is_some_and(|parent| paths_equal(parent, &binary_root)),
+                "receipt-owned adapter binary is outside the user binary boundary"
+            );
+            targets.push(OwnedTarget::new(
+                name,
+                "previous_adapter_binary",
+                binary_root,
+                binary,
+            ));
+        }
+    }
     let allowed_roots = crate::cli::commands::ops::source_allowed_resource_roots(home)?;
     for resource in resources {
         let target = absolute_lexical(Path::new(&resource.path))?;
@@ -1054,10 +1110,6 @@ impl InstallTransaction {
     }
 
     fn snapshot_owned(&mut self, target: &OwnedTarget) -> anyhow::Result<()> {
-        ensure!(
-            self.journal.phase == JournalPhase::Snapshotting,
-            "cannot add snapshots after the transaction is sealed"
-        );
         let normalized = validate_owned_target(target)?;
         if let Some(existing) = self
             .journal
@@ -1065,15 +1117,21 @@ impl InstallTransaction {
             .iter()
             .find(|snapshot| paths_equal(&snapshot.target, &normalized.path))
         {
-            ensure!(
-                existing.component == normalized.component
-                    && existing.role == normalized.role
-                    && paths_equal(&existing.boundary, &normalized.boundary),
-                "update target {} has conflicting ownership",
-                normalized.path.display()
-            );
+            if self.journal.phase == JournalPhase::Snapshotting {
+                ensure!(
+                    existing.component == normalized.component
+                        && existing.role == normalized.role
+                        && paths_equal(&existing.boundary, &normalized.boundary),
+                    "update target {} has conflicting ownership",
+                    normalized.path.display()
+                );
+            }
             return Ok(());
         }
+        ensure!(
+            self.journal.phase == JournalPhase::Snapshotting,
+            "cannot add snapshots after the transaction is sealed"
+        );
 
         let backup = self
             .backup_root
