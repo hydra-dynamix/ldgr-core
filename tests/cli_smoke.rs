@@ -5302,14 +5302,39 @@ fn web_cockpit_serves_context_artifact_viewer_and_loop_controls() -> anyhow::Res
     assert!(start.contains(r#""status": "spawned""#), "{start}");
     assert!(start.contains(r#""launch_observation_id""#), "{start}");
 
-    let context = http_get(port, "/api/context")?;
-    assert!(context.contains(r#""running_work_items": 1"#));
-    assert!(context.contains(r#""loop_state""#));
+    let mut context = http_get(port, "/api/context")?;
+    if context.contains(r#""current_phase": "needs_decision""#) {
+        context = wait_for_context_containing(port, r#""current_phase": "dry_run_restored_work""#)?;
+    }
+    let context_json: serde_json::Value = serde_json::from_str(&context)?;
+    let loop_state = &context_json["loop_state"];
+    let current_phase = loop_state["current_phase"]
+        .as_str()
+        .context("loop state current_phase is not a string")?;
+    let valid_active_phases = [
+        "started",
+        "resumed",
+        "steered",
+        "rendering_prompt",
+        "prompt_source",
+        "running_agent",
+        "capturing_agent_output",
+        "finishing",
+    ];
+    let is_active =
+        loop_state["terminal_status"].is_null() && valid_active_phases.contains(&current_phase);
+    let is_completed_dry_run =
+        loop_state["terminal_status"] == "partial" && current_phase == "dry_run_restored_work";
     assert!(
-        context.contains(r#""current_phase": "started""#)
-            || context.contains(r#""current_phase": "resumed""#),
+        is_active || is_completed_dry_run,
+        "unexpected launched loop phase {current_phase:?}: {context}"
+    );
+    assert_eq!(
+        context_json["running_work_items"].as_u64(),
+        Some(if is_active { 1 } else { 0 }),
         "{context}"
     );
+    assert!(context.contains(r#""loop_state""#));
     assert!(context.contains(r#""work_slug": "web-check""#));
     assert!(context.contains(r#""latest_events""#));
     assert!(context.contains(r#""loop_interventions""#));
