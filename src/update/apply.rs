@@ -934,6 +934,14 @@ fn nearest_existing_directory(path: &Path) -> anyhow::Result<PathBuf> {
 }
 
 #[cfg(unix)]
+fn checked_space_bytes(
+    available_blocks: impl Into<u64>,
+    fragment_size: impl Into<u64>,
+) -> Option<u64> {
+    available_blocks.into().checked_mul(fragment_size.into())
+}
+
+#[cfg(unix)]
 fn available_space(path: &Path) -> anyhow::Result<Option<u64>> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
@@ -949,7 +957,7 @@ fn available_space(path: &Path) -> anyhow::Result<Option<u64>> {
     }
     // SAFETY: statvfs returned success and initialized the output structure.
     let stats = unsafe { stats.assume_init() };
-    Ok(stats.f_bavail.checked_mul(stats.f_frsize))
+    Ok(checked_space_bytes(stats.f_bavail, stats.f_frsize))
 }
 
 #[cfg(windows)]
@@ -2405,6 +2413,16 @@ mod tests {
 
     fn target(root: &Path, component: &str, role: &str, name: &str) -> OwnedTarget {
         OwnedTarget::new(component, role, root, root.join(name))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn available_space_multiplication_accepts_mixed_widths_and_checks_overflow() {
+        assert_eq!(
+            checked_space_bytes(u32::MAX, 4_096_u64),
+            Some(u64::from(u32::MAX) * 4_096)
+        );
+        assert_eq!(checked_space_bytes(u64::MAX, 2_u32), None);
     }
 
     struct CoreFixture {
