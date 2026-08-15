@@ -40,6 +40,102 @@ A failed job may leave hosted release assets, but startup checks cannot discover
 them because the catalog is unchanged. Delete or replace failed candidate assets
 before rerunning. Never manually publish a candidate catalog to bypass the gate.
 
+## One-time initial catalog ceremony
+
+`.github/workflows/core-catalog-bootstrap.yml` is the only supported path when
+`hydra-dynamix/ldgr-releases` has no `core-index.json` or
+`core-index.json.sig`. It is manually dispatched with the exact
+`BOOTSTRAP-CORE-CATALOG` confirmation, runs in the protected
+`core-release-signing` environment, and refuses to replace either catalog file.
+It uses the same `LDGR_CATALOG_SIGNING_KEY` trust root and
+`LDGR_CATALOG_REPOSITORY_TOKEN` as ordinary release publication. A missing,
+malformed, or mismatched signing seed fails before any signature is uploaded;
+the ceremony never creates a key or an unsigned catalog.
+
+The reviewed input is `release/core-catalog-bootstrap-v1.json`. It pins the
+GitHub release ID, tag and tag commit, asset IDs, names, sizes, archive and
+checksum SHA-256 values, complete five-platform matrix, paired agentctl
+provenance, and the exact compatibility-v2 and legacy profiles. Core 0.1.14 is
+the complete supported historical baseline: it is the first historical
+five-platform release that also contains the paired agentctl required by the
+current atomic update contract. Earlier releases are retained on GitHub but
+are not supported signed-catalog update inputs because their archives omit
+agentctl; the ceremony must not relabel those incomplete bundles as supported.
+
+The workflow retrieves assets by pinned GitHub asset ID and checks remote
+release metadata before downloading. `ldgr-release --bootstrap-inventory ...`
+then rechecks every byte and checksum, signs each archive with the already
+trusted root, signs canonical catalog bytes, and independently verifies every
+archive and catalog signature against `release-keyring.json`. Only after that
+succeeds does the workflow upload all detached archive signatures, compare the
+hosted bytes, and commit both catalog files as its final activation step. A
+partial run may therefore leave deterministic archive signatures, but never an
+active catalog. Once the catalog exists, disable the bootstrap workflow and use
+ordinary append mode; append mode still requires and verifies the existing
+signed catalog and accepts the bootstrap output without conversion.
+
+## Compatibility-v2 adapter catalog publication
+
+Adapter release publication is catalog activation, not merely uploading an
+archive. Every dispatchable adapter archive contains the generated
+`adapter-compatibility.json`; its release record contains the exact
+`compatibility` object and the SHA-256 fingerprint of canonical compatibility
+JSON. The fingerprint excludes adapter-local store descriptors, while archive
+SHA-256 and signature still cover the complete bundle.
+
+The integration workflow `.github/workflows/unified-schema-release.yml` is the
+supported publisher. Its gate:
+
+1. checks generated central-contract, Core-profile, release-set, and adapter
+   sidecar output;
+2. runs the complete compatibility matrix;
+3. builds all five supported platforms and requires a non-empty platform matrix
+   for every published adapter variant;
+4. verifies packaged sidecars byte-for-byte against generated sources and emits
+   one index fragment per archive;
+5. verifies archive checksums/signatures and merges fragments with
+   `scripts/adapter-release-metadata.py`;
+6. evaluates every stable adapter variant against every released signed stable
+   Core profile, rejecting stale sidecars, ambiguous same-version variants,
+   missing platforms, handwritten legacy patch ranges, and incompatible
+   central components;
+7. signs canonical schema-v2 `index.json`; and
+8. uploads release assets before the final single commit activates
+   `index.json` and `index.json.sig` in `hydra-dynamix/ldgr-releases`.
+
+For a dry-run review, dispatch the workflow with `publish: false` and retain
+`database-contract-release.json`, the Core profile catalog, archive metadata,
+and index fragments. Maintainers can locally inspect the generated manifest and
+gate a candidate catalog with:
+
+```sh
+scripts/schema-release-manifest.py > database-contract-release.json
+scripts/adapter-release-metadata.py validate \
+  --index /path/to/index.json \
+  --core-catalog /path/to/compatibility-core-catalog.json
+```
+
+Do not hand-edit catalog compatibility fields, add a v1 release to a schema-v2
+catalog, broaden a Core patch range, or publish a partial platform set. The
+schema-v2 resolver filters platform/channel/exact version and evaluates
+protocol, minimum Core schema, capabilities, and central components before any
+download. If multiple compatibility variants share one adapter SemVer, catalog
+CI must prove that no released Core profile accepts more than one.
+
+A failed build may leave unreachable hosted assets, but it must not activate a
+catalog. If validation fails after assets upload, preserve the active prior
+catalog/signature, remove or replace the failed candidate assets, repair the
+source/generated metadata, and rerun the complete gate. Never roll back by
+rewriting compatibility fields in the active signed index. If an activated
+catalog must be superseded, publish a newly signed catalog from trusted source;
+installed updates independently retain their plan-wide rollback journal and
+prior receipts.
+
+The coherent `release_set_hash` remains in release manifests and receipts for
+audit provenance. It is not a v2 discovery or dispatch requirement. A Core patch
+or unrelated local-store migration therefore does not require republishing an
+unchanged compatible adapter merely to recreate global identity.
+
 ## Key rotation
 
 A new key cannot authorize itself. Rotate in two releases:

@@ -1,12 +1,12 @@
 # LDGR self-update and adapter-update specification
 
-Status: proposed
-Target: LDGR Core after 0.1.14
+Status: implemented operational contract
+Target: LDGR Core after 0.1.14 (compatibility v2)
 Scope: update discovery, explicit update application, startup notifications, the paired `agentctl` binary, and installed adapters
 
 ## Summary
 
-LDGR should expose one top-level update surface:
+LDGR exposes one top-level update surface:
 
 ```text
 ldgr update
@@ -18,24 +18,46 @@ ldgr update --adapter research --adapter conduct
 ldgr update --prerelease
 ```
 
-`ldgr update` should update the compatibility-bound Core/`agentctl` release bundle and every eligible receipt-managed adapter. It must construct and verify the complete plan before changing anything. A normal LDGR command should trigger a throttled, non-blocking check at startup, but startup must never install software, prompt, change a project database, or fail the requested command.
+`ldgr update` updates the compatibility-bound Core/`agentctl` release bundle and every eligible receipt-managed adapter. It constructs and verifies the complete plan before changing anything. A normal LDGR command may trigger a throttled, non-blocking check at startup, but startup never installs software, prompts, changes a project database, or fails the requested command.
+
+Adapter compatibility v2 is evaluated from protocol epoch, minimum Core schema,
+required Core capabilities, and optional registered central components. Exact
+global database-contract/release-set identity and Core package patch ranges are
+not ordinary v2 discovery or update gates. Local-store metadata is diagnostic
+and stays under adapter-owned migration and recovery.
 
 This is an orchestration feature, not a replacement for the existing adapter updater. `ldgr adapter update <name>` already handles signed releases and tracked local-source adapters. The implementation should extract that logic into a reusable library and have both command surfaces call it.
 
 ## Current system
 
-The relevant behavior already present in Core is:
+The implemented Core behavior is:
 
-- `src/cli/mod.rs` owns parsing, startup recovery, built-in command precedence, and dispatch. There is no top-level `update` command or general startup hook.
-- `src/cli/args/adapters.rs` and `src/cli/commands/adapters.rs` expose `ldgr adapter update <name> [--check] [--prerelease]`.
-- `src/cli/commands/ops.rs::handle_update_adapter` distinguishes signed-release receipts from local-source receipts. Signed releases resolve the newest platform release compatible with the running Core version. Local-source updates verify ownership and source identity before rerunning their recorded installer.
-- `src/release_index.rs` validates the adapter index, resolves semantic versions and Core compatibility, verifies SHA-256 and Ed25519 signatures, and safely extracts archives.
-- Adapter activation uses `InstallTransaction` snapshots and rollback, but the transaction is scoped to one adapter.
-- Adapter discovery searches `LDGR_ADAPTER_PATH`, project `.ldgr/adapters`, `LDGR_HOME/adapters`, and `~/.ldgr/adapters`. Only receipt-managed user installations are safe bulk-update targets. Project and environment override roots may be source-controlled development inputs and must not be mutated by a global update.
-- Official release archives contain `ldgr`, the paired `agentctl`, and `RELEASE-METADATA.json`. The metadata binds the Core version, `agentctl` version and commit, launcher compatibility schema, platform, Core commit, and source repository.
-- Current Core archives have SHA-256 sidecars. Adapter releases additionally use an Ed25519 keyring. A checksum hosted beside an archive is not a sufficient trust root for unattended self-update.
-- The PowerShell installer backs up both binaries to `*.previous`, installs `agentctl` first, installs Core second, and validates both versions plus the launcher compatibility handshake. The shell installer follows the same paired-bundle model.
-- `~/.ldgr/config.toml` is canonical and `config.json` is a compatibility mirror. `HarnessConfig` preserves unknown extensions, so update configuration can be added compatibly.
+- `src/cli/mod.rs` owns parsing, startup recovery, built-in command precedence,
+  compatibility-aware dispatch, and the top-level `update` command/startup hook.
+- `ldgr update` and `ldgr adapter update <name>` share signed catalog,
+  compatibility-v2 resolution, staging, ownership, and transaction primitives.
+- Signed releases resolve against the active or candidate Core compatibility
+  profile. Local-source updates verify ownership and source identity before
+  rerunning their recorded installer.
+- `src/release_index.rs` validates schema-v2 adapter indexes, deterministic
+  compatibility variants, SHA-256, Ed25519 signatures, and safe extraction. The
+  bounded schema-v1 reader retains exact historical checks only for legacy
+  artifacts.
+- Whole-plan journals snapshot Core/agentctl, adapter bundles, resources, and
+  receipts. Central migrations use verified database backups. Adapter-local
+  stores are not opened by Core update preflight.
+- Discovery searches `LDGR_ADAPTER_PATH`, project `.ldgr/adapters`,
+  `LDGR_HOME/adapters`, and `~/.ldgr/adapters`. Only receipt-managed user
+  installations are bulk-update targets; project and environment overrides are
+  reported but not mutated.
+- Official release archives contain `ldgr`, paired `agentctl`, and
+  `RELEASE-METADATA.json`; signed catalogs bind platform, versions,
+  compatibility profiles, archive roots, URLs, digests, and signing keys.
+- Unix activation validates absolute installed binaries before commit. Windows
+  uses a durable detached finalizer and reports `staged_pending_restart` until a
+  terminal receipt is available.
+- `~/.ldgr/config.toml` is canonical and `config.json` remains a compatibility
+  mirror.
 
 ## Goals
 
@@ -235,10 +257,17 @@ Resolution is one immutable plan built from one verified snapshot of each catalo
 2. Resolve the newest allowed Core release strictly newer than the running version. Normal update never downgrades.
 3. Treat the Core archive’s `ldgr` and `agentctl` as one component. Verify the catalog metadata against `RELEASE-METADATA.json` after extraction.
 4. Discover adapters, but select only installations with valid receipts whose install roots are within the configured user adapter root and whose owned resources remain within recorded/configured harness boundaries.
-5. Resolve signed-release adapters against the **target** Core version, or the current Core version when Core is not selected. This requires refactoring the existing resolver call so the target Core version is an input instead of always using `env!("CARGO_PKG_VERSION")`.
+5. Resolve signed-release adapters against the **candidate Core profile** (or
+   the active profile when Core is not selected): adapter protocol epoch,
+   projected Core schema, required Core capabilities, and projected registered
+   central components. Do not compare the global release-set hash or a maximum
+   Core package patch for v2 artifacts.
 6. For each local-source receipt, validate its ownership boundary and source identity. A startup check may report source drift. An explicit bulk update may rerun the recorded source installer only when drift exists; unchanged local sources are no-ops.
 7. Skip untracked, project-local, and environment-override adapters with an explicit warning. Never guess ownership from a manifest path.
-8. If any selected signed adapter has no release compatible with the target Core, block the default whole update before downloads. `--core-only` is the explicit operator choice to leave adapters unchanged and must print the incompatibility warning.
+8. If any installed adapter cannot be retained or replaced by a release
+   compatible with the target Core, block the whole update before downloads.
+   `--core-only` leaves adapter bytes unchanged but does not bypass this proof;
+   every retained adapter must evaluate successfully against the candidate.
 9. Registry discovery warnings are part of the plan and must not be silently discarded.
 
 The planner returns deterministic component ordering: Core bundle first in reports, then adapters sorted by canonical slug. The applier may use a different safe activation order but records both.
@@ -424,15 +453,30 @@ No update code should depend on a project database being present.
 
 The release workflow may publish a signed catalog entry only after every platform archive, signature, checksum, embedded metadata check, previous-version update test, and rollback test passes. Catalog publication is the final release step so startup checks never observe an incomplete platform matrix.
 
-## Rollout
+## Compatibility-v2 and legacy rollout
 
-1. **Trust and metadata:** publish signed Core and adapter catalogs; add Core installation receipts to both installers; keep startup checking disabled in released builds until the trust path exists.
-2. **Check-only:** ship `ldgr update --check`, JSON output, state/cache, configuration, and opt-out. Enable startup checks with notification only.
-3. **Core apply:** ship plan staging, Unix activation, Windows finalizer, paired validation, and rollback.
-4. **Adapter orchestration:** refactor the current updater, resolve adapters against target Core, and add plan-wide transactions.
-5. **Release gate:** require previous-version update/rollback tests before publishing each catalog entry.
+The rollout keeps readers broader than writers:
 
-Check-only and apply must not be conflated: startup checking can be enabled once signed discovery is dependable, while mutation remains gated on platform-specific recovery tests.
+1. signed Core and schema-v2 adapter catalogs publish generated compatibility
+   metadata and installation receipts;
+2. catalog writers reject newly added v1 releases, handwritten Core patch
+   ranges, partial platform sets, and stale packaged sidecars;
+3. Core continues reading already signed schema-v1 catalogs and
+   `adapter-database-contract.json` during protocol epoch 1;
+4. an exact legacy match is visible as `degraded`; a stale readable legacy
+   install is visible as `blocked` with
+   `compatibility.legacy_global_contract_mismatch` or
+   `compatibility.legacy_core_schema_mismatch` and an exact repair command;
+5. v2 candidates are preferred, and a valid legacy candidate is considered only
+   when no compatible v2 candidate exists; and
+6. the v1 reader can be removed only with protocol epoch 1, after every supported
+   adapter has a published v2 repair artifact.
+
+Never translate a v1 global hash into a v2 schema minimum or ignore a stale
+hash. When both sidecars exist, v2 is authoritative; malformed v2 metadata does
+not downgrade to v1. Check-only and apply also remain distinct: startup checks
+may report a signed plan, but only an explicit update performs staged mutation
+and platform-specific rollback.
 
 ## Acceptance criteria
 

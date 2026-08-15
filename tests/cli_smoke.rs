@@ -917,6 +917,7 @@ fn adapter_install_resolves_and_installs_fixture_from_index() -> anyhow::Result<
         })
         .to_string(),
     )?;
+    sign_adapter_catalog_fixture(&index, &signing_key, "test")?;
     let install_root = project.path().join("installed-fixture");
     let mut command = isolated_command(project.path())?;
     command
@@ -1005,6 +1006,7 @@ fn adapter_install_resolves_and_installs_fixture_from_index() -> anyhow::Result<
         .expect("release fixture is an array")
         .push(newer);
     fs::write(&index, update_index.to_string())?;
+    sign_adapter_catalog_fixture(&index, &signing_key, "test")?;
     let mut update_check = isolated_command(project.path())?;
     update_check
         .env("LDGR_ADAPTER_PATH", &install_root)
@@ -1054,6 +1056,7 @@ fn adapter_install_resolves_and_installs_fixture_from_index() -> anyhow::Result<
             "--version",
             "1.2.3",
             "--yes",
+            "--offline",
             "--install-root",
         ])
         .arg(&install_root);
@@ -1104,6 +1107,7 @@ fn adapter_install_resolves_and_installs_fixture_from_index() -> anyhow::Result<
     updated_index["adapters"][0]["releases"][0]["platforms"][0]["sha256"] =
         serde_json::Value::String(format!("{:x}", Sha256::digest(&updated_archive)));
     fs::write(&index, updated_index.to_string())?;
+    sign_adapter_catalog_fixture(&index, &signing_key, "test")?;
     fs::write(isolated_home.join("pi-skills/collision"), "collision")?;
     let mut rollback = isolated_command(project.path())?;
     rollback
@@ -1116,6 +1120,7 @@ fn adapter_install_resolves_and_installs_fixture_from_index() -> anyhow::Result<
             "--version",
             "1.2.3",
             "--yes",
+            "--offline",
             "--install-root",
         ])
         .arg(&install_root);
@@ -1683,6 +1688,29 @@ fn focused_subcommand_help_omits_adapter_discovery_blocks() -> anyhow::Result<()
 }
 
 #[test]
+fn loop_run_help_explains_resumption_and_operational_controls() -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    let mut command = isolated_command(project.path())?;
+    command.args(["loop", "run", "--help"]);
+    command.assert().success().stdout(
+        predicate::str::contains("Execution model:")
+            .and(predicate::str::contains(
+                "If a run is already active, the loop resumes that run",
+            ))
+            .and(predicate::str::contains("Agents and output:"))
+            .and(predicate::str::contains(
+                "Iteration and background execution:",
+            ))
+            .and(predicate::str::contains("Project completion:"))
+            .and(predicate::str::contains(
+                "--prompt-slug implementation-loop",
+            ))
+            .and(predicate::str::contains("--project-complete-requested")),
+    );
+    Ok(())
+}
+
+#[test]
 fn adapter_focused_help_keeps_adapter_discovery_blocks() -> anyhow::Result<()> {
     let project = TempDir::new()?;
     let mut command = isolated_command(project.path())?;
@@ -1996,6 +2024,24 @@ fn adapter_list_show_and_dispatch_use_core_registry_metadata() -> anyhow::Result
     let artifact_root = project.path().join(".ldgr/artifacts");
     let adapter_root = project.path().join("adapters");
     write_adapter_fixture(&adapter_root.join("sample"), "community-sample", "sample")?;
+    write_adapter_namespace_fixture(
+        &adapter_root.join("blocked"),
+        "blocked-sample",
+        "blocked-sample",
+        "[\"must-not-run\"]",
+    )?;
+    write_adapter_compatibility_fixture(&adapter_root.join("blocked"), "blocked-sample", 2, &[])?;
+    write_adapter_namespace_fixture(
+        &adapter_root.join("legacy"),
+        "code",
+        "legacy-sample",
+        "[\"must-not-run\"]",
+    )?;
+    fs::remove_file(adapter_root.join("legacy/adapter-compatibility.json"))?;
+    fs::write(
+        adapter_root.join("legacy/adapter-database-contract.json"),
+        ldgr_core::database_contract::generated_adapter_contract_json("code")?,
+    )?;
     fs::create_dir_all(adapter_root.join("broken"))?;
     fs::write(adapter_root.join("broken/adapter.toml"), "[adapter\n")?;
 
@@ -2009,13 +2055,37 @@ fn adapter_list_show_and_dispatch_use_core_registry_metadata() -> anyhow::Result
     .assert()
     .success()
     .stdout(predicate::str::contains(
-        "adapter=community-sample title=community-sample title",
+        "adapter=community-sample state=ready title=community-sample title",
+    ))
+    .stdout(predicate::str::contains("adapter=broken state=invalid"))
+    .stdout(predicate::str::contains(
+        "adapter=blocked-sample state=blocked",
+    ))
+    .stdout(predicate::str::contains(
+        "compatibility.protocol_epoch_unsupported",
+    ))
+    .stdout(predicate::str::contains(
+        "repair=ldgr update --adapter blocked-sample",
     ))
     .stdout(predicate::str::contains("command=community-sample-check"))
-    .stderr(predicate::str::contains(
-        "warning: skipped adapter manifest",
-    ))
+    .stderr(predicate::str::contains("warning: adapter manifest"))
     .stderr(predicate::str::contains("failed to parse adapter manifest"));
+
+    command(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        ["adapter", "list", "--json"],
+    )?
+    .env("LDGR_ADAPTER_PATH", &adapter_root)
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("\"state\": \"ready\""))
+    .stdout(predicate::str::contains("\"state\": \"blocked\""))
+    .stdout(predicate::str::contains("\"required\": 2"))
+    .stdout(predicate::str::contains(
+        "\"command\": \"ldgr update --adapter blocked-sample\"",
+    ));
 
     command(
         project.path(),
@@ -2043,6 +2113,35 @@ fn adapter_list_show_and_dispatch_use_core_registry_metadata() -> anyhow::Result
     .success()
     .stdout(predicate::str::contains("command: community-sample-check"))
     .stdout(predicate::str::contains("argv: community-sample check"));
+
+    command(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        ["legacy-sample", "--help"],
+    )?
+    .env("LDGR_ADAPTER_PATH", &adapter_root)
+    .assert()
+    .failure()
+    .stderr(predicate::str::contains(
+        "warning: adapter `code` uses legacy compatibility metadata; repair with `ldgr update --adapter code`",
+    ));
+
+    command(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        ["blocked-sample", "status"],
+    )?
+    .env("LDGR_ADAPTER_PATH", &adapter_root)
+    .assert()
+    .failure()
+    .stderr(predicate::str::contains(
+        "compatibility.protocol_epoch_unsupported",
+    ))
+    .stderr(predicate::str::contains(
+        "repair with `ldgr update --adapter blocked-sample`",
+    ));
 
     command(
         project.path(),
@@ -4720,13 +4819,19 @@ fn autonomous_loop_runtime_dry_run_does_not_consume_work_item() -> anyhow::Resul
 }
 
 #[test]
-fn autonomous_loop_runtime_blocks_on_active_run_even_when_work_status_drifted() -> anyhow::Result<()>
+fn autonomous_loop_runtime_resumes_active_run_even_when_work_status_drifted() -> anyhow::Result<()>
 {
     let project = TempDir::new()?;
     let db_path = project.path().join(".ldgr/ldgr.db");
     let artifact_root = project.path().join(".ldgr/artifacts");
     let prompt_path = project.path().join("loop-prompt.md");
     fs::write(&prompt_path, "{{ldgr_context}}")?;
+    let agent_path = project.path().join("resume-agent.sh");
+    fs::write(
+        &agent_path,
+        "#!/bin/sh\ncat >/dev/null\nprintf 'resumed-active-run\\n'\n",
+    )?;
+    let agent_argv = serde_json::to_string(&vec!["sh", agent_path.to_str().unwrap()])?;
 
     run(project.path(), &db_path, &artifact_root, ["init"])?;
     run(
@@ -4740,7 +4845,7 @@ fn autonomous_loop_runtime_blocks_on_active_run_even_when_work_status_drifted() 
             "--title",
             "Drifted cycle",
             "--description",
-            "The active run remains authoritative for loop blocking.",
+            "The active run remains authoritative for loop resumption.",
         ],
     )?;
     run(
@@ -4754,7 +4859,7 @@ fn autonomous_loop_runtime_blocks_on_active_run_even_when_work_status_drifted() 
             "--title",
             "Next cycle",
             "--description",
-            "Must not start while any active run exists.",
+            "Must not start while an active run can be resumed.",
         ],
     )?;
     run(
@@ -4769,6 +4874,7 @@ fn autonomous_loop_runtime_blocks_on_active_run_even_when_work_status_drifted() 
         "UPDATE work_item SET status = 'done' WHERE slug = 'drifted-cycle'",
         [],
     )?;
+    drop(connection);
 
     command(
         project.path(),
@@ -4779,22 +4885,28 @@ fn autonomous_loop_runtime_blocks_on_active_run_even_when_work_status_drifted() 
             "run",
             "--prompt",
             prompt_path.to_str().expect("prompt path is UTF-8"),
-            "--dry-run",
+            "--agent-argv",
+            agent_argv.as_str(),
         ],
     )?
     .assert()
     .success()
-    .stdout(predicate::str::contains(
-        "Loop is blocked by unfinished work item drifted-cycle",
-    ));
+    .stdout(predicate::str::contains("loop run=1 work=drifted-cycle"))
+    .stdout(predicate::str::contains("agent_exit_code: 0"));
 
     command(project.path(), &db_path, &artifact_root, ["run", "list"])?
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "run=1 [running] work=drifted-cycle",
+            "run=1 [success] work=drifted-cycle",
         ))
         .stdout(predicate::str::contains("work=next-cycle").not());
+    let rendered_prompt = fs::read_to_string(artifact_root.join("loop-run-1-prompt.md"))?;
+    assert!(
+        rendered_prompt.contains(r#""run_id": 1"#),
+        "{rendered_prompt}"
+    );
+    assert!(!artifact_root.join("loop-run-2-prompt.md").exists());
 
     Ok(())
 }
@@ -5193,7 +5305,11 @@ fn web_cockpit_serves_context_artifact_viewer_and_loop_controls() -> anyhow::Res
     let context = http_get(port, "/api/context")?;
     assert!(context.contains(r#""running_work_items": 1"#));
     assert!(context.contains(r#""loop_state""#));
-    assert!(context.contains(r#""current_phase": "started""#));
+    assert!(
+        context.contains(r#""current_phase": "started""#)
+            || context.contains(r#""current_phase": "resumed""#),
+        "{context}"
+    );
     assert!(context.contains(r#""work_slug": "web-check""#));
     assert!(context.contains(r#""latest_events""#));
     assert!(context.contains(r#""loop_interventions""#));
@@ -6389,6 +6505,24 @@ fn command<const ARG_COUNT: usize>(
     Ok(command)
 }
 
+fn sign_adapter_catalog_fixture(
+    index: &Path,
+    signing_key: &SigningKey,
+    key_id: &str,
+) -> anyhow::Result<()> {
+    let parsed = ldgr_core::release_index::parse_release_index(&fs::read_to_string(index)?)?;
+    let canonical = ldgr_core::update::catalog::canonical_adapter_catalog_bytes(&parsed)?;
+    fs::write(
+        format!("{}.sig", index.display()),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "algorithm": "Ed25519",
+            "key_id": key_id,
+            "signature": STANDARD.encode(signing_key.sign(&canonical).to_bytes())
+        }))?,
+    )?;
+    Ok(())
+}
+
 fn isolated_command(project: &Path) -> anyhow::Result<Command> {
     let mut command = Command::cargo_bin("ldgr")?;
     command
@@ -7187,7 +7321,7 @@ description = "Run a check."
 "#
         ),
     )?;
-    Ok(())
+    write_adapter_compatibility_fixture(dir, slug, 1, &[])
 }
 
 fn write_adapter_namespace_fixture(
@@ -7225,6 +7359,29 @@ usage = "ldgr {namespace} <args...>"
 summary = "Run {namespace} adapter commands."
 "#
         ),
+    )?;
+    write_adapter_compatibility_fixture(dir, slug, 1, &[])
+}
+
+fn write_adapter_compatibility_fixture(
+    dir: &Path,
+    slug: &str,
+    protocol: i32,
+    required_capabilities: &[&str],
+) -> anyhow::Result<()> {
+    fs::write(
+        dir.join("adapter-compatibility.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "adapter": slug,
+            "compatibility": {
+                "adapter_protocol_epoch": protocol,
+                "central_components": [],
+                "minimum_core_schema": 5,
+                "required_core_capabilities": required_capabilities,
+            },
+            "format": "ldgr.adapter-compatibility.v2",
+            "local_stores": [],
+        }))?,
     )?;
     Ok(())
 }

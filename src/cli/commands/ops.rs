@@ -480,7 +480,20 @@ pub(crate) fn handle_install_adapter(args: &InstallAdapterArgs) -> anyhow::Resul
     if args.offline && source.starts_with("http") {
         bail!("--offline requires LDGR_ADAPTER_INDEX to reference a local file");
     }
-    match crate::release_index::load_release_index(source) {
+    let signed_index = (|| {
+        let sources = crate::update::catalog::AdapterCatalogSources::configured(args.offline)?;
+        let client = crate::update::network::UpdateNetworkClient::new(args.offline)?;
+        match crate::update::catalog::fetch_signed_adapter_update_catalog(&client, &sources, None)?
+        {
+            crate::update::catalog::AdapterCatalogFetch::Modified { verified, .. } => {
+                Ok(verified.catalog)
+            }
+            crate::update::catalog::AdapterCatalogFetch::NotModified { .. } => {
+                bail!("adapter release index unexpectedly returned not-modified")
+            }
+        }
+    })();
+    match signed_index {
         Ok(index) => install_adapter_from_index(args, &index),
         Err(index_error) if default_catalog_fallback_allowed(args, configured_source.is_some()) => {
             eprintln!(
@@ -1288,7 +1301,12 @@ pub(crate) fn stage_and_apply_resolved_index_release(
             extracted.display()
         );
     }
-    validate_adapter_bundle_contract(&extracted, &resolved.adapter.domain)?;
+    if resolved.release.compatibility.is_some() {
+        validate_adapter_bundle_contract(&extracted, &resolved.adapter.domain)?;
+        crate::release_index::verify_resolved_v2_sidecar(&extracted, resolved)?;
+    } else {
+        validate_legacy_adapter_bundle_contract(&extracted, &resolved.adapter.domain)?;
+    }
     transaction.snapshot(install_root)?;
     let binary_source = extracted
         .join(&resolved.platform.platform)
@@ -1328,7 +1346,12 @@ pub(crate) fn apply_staged_resolved_index_release(
     transaction: &mut InstallTransaction,
     quiet: bool,
 ) -> anyhow::Result<()> {
-    validate_adapter_bundle_contract(extracted, &resolved.adapter.domain)?;
+    if resolved.release.compatibility.is_some() {
+        validate_adapter_bundle_contract(extracted, &resolved.adapter.domain)?;
+        crate::release_index::verify_resolved_v2_sidecar(extracted, resolved)?;
+    } else {
+        validate_legacy_adapter_bundle_contract(extracted, &resolved.adapter.domain)?;
+    }
     let binary_source = extracted
         .join(&resolved.platform.platform)
         .join(&resolved.platform.binary);
@@ -1482,13 +1505,19 @@ fn write_installation_receipt(
         .context("system clock is before Unix epoch")?
         .as_secs();
     let receipt = crate::release_index::InstallationReceipt {
-        schema_version: 1,
+        schema_version: if resolved.release.compatibility.is_some() {
+            2
+        } else {
+            1
+        },
         domain: resolved.adapter.domain.clone(),
         version: resolved.version.to_string(),
         source_url: resolved.platform.asset_url.clone(),
         sha256: resolved.platform.sha256.clone(),
         signing_key_id: resolved.platform.signing_key_id.clone(),
         core_compatibility: resolved.release.core_compatibility.clone(),
+        compatibility: resolved.release.compatibility.clone(),
+        compatibility_sha256: resolved.release.compatibility_sha256.clone(),
         platform: resolved.platform.platform.clone(),
         resource_manifest: resolved.platform.resource_manifest.clone(),
         installed_at_unix_seconds,
@@ -1929,15 +1958,6 @@ static AVAILABLE_ADAPTERS: &[AvailableAdapter] = &[
         workspace_package: Some("ldgr-evidence"),
         git: None,
         release: Some(commercial_release("evidence", "ldgr-evidence")),
-    },
-    AvailableAdapter {
-        slug: "recall",
-        title: "Recall adapter",
-        source: "",
-        install: "ldgr adapter install recall",
-        workspace_package: Some("ldgr-recall"),
-        git: None,
-        release: Some(commercial_release("recall", "ldgr-recall")),
     },
 ];
 
@@ -2576,6 +2596,29 @@ fn verify_source_identity_paths(
 }
 
 pub(crate) fn validate_adapter_bundle_contract(bundle: &Path, adapter: &str) -> anyhow::Result<()> {
+    let v2_path = bundle.join("adapter-compatibility.json");
+    if v2_path.exists() {
+        let sidecar = crate::adapter_compatibility::parse_adapter_compatibility_v2(
+            &fs::read_to_string(&v2_path)
+                .with_context(|| format!("failed to read {}", v2_path.display()))?,
+        )
+        .map_err(anyhow::Error::new)
+        .with_context(|| format!("adapter {adapter} has invalid v2 compatibility metadata"))?;
+        anyhow::ensure!(
+            sidecar.adapter == adapter,
+            "adapter bundle identity {} does not match requested adapter {adapter}",
+            sidecar.adapter
+        );
+        return Ok(());
+    }
+
+    validate_legacy_adapter_bundle_contract(bundle, adapter)
+}
+
+pub(crate) fn validate_legacy_adapter_bundle_contract(
+    bundle: &Path,
+    adapter: &str,
+) -> anyhow::Result<()> {
     let manifest_path = bundle.join("adapter.toml");
     if manifest_path.is_file() {
         let manifest: toml::Value = toml::from_str(&fs::read_to_string(&manifest_path)?)
@@ -4670,6 +4713,8 @@ mod tests {
             ("security", "ldgr-security"),
             ("explore", "ldgr-explore"),
             ("bench", "ldgr-bench"),
+            ("conduct", "ldgr-conduct"),
+            ("evidence", "ldgr-evidence"),
         ] {
             let adapter = available_adapter_catalog()
                 .iter()

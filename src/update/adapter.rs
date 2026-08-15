@@ -169,8 +169,15 @@ pub(crate) fn inspect_adapter_for_bulk(
                 "release receipt domain does not match the discovered adapter"
             );
             Version::parse(&receipt.version).context("release receipt version is invalid")?;
-            VersionReq::parse(&receipt.core_compatibility)
-                .context("release receipt Core compatibility is invalid")?;
+            if receipt.compatibility.is_none() {
+                VersionReq::parse(&receipt.core_compatibility)
+                    .context("legacy release receipt Core compatibility is invalid")?;
+            } else {
+                anyhow::ensure!(
+                    receipt.core_compatibility.is_empty(),
+                    "v2 release receipt must not contain a legacy Core compatibility range"
+                );
+            }
             crate::cli::commands::ops::inspect_release_installation_for_update(
                 &installed.root_path,
                 home,
@@ -691,6 +698,8 @@ mod tests {
             sha256: "0".repeat(64),
             signing_key_id: "test".to_owned(),
             core_compatibility: ">=0.1.0, <0.3.0".to_owned(),
+            compatibility: None,
+            compatibility_sha256: None,
             platform: "test-platform".to_owned(),
             resource_manifest: "adapter-resources.json".to_owned(),
             installed_at_unix_seconds: 0,
@@ -726,12 +735,16 @@ mod tests {
                         version: "2.0.0-beta.1".to_owned(),
                         channel: ReleaseChannel::Prerelease,
                         core_compatibility: ">=0.2.0, <0.3.0".to_owned(),
+                        compatibility: None,
+                        compatibility_sha256: None,
                         platforms: vec![platform("2.0.0-beta.1")],
                     },
                     AdapterRelease {
                         version: "1.5.0".to_owned(),
                         channel: ReleaseChannel::Stable,
                         core_compatibility: ">=0.2.0, <0.3.0".to_owned(),
+                        compatibility: None,
+                        compatibility_sha256: None,
                         platforms: vec![platform("1.5.0")],
                     },
                 ],

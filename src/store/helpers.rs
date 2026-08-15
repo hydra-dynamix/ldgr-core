@@ -832,16 +832,27 @@ mod tests {
     }
 
     #[test]
-    fn adapter_store_open_validates_generated_component() -> anyhow::Result<()> {
+    fn adapter_store_open_rejects_unregistered_local_component() -> anyhow::Result<()> {
         let temp = tempfile::tempdir()?;
         let db = temp.path().join("ldgr.sqlite3");
         init_store(&db, &temp.path().join("artifacts"))?;
-        let contract = crate::database_contract::generated_adapter_contract_json("example")?;
-        let connection = open_store_for_adapter(&db, &contract)?;
-        assert_eq!(current_schema_version(&connection)?, CURRENT_SCHEMA_VERSION);
+
+        let connection = Connection::open(&db)?;
+        assert_eq!(
+            list_schema_components(&connection)?
+                .into_iter()
+                .map(|component| component.namespace)
+                .collect::<Vec<_>>(),
+            ["core"]
+        );
+        drop(connection);
+
+        let local_contract = crate::database_contract::generated_adapter_contract_json("example")?;
+        let error = open_store_for_adapter(&db, &local_contract).unwrap_err();
+        assert!(format!("{error:#}").contains("does not register adapter schema component example"));
 
         let missing = temp.path().join("missing/ldgr.sqlite3");
-        let error = open_store_for_adapter(&missing, &contract).unwrap_err();
+        let error = open_store_for_adapter(&missing, &local_contract).unwrap_err();
         assert!(format!("{error:#}").contains("cannot initialize"));
         assert!(!missing.exists());
         Ok(())

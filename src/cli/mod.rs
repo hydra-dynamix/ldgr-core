@@ -15,7 +15,7 @@ use clap::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::adapter_registry::{AdapterCommandNamespace, AdapterRegistry};
+use crate::adapter_registry::{AdapterCommandNamespace, AdapterOperationalState, AdapterRegistry};
 use crate::store::open_store;
 
 use args::*;
@@ -540,7 +540,7 @@ fn handle_cli(cli: Cli) -> anyhow::Result<()> {
         Command::Web(args) => commands::ops::handle_web(&cli.db, &cli.artifact_root, args),
         Command::Loop(args) => commands::ops::handle_loop_entry(&cli.db, &cli.artifact_root, args),
         Command::Update(args) => commands::update::handle_update(args),
-        Command::Adapter(args) => commands::adapters::handle_adapter(args),
+        Command::Adapter(args) => commands::adapters::handle_adapter(args, &cli.db),
         Command::Telemetry(args) => commands::ops::handle_telemetry(args),
         Command::Next(args) => commands::work::handle_next(&open_store(&cli.db)?, args),
         Command::Rerun => handle_rerun(),
@@ -578,7 +578,7 @@ fn try_dispatch_adapter_namespace(args: &[OsString]) -> anyhow::Result<bool> {
     let Some(mut request) = adapter_namespace_request(args) else {
         return Ok(false);
     };
-    let registry = AdapterRegistry::discover();
+    let registry = AdapterRegistry::discover_for_database(&request.db);
     let normalized = request
         .namespace
         .trim()
@@ -588,6 +588,12 @@ fn try_dispatch_adapter_namespace(args: &[OsString]) -> anyhow::Result<bool> {
         .resolve_namespace(&request.namespace)
         .or_else(|| registry.resolve_namespace(&normalized))
     else {
+        if let Some(adapter) = registry
+            .find_by_namespace(&request.namespace)
+            .or_else(|| registry.find_by_namespace(&normalized))
+        {
+            bail!("{}", commands::adapters::blocked_dispatch_message(adapter));
+        }
         return Ok(false);
     };
     request.namespace = command.namespace.clone();
@@ -651,6 +657,36 @@ fn dispatch_adapter_namespace(
     command: &AdapterCommandNamespace,
     request: AdapterNamespaceRequest,
 ) -> anyhow::Result<()> {
+    let current_registry = AdapterRegistry::discover_for_database(&request.db);
+    let current_adapter = current_registry
+        .find(&command.adapter_slug)
+        .with_context(|| {
+            format!(
+                "adapter `{}` disappeared during dispatch revalidation",
+                command.adapter_slug
+            )
+        })?;
+    if !current_adapter.state.permits_dispatch() {
+        bail!(
+            "{}",
+            commands::adapters::blocked_dispatch_message(current_adapter)
+        );
+    }
+    if current_adapter.state == AdapterOperationalState::Degraded {
+        eprintln!(
+            "warning: adapter `{}` uses legacy compatibility metadata; repair with `{}`",
+            current_adapter.slug, current_adapter.repair.command
+        );
+    }
+    if current_registry
+        .resolve_namespace(&command.namespace)
+        .is_none()
+    {
+        bail!(
+            "adapter namespace `{}` changed during dispatch revalidation",
+            command.namespace
+        );
+    }
     if command.argv.is_empty() {
         bail!("adapter namespace `{}` has empty argv", command.namespace);
     }
@@ -733,7 +769,11 @@ fn print_dynamic_adapter_help() {
     }
     println!();
     println!("Installed adapter control surface:");
-    for adapter in &registry.adapters {
+    for adapter in registry
+        .adapters
+        .iter()
+        .filter(|adapter| adapter.state.permits_dispatch())
+    {
         println!("  {} — {}", adapter.slug, adapter.title);
         for namespace in &adapter.command_namespaces {
             let description = namespace
@@ -781,7 +821,11 @@ fn maybe_print_adapter_namespace_hint(args: &[OsString]) {
     let input = input.to_ascii_lowercase().replace('_', "-");
     let registry = AdapterRegistry::discover();
     let mut scored = Vec::new();
-    for adapter in &registry.adapters {
+    for adapter in registry
+        .adapters
+        .iter()
+        .filter(|adapter| adapter.state.permits_dispatch())
+    {
         for namespace in &adapter.command_namespaces {
             let distance = std::iter::once(namespace.namespace.as_str())
                 .chain(namespace.aliases.iter().map(String::as_str))

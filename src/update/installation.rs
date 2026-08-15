@@ -1174,7 +1174,8 @@ mod tests {
         let (home, bin, core, agentctl) = isolated_pair()?;
         let link = bin.join("linked-agentctl");
         symlink(&agentctl, &link)?;
-        let receipt = official_receipt(&bin, &core, &link)?;
+        let mut receipt = official_receipt(&bin, &core, &agentctl)?;
+        receipt.agentctl_binary_path = link;
         let receipt_path = core_installation_receipt_path(home.path());
         fs::create_dir_all(receipt_path.parent().unwrap())?;
         atomic_write_receipt(&receipt_path, &receipt)?;

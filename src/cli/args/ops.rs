@@ -225,10 +225,48 @@ pub struct WebArgs {
     pub control_token: Option<String>,
 }
 
+const LOOP_HELP: &str = "Examples:\n  ldgr loop run --prompt prompts/loop-prompt.md --agent agentctl\n  ldgr loop run --prompt-slug implementation-loop --until-empty\n  ldgr loop run --bundle release --prompt-role implementation-loop --detach\n\n`loop run` renders durable LDGR context into a selected prompt and executes bounded agent sessions. Run `ldgr loop run --help` for prompt sources, active-run resumption, iteration controls, artifacts, completion audits, and detailed examples.";
+
+const LOOP_RUN_HELP: &str = r#"Execution model:
+  * Choose exactly one prompt source: --prompt, --prompt-slug, or --bundle.
+  * If a run is already active, the loop resumes that run and its work item instead
+    of claiming another item. A running work item with no active run still requires
+    a decision or lifecycle correction before new work can start.
+  * With no active run, the loop atomically claims the next ready pending item.
+  * Every cycle renders fresh LDGR context, invokes one fresh agent process, records
+    prompt provenance and process output, and finishes the run if it is still active.
+
+Agents and output:
+  --agent agentctl is the default. Use --agent-argv with a JSON argv array for a
+  custom process; the rendered prompt is sent on stdin. --stream-agent-output tees
+  stdout/stderr while retaining full artifact files. --summary-agent or
+  --summary-argv adds a separate one-shot summary and --summary-log selects its log.
+  --agent-timeout-seconds 0 disables the timeout.
+
+Iteration and background execution:
+  The default is one cycle. --max-iterations N bounds repeated cycles;
+  --until-empty continues until the queue drains, a subprocess fails, or the loop
+  blocks. --detach launches the same loop in the background and writes stdout/stderr
+  under .ldgr/logs. --dry-run renders and records artifacts without spawning agents.
+
+Project completion:
+  --project-complete-requested requires --audit-argv. The fresh audit runs before
+  the worker, and both processes must succeed for a successful loop result.
+
+Examples:
+  ldgr loop run --prompt prompts/loop-prompt.md
+  ldgr loop run --prompt-slug implementation-loop --agent agentctl
+  ldgr loop run --bundle release --prompt-role implementation-loop --until-empty
+  ldgr loop run --prompt prompts/loop-prompt.md --agent-argv '["my-agent","--batch"]'
+  ldgr loop run --prompt prompts/loop-prompt.md --dry-run
+  ldgr loop run --prompt prompts/loop-prompt.md --until-empty --summary-agent agentctl
+  ldgr loop run --prompt prompts/loop-prompt.md --until-empty --detach
+  ldgr loop run --prompt prompts/loop-prompt.md --project-complete-requested \
+    --audit-argv '["my-auditor","--fresh"]'
+"#;
+
 #[derive(Debug, Args)]
-#[command(
-    after_help = "Examples:\n  ldgr loop run --prompt prompts/loop-prompt.md --agent agentctl\n  ldgr loop run --prompt prompts/loop-prompt.md --agent agentctl --until-empty --summary-agent agentctl\n  ldgr loop run --prompt prompts/loop-prompt.md --agent agentctl --until-empty --detach\n  ldgr loop run --prompt prompts/loop-prompt.md --dry-run\n  ldgr loop run --prompt prompts/loop-prompt.md --agent-argv '[\"my-agent\"]'\n\nLoop run executes bounded cycles from pending work items. Each cycle is a fresh agent invocation that rehydrates from LDGR context. Use --until-empty to keep launching one fresh cycle at a time until no pending work remains or the loop blocks. Use --detach for a background process whose stdout and stderr are written under the LDGR logs directory."
-)]
+#[command(after_help = LOOP_HELP)]
 pub struct LoopArgs {
     #[command(subcommand)]
     pub command: LoopCommand,
@@ -241,6 +279,7 @@ pub enum LoopCommand {
 }
 
 #[derive(Debug, Args)]
+#[command(after_help = LOOP_RUN_HELP)]
 pub struct LoopRunArgs {
     /// Editable prompt document used as the model system prompt template.
     #[arg(long, conflicts_with_all = ["prompt_slug", "bundle"])]

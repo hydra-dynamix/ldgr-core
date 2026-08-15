@@ -6,14 +6,19 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use sha2::{Digest, Sha256};
 
+use crate::adapter_compatibility::{
+    evaluate_legacy_v1, evaluate_v2, AdapterCompatibilitySidecarV2, CompatibilityReason,
+};
+use crate::database_contract::AdapterDatabaseContract;
 use crate::harness_config::UpdateChannel;
 use crate::release_index::{
-    resolve_release, validate_release_index, AdapterPlatformRelease, AdapterRelease,
-    AdapterReleaseIndex,
+    resolve_release, resolve_release_with_profile, validate_release_index, AdapterPlatformRelease,
+    AdapterRelease, AdapterReleaseIndex,
 };
 
 use super::catalog::{
-    resolve_newer_core_release, CorePlatformArchive, CoreRelease, VerifiedCoreUpdateCatalog,
+    resolve_newer_core_release, CandidateCoreAdapterCompatibilityV2, CorePlatformArchive,
+    CoreRelease, VerifiedCoreUpdateCatalog,
 };
 
 pub const UPDATE_PLAN_SCHEMA_VERSION: u32 = 1;
@@ -101,6 +106,21 @@ pub struct AdapterInstallationSnapshot {
     pub slug: String,
     pub origin: AdapterOrigin,
     pub installation: AdapterInstallationKind,
+    pub compatibility: InstalledAdapterCompatibility,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "format", rename_all = "snake_case", deny_unknown_fields)]
+pub enum InstalledAdapterCompatibility {
+    V2 {
+        sidecar: AdapterCompatibilitySidecarV2,
+    },
+    LegacyV1 {
+        contract: AdapterDatabaseContract,
+    },
+    Invalid {
+        reason: String,
+    },
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -286,6 +306,23 @@ impl UpdatePlan {
         &self.warnings
     }
 
+    pub fn candidate_adapter_compatibility(&self) -> Option<&CandidateCoreAdapterCompatibilityV2> {
+        self.components
+            .iter()
+            .find_map(|component| match component {
+                UpdatePlanComponent::CoreBundle {
+                    action: UpdateAction::Update,
+                    artifact: Some(artifact),
+                    ..
+                } => artifact
+                    .release
+                    .compatibility
+                    .adapter_compatibility
+                    .as_ref(),
+                _ => None,
+            })
+    }
+
     pub fn update_available(&self) -> bool {
         self.components.iter().any(|component| {
             matches!(
@@ -452,6 +489,13 @@ pub fn build_update_plan(
     let resolved_target_core = resolved_core
         .as_ref()
         .map_or_else(|| current_core.clone(), |resolved| resolved.version.clone());
+    let candidate_adapter_compatibility = resolved_core.as_ref().and_then(|resolved| {
+        resolved
+            .release
+            .compatibility
+            .adapter_compatibility
+            .as_ref()
+    });
     let target_core = resolved_target_core.to_string();
     let mut components = Vec::new();
     let mut warnings = inventory.discovery_warnings.clone();
@@ -536,7 +580,26 @@ pub fn build_update_plan(
     }
 
     let adapters_by_slug = adapters_by_slug(&inventory.adapters)?;
-    if selection.include_all_adapters || !selection.adapters.is_empty() {
+    if resolved_core.is_some() {
+        // A Core replacement always inventories every installed adapter. CLI
+        // selectors cannot hide an invalid or candidate-incompatible install.
+        for adapter in adapters_by_slug.values().copied() {
+            let (component, component_blocked, mut component_warnings) =
+                plan_adapter_for_core_update(
+                    adapter,
+                    catalogs.adapters,
+                    &resolved_target_core,
+                    candidate_adapter_compatibility,
+                    platform,
+                    request.channel,
+                    request.offline,
+                    !request.core_only,
+                )?;
+            blocked |= component_blocked;
+            warnings.append(&mut component_warnings);
+            components.push(component);
+        }
+    } else if selection.include_all_adapters || !selection.adapters.is_empty() {
         let selected_slugs = if selection.include_all_adapters {
             adapters_by_slug.keys().cloned().collect::<BTreeSet<_>>()
         } else {
@@ -562,12 +625,6 @@ pub fn build_update_plan(
             warnings.append(&mut component_warnings);
             components.push(component);
         }
-    } else if selection.include_core && resolved_core.is_some() {
-        append_core_only_incompatibility_warnings(
-            &mut warnings,
-            adapters_by_slug.values().copied(),
-            &resolved_target_core,
-        )?;
     }
 
     components.sort_by(component_order);
@@ -654,37 +711,229 @@ fn adapters_by_slug(
     Ok(by_slug)
 }
 
-fn append_core_only_incompatibility_warnings<'a>(
-    warnings: &mut Vec<String>,
-    adapters: impl Iterator<Item = &'a AdapterInstallationSnapshot>,
+#[allow(clippy::too_many_arguments)]
+fn plan_adapter_for_core_update(
+    adapter: &AdapterInstallationSnapshot,
+    catalog: &AdapterReleaseIndex,
     target_core: &Version,
-) -> anyhow::Result<()> {
-    for adapter in adapters {
-        if adapter.origin != AdapterOrigin::User {
-            continue;
-        }
-        if let AdapterInstallationKind::Release {
-            version,
-            core_compatibility,
-        } = &adapter.installation
-        {
-            let compatible = VersionReq::parse(core_compatibility)
-                .with_context(|| {
-                    format!(
-                        "adapter `{}` receipt Core compatibility is invalid",
-                        adapter.slug
-                    )
-                })?
-                .matches(target_core);
-            if !compatible {
-                warnings.push(format!(
-                    "adapter `{}` at {version} is incompatible with target Core {target_core}; --core-only leaves it unchanged",
+    candidate: Option<&CandidateCoreAdapterCompatibilityV2>,
+    platform: &str,
+    channel: UpdateChannel,
+    offline: bool,
+    coordinated_updates_allowed: bool,
+) -> anyhow::Result<(UpdatePlanComponent, bool, Vec<String>)> {
+    if adapter.origin == AdapterOrigin::User {
+        if let AdapterInstallationKind::Untracked { reason } = &adapter.installation {
+            return Ok((
+                blocked_adapter_optional(&adapter.slug, None, None),
+                true,
+                vec![format!(
+                    "adapter `{}` has no trustworthy receipt and blocks Core activation: {reason}",
                     adapter.slug
-                ));
-            }
+                )],
+            ));
         }
     }
-    Ok(())
+    let Some(candidate) = candidate else {
+        return Ok((
+            blocked_adapter_optional(
+                &adapter.slug,
+                installed_adapter_identity(&adapter.installation).as_deref(),
+                None,
+            ),
+            true,
+            vec![format!(
+                "adapter `{}` cannot be preflighted: candidate Core release has no signed adapter compatibility inventory",
+                adapter.slug
+            )],
+        ));
+    };
+
+    let evaluation = match &adapter.compatibility {
+        InstalledAdapterCompatibility::V2 { sidecar } => evaluate_v2(
+            sidecar,
+            &adapter.slug,
+            &candidate.profile,
+            &candidate.projected_database_components,
+        ),
+        InstalledAdapterCompatibility::LegacyV1 { contract } => {
+            let mut result = evaluate_legacy_v1(contract, &adapter.slug, &candidate.legacy_profile);
+            if let AdapterInstallationKind::Release {
+                core_compatibility, ..
+            } = &adapter.installation
+            {
+                let range_matches = VersionReq::parse(core_compatibility)
+                    .is_ok_and(|requirement| requirement.matches(target_core));
+                if !range_matches {
+                    result.compatible = false;
+                    result.reasons.push(legacy_target_range_reason(
+                        &adapter.slug,
+                        core_compatibility,
+                        target_core,
+                    ));
+                }
+            }
+            result
+        }
+        InstalledAdapterCompatibility::Invalid { reason } => {
+            return Ok((
+                blocked_adapter_optional(
+                    &adapter.slug,
+                    installed_adapter_identity(&adapter.installation).as_deref(),
+                    None,
+                ),
+                true,
+                vec![format!(
+                    "adapter `{}` is invalid and blocks Core activation: {reason}",
+                    adapter.slug
+                )],
+            ));
+        }
+    };
+
+    if evaluation.compatible {
+        return Ok((
+            retained_adapter(
+                &adapter.slug,
+                installed_adapter_identity(&adapter.installation),
+            ),
+            false,
+            Vec::new(),
+        ));
+    }
+    let first_reason = evaluation
+        .reasons
+        .first()
+        .map(|reason| format!("{}: {}", reason.code, reason.message))
+        .unwrap_or_else(|| "compatibility could not be proved".to_owned());
+    if !coordinated_updates_allowed {
+        return Ok((
+            blocked_adapter_optional(
+                &adapter.slug,
+                installed_adapter_identity(&adapter.installation).as_deref(),
+                None,
+            ),
+            true,
+            vec![format!(
+                "adapter `{}` is incompatible with target Core {target_core}; --core-only cannot replace it: {first_reason}",
+                adapter.slug
+            )],
+        ));
+    }
+    if adapter.origin != AdapterOrigin::User {
+        return Ok((
+            blocked_adapter_optional(
+                &adapter.slug,
+                installed_adapter_identity(&adapter.installation).as_deref(),
+                None,
+            ),
+            true,
+            vec![format!(
+                "adapter `{}` is incompatible with target Core {target_core} and its non-user installation cannot be transactionally updated: {first_reason}",
+                adapter.slug
+            )],
+        ));
+    }
+    let AdapterInstallationKind::Release { version, .. } = &adapter.installation else {
+        return Ok((
+            blocked_adapter_optional(
+                &adapter.slug,
+                installed_adapter_identity(&adapter.installation).as_deref(),
+                None,
+            ),
+            true,
+            vec![format!(
+                "adapter `{}` is incompatible with target Core {target_core} and has no signed release receipt for a coordinated repair: {first_reason}",
+                adapter.slug
+            )],
+        ));
+    };
+    let installed_version = Version::parse(version)
+        .with_context(|| format!("adapter `{}` receipt version is invalid", adapter.slug))?;
+    let resolved = resolve_release_with_profile(
+        catalog,
+        &adapter.slug,
+        target_core,
+        &candidate.profile,
+        &candidate.projected_database_components,
+        platform,
+        None,
+        channel == UpdateChannel::Prerelease,
+    );
+    let resolved = match resolved {
+        Ok(resolved) if resolved.version >= installed_version => resolved,
+        Ok(resolved) => {
+            return Ok((
+                blocked_adapter_optional(&adapter.slug, Some(version), Some(&resolved.version.to_string())),
+                true,
+                vec![format!(
+                    "adapter `{}` requires a downgrade from {version} to {} for target Core {target_core}; no same-or-newer repair is available",
+                    adapter.slug, resolved.version
+                )],
+            ));
+        }
+        Err(error) => {
+            return Ok((
+                blocked_adapter_optional(&adapter.slug, Some(version), None),
+                true,
+                vec![format!(
+                    "adapter `{}` is incompatible with target Core {target_core} and no matching staged repair is available: {error}; installed failure: {first_reason}",
+                    adapter.slug
+                )],
+            ));
+        }
+    };
+    let mut release = resolved.release.clone();
+    release
+        .platforms
+        .sort_by(|left, right| left.platform.cmp(&right.platform));
+    let artifact = AdapterReleaseArtifact {
+        domain: resolved.adapter.domain.clone(),
+        version: resolved.version.to_string(),
+        release,
+        platform: resolved.platform.clone(),
+    };
+    if offline && !adapter_artifact_is_offline(&artifact.platform) {
+        return Ok((
+            blocked_adapter_optional(&adapter.slug, Some(version), Some(&artifact.version)),
+            true,
+            vec![format!(
+                "adapter `{}` requires a coordinated repair whose remote artifacts are unavailable in offline mode",
+                adapter.slug
+            )],
+        ));
+    }
+    Ok((
+        UpdatePlanComponent::Adapter {
+            name: adapter.slug.clone(),
+            current: Some(version.clone()),
+            target: Some(artifact.version.clone()),
+            action: UpdateAction::Update,
+            compatibility: UpdateCompatibility::Compatible,
+            release: Some(artifact),
+            local_source: None,
+        },
+        false,
+        vec![format!(
+            "adapter `{}` requires coordinated replacement for target Core {target_core}: {first_reason}",
+            adapter.slug
+        )],
+    ))
+}
+
+fn legacy_target_range_reason(
+    slug: &str,
+    required: &str,
+    target_core: &Version,
+) -> CompatibilityReason {
+    CompatibilityReason {
+        code: crate::adapter_compatibility::CompatibilityReasonCode::InvalidMetadata,
+        subject: format!("{slug}.receipt.core_compatibility"),
+        required: JsonValue::String(required.to_owned()),
+        actual: JsonValue::String(target_core.to_string()),
+        message: "legacy release receipt does not allow the candidate Core package version"
+            .to_owned(),
+    }
 }
 
 fn plan_adapter(
@@ -764,16 +1013,29 @@ fn plan_adapter(
         AdapterInstallationKind::Release {
             version,
             core_compatibility,
-        } => plan_release_adapter(
-            adapter,
-            version,
-            core_compatibility,
-            catalog,
-            target_core,
-            platform,
-            channel,
-            offline,
-        ),
+        } => {
+            let active_v2 = crate::adapter_compatibility::core_compatibility_inventory();
+            let installed_is_compatible = match &adapter.compatibility {
+                InstalledAdapterCompatibility::V2 { sidecar } => {
+                    evaluate_v2(sidecar, &adapter.slug, &active_v2, &[]).compatible
+                }
+                InstalledAdapterCompatibility::LegacyV1 { .. } => {
+                    VersionReq::parse(core_compatibility)
+                        .is_ok_and(|requirement| requirement.matches(target_core))
+                }
+                InstalledAdapterCompatibility::Invalid { .. } => false,
+            };
+            plan_release_adapter(
+                adapter,
+                version,
+                installed_is_compatible,
+                catalog,
+                target_core,
+                platform,
+                channel,
+                offline,
+            )
+        }
     }
 }
 
@@ -781,7 +1043,7 @@ fn plan_adapter(
 fn plan_release_adapter(
     adapter: &AdapterInstallationSnapshot,
     version: &str,
-    core_compatibility: &str,
+    installed_is_compatible: bool,
     catalog: &AdapterReleaseIndex,
     target_core: &Version,
     platform: &str,
@@ -790,13 +1052,6 @@ fn plan_release_adapter(
 ) -> anyhow::Result<(UpdatePlanComponent, bool, Vec<String>)> {
     let installed_version = Version::parse(version)
         .with_context(|| format!("adapter `{}` receipt version is invalid", adapter.slug))?;
-    let installed_compatibility = VersionReq::parse(core_compatibility).with_context(|| {
-        format!(
-            "adapter `{}` receipt Core compatibility is invalid",
-            adapter.slug
-        )
-    })?;
-    let installed_is_compatible = installed_compatibility.matches(target_core);
     let resolved = resolve_release(
         catalog,
         &adapter.slug,
@@ -878,10 +1133,14 @@ fn plan_release_adapter(
 }
 
 fn current_adapter(name: &str, version: &str) -> UpdatePlanComponent {
+    retained_adapter(name, Some(version.to_owned()))
+}
+
+fn retained_adapter(name: &str, current: Option<String>) -> UpdatePlanComponent {
     UpdatePlanComponent::Adapter {
         name: name.to_owned(),
-        current: Some(version.to_owned()),
-        target: Some(version.to_owned()),
+        target: current.clone(),
+        current,
         action: UpdateAction::None,
         compatibility: UpdateCompatibility::Compatible,
         release: None,
@@ -902,9 +1161,17 @@ fn skipped_adapter(name: &str, current: Option<String>) -> UpdatePlanComponent {
 }
 
 fn blocked_adapter(name: &str, current: &str, target: Option<&str>) -> UpdatePlanComponent {
+    blocked_adapter_optional(name, Some(current), target)
+}
+
+fn blocked_adapter_optional(
+    name: &str,
+    current: Option<&str>,
+    target: Option<&str>,
+) -> UpdatePlanComponent {
     UpdatePlanComponent::Adapter {
         name: name.to_owned(),
-        current: Some(current.to_owned()),
+        current: current.map(str::to_owned),
         target: target.map(str::to_owned),
         action: UpdateAction::Blocked,
         compatibility: UpdateCompatibility::Incompatible,
@@ -1035,6 +1302,21 @@ mod tests {
             version: version.to_owned(),
             channel,
             core_compatibility: compatibility.to_owned(),
+            compatibility: None,
+            compatibility_sha256: None,
+            platforms: vec![platform(version, true)],
+        }
+    }
+
+    fn adapter_release_v2(slug: &str, version: &str) -> AdapterRelease {
+        let requirements = compatible_sidecar(slug).compatibility;
+        let compatibility_sha256 = requirements.compatibility_sha256().unwrap();
+        AdapterRelease {
+            version: version.to_owned(),
+            channel: ReleaseChannel::Stable,
+            core_compatibility: String::new(),
+            compatibility: Some(requirements),
+            compatibility_sha256: Some(compatibility_sha256),
             platforms: vec![platform(version, true)],
         }
     }
@@ -1083,6 +1365,7 @@ mod tests {
                 launcher_compatibility_schema: LAUNCHER_COMPATIBILITY_SCHEMA_V1.to_owned(),
                 error_recovery_schema: ERROR_RECOVERY_SCHEMA_VERSION,
                 release_metadata_schema: CORE_RELEASE_METADATA_SCHEMA_VERSION,
+                adapter_compatibility: Some(CandidateCoreAdapterCompatibilityV2::generated()),
             },
             platforms: vec![core_platform(version, true)],
         }
@@ -1103,7 +1386,17 @@ mod tests {
                 archive_keyring: ReleaseKeyring { keys: Vec::new() },
             },
             AdapterReleaseIndex {
-                schema_version: 1,
+                schema_version: if !adapters.is_empty()
+                    && adapters.iter().all(|adapter| {
+                        adapter
+                            .releases
+                            .iter()
+                            .all(|release| release.compatibility.is_some())
+                    }) {
+                    crate::release_index::ADAPTER_RELEASE_INDEX_SCHEMA_VERSION
+                } else {
+                    crate::release_index::LEGACY_ADAPTER_RELEASE_INDEX_SCHEMA_VERSION
+                },
                 adapters,
             },
         )
@@ -1121,6 +1414,20 @@ mod tests {
         }
     }
 
+    fn compatible_sidecar(slug: &str) -> AdapterCompatibilitySidecarV2 {
+        AdapterCompatibilitySidecarV2 {
+            format: crate::adapter_compatibility::ADAPTER_COMPATIBILITY_FORMAT_V2.to_owned(),
+            adapter: slug.to_owned(),
+            compatibility: crate::adapter_compatibility::CompatibilityRequirementsV2 {
+                adapter_protocol_epoch: 1,
+                minimum_core_schema: 1,
+                required_core_capabilities: Vec::new(),
+                central_components: Vec::new(),
+            },
+            local_stores: Vec::new(),
+        }
+    }
+
     fn release_install(
         slug: &str,
         version: &str,
@@ -1132,6 +1439,9 @@ mod tests {
             installation: AdapterInstallationKind::Release {
                 version: version.to_owned(),
                 core_compatibility: compatibility.to_owned(),
+            },
+            compatibility: InstalledAdapterCompatibility::V2 {
+                sidecar: compatible_sidecar(slug),
             },
         }
     }
@@ -1181,7 +1491,7 @@ mod tests {
     }
 
     #[test]
-    fn resolves_core_pair_then_adapters_against_target_core() -> anyhow::Result<()> {
+    fn compatible_core_update_retains_installed_adapter_bytes() -> anyhow::Result<()> {
         let plan = plan(
             UpdatePlanRequest::default(),
             vec![core_release("2.0.0", ReleaseChannel::Stable)],
@@ -1200,12 +1510,111 @@ mod tests {
         )?;
         assert_eq!(plan.target_core(), "2.0.0");
         assert_eq!(plan.components()[0].action(), UpdateAction::Update);
-        assert_eq!(plan.components()[1].action(), UpdateAction::Update);
-        assert_eq!(plan.components()[1].target(), Some("1.5.0"));
+        assert_eq!(plan.components()[1].action(), UpdateAction::None);
+        assert_eq!(plan.components()[1].target(), Some("1.0.0"));
         assert_eq!(
             plan.check_result().status,
             UpdateResultStatus::UpdatesAvailable
         );
+        Ok(())
+    }
+
+    #[test]
+    fn untracked_user_adapter_blocks_core_replacement_even_with_valid_sidecar() -> anyhow::Result<()>
+    {
+        let installed = AdapterInstallationSnapshot {
+            slug: "fixture".to_owned(),
+            origin: AdapterOrigin::User,
+            installation: AdapterInstallationKind::Untracked {
+                reason: "receipt ownership validation failed".to_owned(),
+            },
+            compatibility: InstalledAdapterCompatibility::V2 {
+                sidecar: compatible_sidecar("fixture"),
+            },
+        };
+        let plan = plan(
+            UpdatePlanRequest::default(),
+            vec![core_release("2.0.0", ReleaseChannel::Stable)],
+            Vec::new(),
+            inventory(vec![installed]),
+        )?;
+        assert!(plan.blocked());
+        assert_eq!(plan.components()[1].action(), UpdateAction::Blocked);
+        assert!(plan
+            .warnings()
+            .iter()
+            .any(|warning| warning.contains("no trustworthy receipt")));
+        Ok(())
+    }
+
+    #[test]
+    fn core_release_without_signed_candidate_inventory_blocks_installed_adapters(
+    ) -> anyhow::Result<()> {
+        let mut core = core_release("2.0.0", ReleaseChannel::Stable);
+        core.compatibility.adapter_compatibility = None;
+        let plan = plan(
+            UpdatePlanRequest::default(),
+            vec![core],
+            Vec::new(),
+            inventory(vec![release_install("research", "1.0.0", "")]),
+        )?;
+        assert!(plan.blocked());
+        assert_eq!(plan.components()[1].action(), UpdateAction::Blocked);
+        assert!(plan
+            .warnings()
+            .iter()
+            .any(|warning| warning.contains("no signed adapter compatibility inventory")));
+        Ok(())
+    }
+
+    #[test]
+    fn incompatible_v2_adapter_stages_same_version_candidate_variant() -> anyhow::Result<()> {
+        let mut installed = release_install("research", "1.0.0", "");
+        let InstalledAdapterCompatibility::V2 { sidecar } = &mut installed.compatibility else {
+            unreachable!();
+        };
+        sidecar.compatibility.adapter_protocol_epoch = 2;
+        let plan = plan(
+            UpdatePlanRequest::default(),
+            vec![core_release("2.0.0", ReleaseChannel::Stable)],
+            vec![adapter_product(
+                "research",
+                vec![adapter_release_v2("research", "1.0.0")],
+            )],
+            inventory(vec![installed]),
+        )?;
+        assert!(!plan.blocked());
+        assert_eq!(plan.components()[0].action(), UpdateAction::Update);
+        assert_eq!(plan.components()[1].action(), UpdateAction::Update);
+        assert_eq!(plan.components()[1].current(), Some("1.0.0"));
+        assert_eq!(plan.components()[1].target(), Some("1.0.0"));
+        assert!(plan
+            .warnings()
+            .iter()
+            .any(|warning| warning.contains("protocol_epoch_unsupported")));
+        Ok(())
+    }
+
+    #[test]
+    fn incompatible_v2_adapter_without_candidate_blocks_before_staging() -> anyhow::Result<()> {
+        let mut installed = release_install("research", "1.0.0", "");
+        let InstalledAdapterCompatibility::V2 { sidecar } = &mut installed.compatibility else {
+            unreachable!();
+        };
+        sidecar.compatibility.required_core_capabilities = vec!["work.v2".to_owned()];
+        let plan = plan(
+            UpdatePlanRequest::default(),
+            vec![core_release("2.0.0", ReleaseChannel::Stable)],
+            Vec::new(),
+            inventory(vec![installed]),
+        )?;
+        assert!(plan.blocked());
+        assert_eq!(plan.components()[1].action(), UpdateAction::Blocked);
+        assert!(!plan.update_available() || plan.components()[0].action() == UpdateAction::Update);
+        assert!(plan
+            .warnings()
+            .iter()
+            .any(|warning| warning.contains("no matching staged repair")));
         Ok(())
     }
 
@@ -1296,7 +1705,7 @@ mod tests {
         assert_eq!(stable.target_core(), "1.1.0");
         let prerelease = make_plan(UpdateChannel::Prerelease)?;
         assert_eq!(prerelease.target_core(), "2.0.0-beta.1");
-        assert_eq!(prerelease.components()[1].target(), Some("2.0.0-beta.1"));
+        assert_eq!(prerelease.components()[1].target(), Some("1.0.0"));
         Ok(())
     }
 
@@ -1314,6 +1723,9 @@ mod tests {
                     "installed-digest".to_owned()
                 },
                 source_changed: changed,
+            },
+            compatibility: InstalledAdapterCompatibility::V2 {
+                sidecar: compatible_sidecar("local"),
             },
         };
         for (changed, action) in [
@@ -1353,6 +1765,9 @@ mod tests {
                     installation: AdapterInstallationKind::Untracked {
                         reason: "development checkout".to_owned(),
                     },
+                    compatibility: InstalledAdapterCompatibility::V2 {
+                        sidecar: compatible_sidecar("override"),
+                    },
                 },
                 AdapterInstallationSnapshot {
                     slug: "project".to_owned(),
@@ -1360,12 +1775,18 @@ mod tests {
                     installation: AdapterInstallationKind::Untracked {
                         reason: "project checkout".to_owned(),
                     },
+                    compatibility: InstalledAdapterCompatibility::V2 {
+                        sidecar: compatible_sidecar("project"),
+                    },
                 },
                 AdapterInstallationSnapshot {
                     slug: "untracked".to_owned(),
                     origin: AdapterOrigin::User,
                     installation: AdapterInstallationKind::Untracked {
                         reason: "receipt missing".to_owned(),
+                    },
+                    compatibility: InstalledAdapterCompatibility::V2 {
+                        sidecar: compatible_sidecar("untracked"),
                     },
                 },
             ]),
@@ -1390,7 +1811,7 @@ mod tests {
     }
 
     #[test]
-    fn incompatible_adapter_blocks_default_but_core_only_warns() -> anyhow::Result<()> {
+    fn incompatible_adapter_blocks_default_and_core_only() -> anyhow::Result<()> {
         let core_releases = vec![core_release("2.0.0", ReleaseChannel::Stable)];
         let adapter_releases = vec![adapter_product(
             "research",
@@ -1400,11 +1821,12 @@ mod tests {
                 ">=1.0.0, <2.0.0",
             )],
         )];
-        let installed_inventory = inventory(vec![release_install(
-            "research",
-            "1.0.0",
-            ">=1.0.0, <2.0.0",
-        )]);
+        let mut installed = release_install("research", "1.0.0", ">=1.0.0, <2.0.0");
+        let InstalledAdapterCompatibility::V2 { sidecar } = &mut installed.compatibility else {
+            unreachable!();
+        };
+        sidecar.compatibility.adapter_protocol_epoch = 2;
+        let installed_inventory = inventory(vec![installed]);
         let default_plan = plan(
             UpdatePlanRequest::default(),
             core_releases.clone(),
@@ -1426,8 +1848,9 @@ mod tests {
             adapter_releases,
             installed_inventory,
         )?;
-        assert!(!core_only.blocked());
-        assert_eq!(core_only.components().len(), 1);
+        assert!(core_only.blocked());
+        assert_eq!(core_only.components().len(), 2);
+        assert_eq!(core_only.components()[1].action(), UpdateAction::Blocked);
         assert!(core_only
             .warnings()
             .iter()
@@ -1443,11 +1866,15 @@ mod tests {
                 "research",
                 vec![adapter_release("1.1.0", ReleaseChannel::Stable, ">=2.0.0")],
             )],
-            inventory(vec![release_install(
-                "research",
-                "1.0.0",
-                ">=1.0.0, <2.0.0",
-            )]),
+            {
+                let mut installed = release_install("research", "1.0.0", ">=1.0.0, <2.0.0");
+                let InstalledAdapterCompatibility::V2 { sidecar } = &mut installed.compatibility
+                else {
+                    unreachable!();
+                };
+                sidecar.compatibility.adapter_protocol_epoch = 2;
+                inventory(vec![installed])
+            },
         )?;
         assert!(core_only_with_available_adapter
             .warnings()

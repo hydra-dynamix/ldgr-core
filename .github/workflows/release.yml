@@ -167,7 +167,7 @@ jobs:
           cp "target/release-agentctl/release/${agentctl_file}" "$staging/${agentctl_file}"
           chmod +x "$staging/${binary_file}" || true
           chmod +x "$staging/${agentctl_file}" || true
-          cp README.md LICENSE "dist/${RELEASE_NAME}-${version}/"
+          cp README.md LICENSE schema/core-compatibility.json "dist/${RELEASE_NAME}-${version}/"
           if [[ -f scripts/install.sh ]]; then mkdir -p "dist/${RELEASE_NAME}-${version}/scripts"; cp scripts/install.sh "dist/${RELEASE_NAME}-${version}/scripts/install.sh"; fi
           cat > "dist/${RELEASE_NAME}-${version}/RELEASE-METADATA.json" <<JSON
           {

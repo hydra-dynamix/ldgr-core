@@ -82,6 +82,11 @@ pub struct PlanStagingOwnership {
     pub home: PathBuf,
     pub core: Option<CoreInstallationReceipt>,
     pub adapters: BTreeMap<String, AdapterStagingOwnership>,
+    /// Every discovered install root, including retained, blocked, project,
+    /// override, and malformed candidates. Used for candidate-profile race
+    /// checks before and after activation.
+    #[serde(default)]
+    pub adapter_roots: BTreeMap<String, PathBuf>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -507,45 +512,77 @@ fn validate_adapter_discovery(
     plan: &UpdatePlan,
     ownership: &PlanStagingOwnership,
 ) -> anyhow::Result<()> {
-    let selected = plan
+    let adapters = plan
         .components()
         .iter()
         .filter(|component| {
             matches!(component, UpdatePlanComponent::Adapter { .. })
                 && matches!(
                     component.action(),
-                    UpdateAction::Update | UpdateAction::ReinstallLocalSource
+                    UpdateAction::None | UpdateAction::Update | UpdateAction::ReinstallLocalSource
                 )
         })
         .collect::<Vec<_>>();
-    if selected.is_empty() {
+    if adapters.is_empty() {
         return Ok(());
     }
-    let roots = selected
-        .iter()
-        .filter_map(|component| ownership.adapters.get(component.name()))
-        .map(|owned| owned.user_adapter_root.clone())
-        .collect::<BTreeSet<_>>();
-    let registry = crate::adapter_registry::AdapterRegistry::discover_from_roots(roots);
-    for component in selected {
-        let owned = ownership
-            .adapters
+    let mut roots = BTreeSet::new();
+    for component in &adapters {
+        if let Some(root) = ownership.adapter_roots.get(component.name()) {
+            roots.insert(root.clone());
+        } else if let Some(owned) = ownership.adapters.get(component.name()) {
+            roots.insert(owned.install_root.clone());
+        }
+    }
+    let registry = if let Some(candidate) = plan.candidate_adapter_compatibility() {
+        crate::adapter_registry::AdapterRegistry::discover_from_roots_with_profiles(
+            roots,
+            &candidate.profile,
+            &candidate.projected_database_components,
+            &candidate.legacy_profile,
+        )
+    } else {
+        crate::adapter_registry::AdapterRegistry::discover_from_roots(roots)
+    };
+    for component in adapters {
+        let expected_root = ownership
+            .adapter_roots
             .get(component.name())
-            .with_context(|| format!("updated adapter `{}` lost ownership", component.name()))?;
+            .or_else(|| {
+                ownership
+                    .adapters
+                    .get(component.name())
+                    .map(|owned| &owned.install_root)
+            })
+            .with_context(|| format!("adapter `{}` lost its inventoried root", component.name()))?;
         ensure!(
             !registry
                 .warnings
                 .iter()
-                .any(|warning| warning.manifest_path.starts_with(&owned.install_root)),
-            "updated adapter `{}` emitted a discovery warning",
+                .any(|warning| warning.manifest_path.starts_with(expected_root)),
+            "adapter `{}` emitted a candidate-profile discovery warning",
             component.name()
         );
         let discovered = registry.find(component.name()).with_context(|| {
-            format!("updated adapter `{}` is not discoverable", component.name())
+            format!(
+                "adapter `{}` is not discoverable after candidate activation",
+                component.name()
+            )
         })?;
         ensure!(
-            paths_equal(&discovered.root_path, &owned.install_root),
-            "updated adapter `{}` resolved from a different installation root",
+            discovered.state.permits_dispatch(),
+            "adapter `{}` is {} against the candidate Core after activation: {}",
+            component.name(),
+            discovered.state,
+            discovered
+                .reasons
+                .first()
+                .map(|reason| reason.message.as_str())
+                .unwrap_or("compatibility could not be proved")
+        );
+        ensure!(
+            paths_equal(&discovered.root_path, expected_root),
+            "adapter `{}` resolved from a different installation root",
             component.name()
         );
     }
@@ -726,6 +763,9 @@ pub fn stage_verified_update_plan(
         !artifacts.is_empty(),
         "resolved update plan contains no selected artifacts"
     );
+    validate_retained_adapter_preflight(plan, ownership).context(
+        "update.compatibility-preflight-failed: retained adapter changed during staging",
+    )?;
     targets = coalesce_staging_targets(targets)?;
     targets.sort_by(|left, right| {
         path_key(&left.path)
@@ -758,6 +798,52 @@ pub fn stage_verified_update_plan(
         manifest,
         transaction,
     })
+}
+
+fn validate_retained_adapter_preflight(
+    plan: &UpdatePlan,
+    ownership: &PlanStagingOwnership,
+) -> anyhow::Result<()> {
+    let Some(candidate) = plan.candidate_adapter_compatibility() else {
+        return Ok(());
+    };
+    for component in plan.components().iter().filter(|component| {
+        matches!(component, UpdatePlanComponent::Adapter { .. })
+            && component.action() == UpdateAction::None
+    }) {
+        let root = ownership
+            .adapter_roots
+            .get(component.name())
+            .with_context(|| {
+                format!(
+                    "retained adapter `{}` lost its inventoried root",
+                    component.name()
+                )
+            })?;
+        let registry = crate::adapter_registry::AdapterRegistry::discover_from_roots_with_profiles(
+            [root.clone()],
+            &candidate.profile,
+            &candidate.projected_database_components,
+            &candidate.legacy_profile,
+        );
+        let discovered = registry.find(component.name()).with_context(|| {
+            format!(
+                "retained adapter `{}` is no longer discoverable",
+                component.name()
+            )
+        })?;
+        ensure!(
+            discovered.state.permits_dispatch() && paths_equal(&discovered.root_path, root),
+            "retained adapter `{}` no longer passes the candidate Core profile: {}",
+            component.name(),
+            discovered
+                .reasons
+                .first()
+                .map(|reason| reason.message.as_str())
+                .unwrap_or("installation identity changed")
+        );
+    }
+    Ok(())
 }
 
 fn verify_staging_capacity(
@@ -1006,18 +1092,16 @@ fn validate_adapter_catalog_binding(
         .iter()
         .find(|adapter| adapter.domain == artifact.domain)
         .context("adapter release is absent from the verified catalog")?;
-    let release = adapter
-        .releases
-        .iter()
-        .find(|release| release.version == artifact.version)
-        .context("adapter version is absent from the verified catalog")?;
     ensure!(
-        release == &artifact.release
-            && release
-                .platforms
-                .iter()
-                .any(|platform| platform == &artifact.platform),
-        "adapter release metadata differs from the verified catalog"
+        adapter.releases.iter().any(|release| {
+            release.version == artifact.version
+                && release == &artifact.release
+                && release
+                    .platforms
+                    .iter()
+                    .any(|platform| platform == &artifact.platform)
+        }),
+        "adapter compatibility variant metadata differs from the verified catalog"
     );
     Ok(())
 }
@@ -1132,7 +1216,12 @@ fn stage_adapter_artifact(
         &artifact.platform.archive_root,
     )?;
     let extracted_root = extraction.join(&artifact.platform.archive_root);
-    crate::cli::commands::ops::validate_adapter_bundle_contract(&extracted_root, name)?;
+    if artifact.release.compatibility.is_some() {
+        crate::cli::commands::ops::validate_adapter_bundle_contract(&extracted_root, name)?;
+        crate::release_index::verify_indexed_v2_sidecar(&extracted_root, name, &artifact.release)?;
+    } else {
+        crate::cli::commands::ops::validate_legacy_adapter_bundle_contract(&extracted_root, name)?;
+    }
     ensure!(
         extracted_root
             .join(&artifact.platform.resource_manifest)
@@ -2448,6 +2537,9 @@ mod tests {
                 launcher_compatibility_schema: LAUNCHER_COMPATIBILITY_SCHEMA.to_owned(),
                 error_recovery_schema: 1,
                 release_metadata_schema: 1,
+                adapter_compatibility: Some(
+                    crate::update::catalog::CandidateCoreAdapterCompatibilityV2::generated(),
+                ),
             },
             platforms: vec![CorePlatformArchive {
                 platform: platform.to_owned(),
@@ -2537,6 +2629,7 @@ mod tests {
             home: home.path().to_path_buf(),
             core: Some(receipt),
             adapters: BTreeMap::new(),
+            adapter_roots: BTreeMap::new(),
         };
         Ok(CoreFixture {
             _files: files,
@@ -2951,6 +3044,8 @@ mod tests {
                     version: "2.0.0".to_owned(),
                     channel: ReleaseChannel::Stable,
                     core_compatibility: ">=0.2.0, <0.3.0".to_owned(),
+                    compatibility: None,
+                    compatibility_sha256: None,
                     platforms: vec![AdapterPlatformRelease {
                         platform: platform.clone(),
                         asset_url: file_url(&adapter_archive),
@@ -2995,6 +3090,8 @@ mod tests {
             sha256: "0".repeat(64),
             signing_key_id: "old-key".to_owned(),
             core_compatibility: ">=0.1.0, <0.3.0".to_owned(),
+            compatibility: None,
+            compatibility_sha256: None,
             platform: platform.clone(),
             resource_manifest: "adapter-resources.json".to_owned(),
             installed_at_unix_seconds: 0,
@@ -3025,6 +3122,21 @@ mod tests {
                     installation: AdapterInstallationKind::Release {
                         version: "1.0.0".to_owned(),
                         core_compatibility: ">=0.1.0, <0.3.0".to_owned(),
+                    },
+                    compatibility: crate::update::plan::InstalledAdapterCompatibility::V2 {
+                        sidecar: crate::adapter_compatibility::AdapterCompatibilitySidecarV2 {
+                            format: crate::adapter_compatibility::ADAPTER_COMPATIBILITY_FORMAT_V2
+                                .to_owned(),
+                            adapter: "fixture".to_owned(),
+                            compatibility:
+                                crate::adapter_compatibility::CompatibilityRequirementsV2 {
+                                    adapter_protocol_epoch: 2,
+                                    minimum_core_schema: 1,
+                                    required_core_capabilities: Vec::new(),
+                                    central_components: Vec::new(),
+                                },
+                            local_stores: Vec::new(),
+                        },
                     },
                 }],
                 discovery_warnings: Vec::new(),
@@ -3135,6 +3247,8 @@ mod tests {
             target(&owned, "core", "core_binary", "ldgr"),
             target(&owned, "core", "agentctl_binary", "agentctl"),
             target(&owned, "fixture", "adapter_bundle", "adapter"),
+            target(&owned, "fixture", "adapter_binary", "ldgr-fixture"),
+            target(&owned, "fixture", "adapter_receipt", "adapter-receipt.json"),
             target(&owned, "fixture", "harness_resource", "resource"),
             target(&owned, "core", "receipt", "receipt.json"),
         ];

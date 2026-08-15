@@ -1,0 +1,12 @@
+{
+  "component": {
+    "migration_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "migration_sources": [],
+    "minimum_core_schema": 5,
+    "namespace": "example",
+    "schema_version": 1
+  },
+  "contract_hash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "core_schema_version": 5,
+  "format": "ldgr.adapter-database-contract.v1"
+}

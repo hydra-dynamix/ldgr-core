@@ -71,6 +71,61 @@ fn release_workflow_catalog_publication_is_last_and_matrix_gated() -> anyhow::Re
 }
 
 #[test]
+fn bootstrap_workflow_is_explicit_key_gated_and_activates_catalog_last() -> anyhow::Result<()> {
+    let workflow =
+        fs::read_to_string(repository().join(".github/workflows/core-catalog-bootstrap.yml"))?;
+    for required in [
+        "inputs.confirmation == 'BOOTSTRAP-CORE-CATALOG'",
+        "environment: core-release-signing",
+        "secrets.LDGR_CATALOG_SIGNING_KEY",
+        "test ! -e catalog-repository/core-index.json",
+        "release/core-catalog-bootstrap-v1.json",
+        "Accept: application/octet-stream",
+        "--bootstrap-inventory",
+        "Upload every archive signature before catalog activation",
+        "cmp \"dist/$archive.sig\" \"hosted-signatures/$archive.sig\"",
+        "Publish the independently verified catalog last",
+        "git push origin HEAD:main",
+    ] {
+        ensure!(
+            workflow.contains(required),
+            "bootstrap workflow omits {required}"
+        );
+    }
+    ensure!(!workflow.contains("SigningKey::generate"));
+    let upload = workflow
+        .find("Upload every archive signature before catalog activation")
+        .context("archive signature upload step missing")?;
+    let publish = workflow
+        .find("Publish the independently verified catalog last")
+        .context("catalog publication step missing")?;
+    ensure!(upload < publish);
+
+    let inventory: serde_json::Value = serde_json::from_str(&fs::read_to_string(
+        repository().join("release/core-catalog-bootstrap-v1.json"),
+    )?)?;
+    ensure!(inventory["supported_stable_versions"] == serde_json::json!(["0.1.14"]));
+    ensure!(
+        inventory["releases"][0]["release"]["platforms"]
+            .as_array()
+            .unwrap()
+            .len()
+            == 5
+    );
+    ensure!(
+        inventory["releases"][0]["provenance"]
+            .as_array()
+            .unwrap()
+            .len()
+            == 5
+    );
+    ensure!(
+        !inventory["releases"][0]["release"]["compatibility"]["adapter_compatibility"].is_null()
+    );
+    Ok(())
+}
+
+#[test]
 fn release_workflow_runs_actionlint_and_signed_installer_fixtures() -> anyhow::Result<()> {
     let workflow = fs::read_to_string(repository().join(".github/workflows/release.yml"))?;
     ensure!(workflow.contains("docker://rhysd/actionlint:1.7.12"));
@@ -154,6 +209,9 @@ fn installer_helper_verifies_catalog_checksum_signature_and_embedded_metadata() 
                 launcher_compatibility_schema: "ldgr.launcher-compatibility.v1".into(),
                 error_recovery_schema: 1,
                 release_metadata_schema: 1,
+                adapter_compatibility: Some(
+                    ldgr_core::update::catalog::CandidateCoreAdapterCompatibilityV2::generated(),
+                ),
             },
             platforms: vec![CorePlatformArchive {
                 platform: "windows-x86_64".into(),

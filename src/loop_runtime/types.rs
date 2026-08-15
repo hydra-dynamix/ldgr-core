@@ -13,8 +13,8 @@ use rusqlite::Connection;
 use crate::cli::render::brief_context::{brief_context, BriefContextOptions};
 use crate::store::{
     active_prompt, add_artifact, add_observation, apply_loop_intervention, bundled_prompt_version,
-    claim_next_pending_run, finish_run, get_run, oldest_running_work_item,
-    pending_loop_interventions, read_context, record_run_phase,
+    claim_next_pending_run, finish_run, get_run, oldest_active_run,
+    oldest_running_work_item, pending_loop_interventions, read_context, record_run_phase,
     restore_work_item_pending_after_dry_run, sealed_bundle, ArtifactKind, LoopIntervention,
     LoopInterventionAction, RunStatus,
 };

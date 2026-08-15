@@ -1,3 +1,4 @@
+pub mod adapter_compatibility;
 pub mod adapter_manifest;
 pub mod adapter_registry;
 pub mod claims;

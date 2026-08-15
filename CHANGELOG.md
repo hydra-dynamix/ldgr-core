@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- Resume the current active run when `ldgr loop run` starts instead of refusing the invocation or claiming a second work item, and document the full loop execution model and operational controls in focused help.
+
 ### Fixed
 
 - Resolve and probe Windows source-adapter Cargo/Rustup configurations across split harness and user-profile homes, preserve working explicit homes, reject relative overrides, and record redacted first-class infrastructure errors before spawn when fallbacks are unavailable or ambiguous.

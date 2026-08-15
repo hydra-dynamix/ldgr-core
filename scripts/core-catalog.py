@@ -281,8 +281,32 @@ def validate_catalog(value: Any, offline: bool) -> dict[str, Any]:
         semver(agentctl["version"], f"{subject}.agentctl.version")
         require(REPOSITORY.fullmatch(text(agentctl["repository"], f"{subject}.agentctl.repository")) is not None, f"{subject}.agentctl.repository is invalid")
         require(COMMIT.fullmatch(text(agentctl["commit"], f"{subject}.agentctl.commit")) is not None, f"{subject}.agentctl.commit is invalid")
-        compatibility = exact_object(release["compatibility"], {"launcher_compatibility_schema", "error_recovery_schema", "release_metadata_schema"}, f"{subject}.compatibility")
-        require(compatibility == {"launcher_compatibility_schema": "ldgr.launcher-compatibility.v1", "error_recovery_schema": 1, "release_metadata_schema": 1}, f"{subject}.compatibility is unsupported")
+        compatibility = release["compatibility"]
+        require(isinstance(compatibility, dict), f"{subject}.compatibility must be an object")
+        base_compatibility = {
+            "launcher_compatibility_schema": "ldgr.launcher-compatibility.v1",
+            "error_recovery_schema": 1,
+            "release_metadata_schema": 1,
+        }
+        compatibility_fields = set(compatibility)
+        require(
+            compatibility_fields == set(base_compatibility)
+            or compatibility_fields == {*base_compatibility, "adapter_compatibility"},
+            f"{subject}.compatibility fields are unsupported",
+        )
+        require(
+            all(compatibility.get(key) == value for key, value in base_compatibility.items()),
+            f"{subject}.compatibility is unsupported",
+        )
+        if "adapter_compatibility" in compatibility:
+            candidate = exact_object(
+                compatibility["adapter_compatibility"],
+                {"profile", "projected_database_components", "legacy_profile"},
+                f"{subject}.compatibility.adapter_compatibility",
+            )
+            require(isinstance(candidate["profile"], dict), f"{subject} candidate profile must be an object")
+            require(isinstance(candidate["projected_database_components"], list), f"{subject} projected database components must be an array")
+            require(isinstance(candidate["legacy_profile"], dict), f"{subject} legacy profile must be an object")
         require(isinstance(release["platforms"], list) and release["platforms"], f"{subject}.platforms must be non-empty")
         seen: set[str] = set()
         for platform_index, value in enumerate(release["platforms"]):

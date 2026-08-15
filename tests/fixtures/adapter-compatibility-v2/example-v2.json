@@ -1,0 +1,22 @@
+{
+  "adapter": "example",
+  "compatibility": {
+    "adapter_protocol_epoch": 1,
+    "central_components": [
+      {
+        "accepted_lineage_digests": [
+          "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ],
+        "minimum_schema_version": 1,
+        "namespace": "notes",
+        "schema_epoch": 1
+      }
+    ],
+    "minimum_core_schema": 4,
+    "required_core_capabilities": [
+      "work.v1"
+    ]
+  },
+  "format": "ldgr.adapter-compatibility.v2",
+  "local_stores": []
+}

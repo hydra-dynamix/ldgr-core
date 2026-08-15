@@ -10,9 +10,14 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tar::EntryType;
 
+use crate::adapter_compatibility::{
+    core_compatibility_inventory, evaluate_requirements_v2, parse_adapter_compatibility_v2,
+    CentralComponentDatabaseStateV2, CompatibilityRequirementsV2, CoreCompatibilityProfileV2,
+};
 use crate::update::network::{CatalogFetch, UpdateNetworkClient};
 
-pub const ADAPTER_RELEASE_INDEX_SCHEMA_VERSION: u32 = 1;
+pub const LEGACY_ADAPTER_RELEASE_INDEX_SCHEMA_VERSION: u32 = 1;
+pub const ADAPTER_RELEASE_INDEX_SCHEMA_VERSION: u32 = 2;
 pub const ADAPTER_RELEASE_INDEX_ENV: &str = "LDGR_ADAPTER_INDEX";
 pub const ADAPTER_RELEASE_KEYRING_ENV: &str = "LDGR_ADAPTER_RELEASE_KEYRING";
 pub const DEFAULT_ADAPTER_RELEASE_INDEX_URL: &str =
@@ -45,6 +50,34 @@ pub fn resolve_release<'a>(
     exact_version: Option<&Version>,
     include_prerelease: bool,
 ) -> anyhow::Result<ResolvedAdapterRelease<'a>> {
+    let core = core_compatibility_inventory();
+    resolve_release_with_profile(
+        index,
+        domain,
+        core_version,
+        &core,
+        &[],
+        platform,
+        exact_version,
+        include_prerelease,
+    )
+}
+
+/// Resolve against an explicit active or candidate Core profile. The package
+/// version is consulted only by the bounded schema-v1 bridge; schema v2 uses
+/// the protocol, schema, capability, and central-component profile.
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_release_with_profile<'a>(
+    index: &'a AdapterReleaseIndex,
+    domain: &str,
+    legacy_core_version: &Version,
+    core: &CoreCompatibilityProfileV2,
+    database_components: &[CentralComponentDatabaseStateV2],
+    platform: &str,
+    exact_version: Option<&Version>,
+    include_prerelease: bool,
+) -> anyhow::Result<ResolvedAdapterRelease<'a>> {
+    validate_release_index(index)?;
     let adapter = index
         .adapters
         .iter()
@@ -57,23 +90,90 @@ pub fn resolve_release<'a>(
         .iter()
         .filter_map(|release| {
             let version = Version::parse(&release.version).ok()?;
-            let requirement = VersionReq::parse(&release.core_compatibility).ok()?;
             let platform_release = release
                 .platforms
                 .iter()
                 .find(|item| item.platform == platform)?;
             let channel_allowed = release.channel == ReleaseChannel::Stable || include_prerelease;
             let exact_allowed = exact_version.is_none_or(|exact| exact == &version);
-            (channel_allowed && exact_allowed && requirement.matches(core_version)).then_some((
-                version,
-                release,
-                platform_release,
-            ))
+            if !channel_allowed || !exact_allowed {
+                return None;
+            }
+            let compatible = match index.schema_version {
+                LEGACY_ADAPTER_RELEASE_INDEX_SCHEMA_VERSION => {
+                    VersionReq::parse(&release.core_compatibility)
+                        .ok()
+                        .is_some_and(|requirement| requirement.matches(legacy_core_version))
+                }
+                ADAPTER_RELEASE_INDEX_SCHEMA_VERSION => {
+                    release.compatibility.as_ref().is_some_and(|requirements| {
+                        evaluate_requirements_v2(
+                            requirements,
+                            &adapter.domain,
+                            core,
+                            database_components,
+                        )
+                        .compatible
+                    })
+                }
+                _ => false,
+            };
+            compatible.then_some((version, release, platform_release))
         })
         .collect::<Vec<_>>();
-    candidates.sort_by(|left, right| right.0.cmp(&left.0));
+    candidates.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| {
+                right
+                    .1
+                    .compatibility
+                    .as_ref()
+                    .map_or(0, |value| value.adapter_protocol_epoch)
+                    .cmp(
+                        &left
+                            .1
+                            .compatibility
+                            .as_ref()
+                            .map_or(0, |value| value.adapter_protocol_epoch),
+                    )
+            })
+            .then_with(|| {
+                right
+                    .1
+                    .compatibility
+                    .as_ref()
+                    .map_or(0, |value| value.minimum_core_schema)
+                    .cmp(
+                        &left
+                            .1
+                            .compatibility
+                            .as_ref()
+                            .map_or(0, |value| value.minimum_core_schema),
+                    )
+            })
+            .then_with(|| {
+                left.1
+                    .compatibility_sha256
+                    .as_deref()
+                    .unwrap_or_default()
+                    .cmp(right.1.compatibility_sha256.as_deref().unwrap_or_default())
+            })
+    });
     let Some((version, release, platform_release)) = candidates.into_iter().next() else {
-        bail!("no compatible release for adapter `{}` on platform `{platform}` with Core {core_version}", adapter.domain);
+        let profile = if index.schema_version == ADAPTER_RELEASE_INDEX_SCHEMA_VERSION {
+            format!(
+                "Core compatibility profile (schema {}, protocols {:?})",
+                core.core_schema_version, core.supported_adapter_protocol_epochs
+            )
+        } else {
+            format!("Core {legacy_core_version}")
+        };
+        bail!(
+            "no compatible release for adapter `{}` on platform `{platform}` with {profile}",
+            adapter.domain
+        );
     };
     Ok(ResolvedAdapterRelease {
         adapter,
@@ -81,6 +181,53 @@ pub fn resolve_release<'a>(
         platform: platform_release,
         version,
     })
+}
+
+/// Bind an extracted archive's authoritative v2 sidecar to the signed index
+/// variant before activation. Legacy archives retain their original exact
+/// database-contract validation path.
+pub fn verify_resolved_v2_sidecar(
+    extracted_root: &Path,
+    resolved: &ResolvedAdapterRelease<'_>,
+) -> anyhow::Result<()> {
+    verify_indexed_v2_sidecar(extracted_root, &resolved.adapter.domain, resolved.release)
+}
+
+pub fn verify_indexed_v2_sidecar(
+    extracted_root: &Path,
+    adapter: &str,
+    release: &AdapterRelease,
+) -> anyhow::Result<()> {
+    if release.compatibility.is_none() {
+        return Ok(());
+    }
+    let path = extracted_root.join("adapter-compatibility.json");
+    let text = fs::read_to_string(&path)
+        .with_context(|| format!("adapter archive is missing {}", path.display()))?;
+    let sidecar = parse_adapter_compatibility_v2(&text)
+        .map_err(anyhow::Error::new)
+        .context("staged adapter compatibility sidecar is invalid")?;
+    if sidecar.adapter != adapter {
+        bail!(
+            "staged adapter identity `{}` does not match indexed product `{adapter}`",
+            sidecar.adapter
+        );
+    }
+    let expected = release.compatibility.as_ref().expect("checked v2 release");
+    if &sidecar.compatibility != expected {
+        bail!("staged adapter compatibility object does not match the signed release index");
+    }
+    let actual = sidecar.compatibility_sha256().map_err(anyhow::Error::new)?;
+    let indexed = release
+        .compatibility_sha256
+        .as_deref()
+        .expect("validated v2 release fingerprint");
+    if actual != indexed {
+        bail!(
+            "staged adapter compatibility fingerprint mismatch: expected {indexed}, got {actual}"
+        );
+    }
+    Ok(())
 }
 
 pub fn verify_file_sha256(path: &Path, expected: &str) -> anyhow::Result<()> {
@@ -319,7 +466,12 @@ pub struct InstallationReceipt {
     pub source_url: String,
     pub sha256: String,
     pub signing_key_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub core_compatibility: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compatibility: Option<CompatibilityRequirementsV2>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compatibility_sha256: Option<String>,
     pub platform: String,
     pub resource_manifest: String,
     pub installed_at_unix_seconds: u64,
@@ -500,11 +652,15 @@ pub fn parse_release_index(json: &str) -> anyhow::Result<AdapterReleaseIndex> {
 }
 
 pub fn validate_release_index(index: &AdapterReleaseIndex) -> anyhow::Result<()> {
-    if index.schema_version != ADAPTER_RELEASE_INDEX_SCHEMA_VERSION {
+    if ![
+        LEGACY_ADAPTER_RELEASE_INDEX_SCHEMA_VERSION,
+        ADAPTER_RELEASE_INDEX_SCHEMA_VERSION,
+    ]
+    .contains(&index.schema_version)
+    {
         bail!(
-            "unsupported adapter release index schema_version {}; expected {}",
-            index.schema_version,
-            ADAPTER_RELEASE_INDEX_SCHEMA_VERSION
+            "unsupported adapter release index schema_version {}; expected 1 or 2",
+            index.schema_version
         );
     }
     if index.adapters.is_empty() {
@@ -540,26 +696,106 @@ pub fn validate_release_index(index: &AdapterReleaseIndex) -> anyhow::Result<()>
         if adapter.releases.is_empty() {
             bail!("adapters[{adapter_index}].releases must not be empty");
         }
+        let mut precedence_versions = HashMap::<String, String>::new();
+        let mut variants = HashSet::<(String, u8, String)>::new();
         for (release_index, release) in adapter.releases.iter().enumerate() {
             let path = format!("adapters[{adapter_index}].releases[{release_index}]");
             require_text(&release.version, &format!("{path}.version"))?;
-            require_text(
-                &release.core_compatibility,
-                &format!("{path}.core_compatibility"),
-            )?;
+            let version = Version::parse(&release.version)
+                .with_context(|| format!("{path}.version must be a semantic version"))?;
+            let precedence = format!(
+                "{}.{}.{}-{}",
+                version.major, version.minor, version.patch, version.pre
+            );
+            if let Some(existing) = precedence_versions.get(&precedence) {
+                if existing != &release.version {
+                    bail!(
+                        "{path}.version `{}` collides in SemVer precedence with `{existing}`; build metadata cannot select a release",
+                        release.version
+                    );
+                }
+            } else {
+                precedence_versions.insert(precedence, release.version.clone());
+            }
+
+            let variant_id = match index.schema_version {
+                LEGACY_ADAPTER_RELEASE_INDEX_SCHEMA_VERSION => {
+                    require_text(
+                        &release.core_compatibility,
+                        &format!("{path}.core_compatibility"),
+                    )?;
+                    if release.compatibility.is_some() || release.compatibility_sha256.is_some() {
+                        bail!("{path} mixes schema-v2 compatibility fields into a legacy index");
+                    }
+                    VersionReq::parse(&release.core_compatibility).with_context(|| {
+                        format!("{path}.core_compatibility must be a semantic version requirement")
+                    })?;
+                    release.core_compatibility.clone()
+                }
+                ADAPTER_RELEASE_INDEX_SCHEMA_VERSION => {
+                    if !release.core_compatibility.is_empty() {
+                        bail!("{path}.core_compatibility is forbidden in schema v2");
+                    }
+                    let compatibility = release.compatibility.as_ref().with_context(|| {
+                        format!("{path}.compatibility is required in schema v2")
+                    })?;
+                    compatibility
+                        .validate()
+                        .map_err(anyhow::Error::new)
+                        .with_context(|| format!("{path}.compatibility is invalid"))?;
+                    let expected = compatibility
+                        .compatibility_sha256()
+                        .map_err(anyhow::Error::new)?;
+                    let indexed = release.compatibility_sha256.as_deref().with_context(|| {
+                        format!("{path}.compatibility_sha256 is required in schema v2")
+                    })?;
+                    if indexed != expected {
+                        bail!(
+                            "{path}.compatibility_sha256 mismatch: expected {expected}, got {indexed}"
+                        );
+                    }
+                    indexed.to_owned()
+                }
+                _ => unreachable!("schema checked above"),
+            };
+            let channel = match release.channel {
+                ReleaseChannel::Stable => 0,
+                ReleaseChannel::Prerelease => 1,
+            };
+            if !variants.insert((release.version.clone(), channel, variant_id)) {
+                bail!("{path} duplicates release tuple (version, channel, compatibility variant)");
+            }
+
             if release.platforms.is_empty() {
                 bail!("{path}.platforms must not be empty");
             }
+            let mut platforms = HashSet::new();
             for (platform_index, platform) in release.platforms.iter().enumerate() {
                 let platform_path = format!("{path}.platforms[{platform_index}]");
                 require_text(&platform.platform, &format!("{platform_path}.platform"))?;
+                if !platforms.insert(platform.platform.as_str()) {
+                    bail!(
+                        "{platform_path}.platform duplicates `{}`",
+                        platform.platform
+                    );
+                }
                 require_text(&platform.asset_url, &format!("{platform_path}.asset_url"))?;
                 require_text(
                     &platform.archive_root,
                     &format!("{platform_path}.archive_root"),
                 )?;
+                validate_archive_root(&platform.archive_root)
+                    .with_context(|| format!("invalid {platform_path}.archive_root"))?;
                 require_text(&platform.binary, &format!("{platform_path}.binary"))?;
-                require_text(&platform.sha256, &format!("{platform_path}.sha256"))?;
+                validate_sha256(&platform.sha256)
+                    .with_context(|| format!("invalid {platform_path}.sha256"))?;
+                if platform
+                    .sha256
+                    .bytes()
+                    .any(|byte| byte.is_ascii_uppercase())
+                {
+                    bail!("{platform_path}.sha256 must use lowercase hexadecimal");
+                }
                 require_text(
                     &platform.signature_url,
                     &format!("{platform_path}.signature_url"),
@@ -578,6 +814,136 @@ pub fn validate_release_index(index: &AdapterReleaseIndex) -> anyhow::Result<()>
                 )?;
             }
         }
+    }
+    Ok(())
+}
+
+/// One signed stable Core capability/contract inventory used by catalog CI.
+/// Package versions identify diagnostics only; compatibility evaluation never
+/// compares them with adapter package ranges.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReleasedCoreCompatibilityV2 {
+    pub version: String,
+    pub profile: CoreCompatibilityProfileV2,
+    pub projected_database_components: Vec<CentralComponentDatabaseStateV2>,
+}
+
+/// Apply publication policy after structural index validation. Every stable
+/// artifact variant must work on at least one released stable Core inventory,
+/// the current (last) inventory must resolve each product, and same-version
+/// variants may not overlap on any released inventory.
+pub fn validate_release_index_against_core_profiles(
+    index: &AdapterReleaseIndex,
+    released_cores: &[ReleasedCoreCompatibilityV2],
+) -> anyhow::Result<()> {
+    validate_release_index(index)?;
+    ensure_schema_v2(index)?;
+    if released_cores.is_empty() {
+        bail!("catalog compatibility gate requires at least one released stable Core profile");
+    }
+    for (offset, core) in released_cores.iter().enumerate() {
+        Version::parse(&core.version)
+            .with_context(|| format!("released Core profiles[{offset}].version is not semantic"))?;
+        core.profile
+            .validate()
+            .map_err(anyhow::Error::new)
+            .with_context(|| format!("released Core profiles[{offset}].profile is invalid"))?;
+    }
+    let current = released_cores
+        .iter()
+        .max_by(|left, right| {
+            Version::parse(&left.version)
+                .expect("validated Core version")
+                .cmp(&Version::parse(&right.version).expect("validated Core version"))
+        })
+        .expect("non-empty profiles");
+    for (adapter_index, adapter) in index.adapters.iter().enumerate() {
+        let stable = adapter
+            .releases
+            .iter()
+            .filter(|release| release.channel == ReleaseChannel::Stable)
+            .collect::<Vec<_>>();
+        if stable.is_empty() {
+            bail!("adapters[{adapter_index}] has no stable compatibility-v2 release");
+        }
+        for release in &stable {
+            let requirements = release.compatibility.as_ref().expect("validated schema v2");
+            if !released_cores.iter().any(|core| {
+                evaluate_requirements_v2(
+                    requirements,
+                    &adapter.domain,
+                    &core.profile,
+                    &core.projected_database_components,
+                )
+                .compatible
+            }) {
+                bail!(
+                    "stable adapter {} {} variant {} is incompatible with every released stable Core profile",
+                    adapter.domain,
+                    release.version,
+                    release.compatibility_sha256.as_deref().unwrap_or("missing")
+                );
+            }
+        }
+        if !stable.iter().any(|release| {
+            evaluate_requirements_v2(
+                release.compatibility.as_ref().expect("validated schema v2"),
+                &adapter.domain,
+                &current.profile,
+                &current.projected_database_components,
+            )
+            .compatible
+        }) {
+            bail!(
+                "adapter {} has no stable release compatible with current stable Core {}",
+                adapter.domain,
+                current.version
+            );
+        }
+        for left in 0..stable.len() {
+            for right in (left + 1)..stable.len() {
+                if stable[left].version != stable[right].version {
+                    continue;
+                }
+                for core in released_cores {
+                    let left_matches = evaluate_requirements_v2(
+                        stable[left]
+                            .compatibility
+                            .as_ref()
+                            .expect("validated schema v2"),
+                        &adapter.domain,
+                        &core.profile,
+                        &core.projected_database_components,
+                    )
+                    .compatible;
+                    let right_matches = evaluate_requirements_v2(
+                        stable[right]
+                            .compatibility
+                            .as_ref()
+                            .expect("validated schema v2"),
+                        &adapter.domain,
+                        &core.profile,
+                        &core.projected_database_components,
+                    )
+                    .compatible;
+                    if left_matches && right_matches {
+                        bail!(
+                            "adapter {} version {} has compatibility variants that overlap on Core {}",
+                            adapter.domain,
+                            stable[left].version,
+                            core.version
+                        );
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn ensure_schema_v2(index: &AdapterReleaseIndex) -> anyhow::Result<()> {
+    if index.schema_version != ADAPTER_RELEASE_INDEX_SCHEMA_VERSION {
+        bail!("catalog publication requires adapter index schema_version 2");
     }
     Ok(())
 }
@@ -643,7 +1009,12 @@ pub enum AdapterClassification {
 pub struct AdapterRelease {
     pub version: String,
     pub channel: ReleaseChannel,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub core_compatibility: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compatibility: Option<CompatibilityRequirementsV2>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compatibility_sha256: Option<String>,
     pub platforms: Vec<AdapterPlatformRelease>,
 }
 
@@ -675,14 +1046,95 @@ mod tests {
     use std::io::Write as _;
     use tar::EntryType;
 
+    use crate::adapter_compatibility::{
+        CentralComponentDescriptorV2, CentralComponentRequirementV2, CompatibilityRequirementsV2,
+        CoreCompatibilityProfileV2, CORE_COMPATIBILITY_FORMAT_V2,
+    };
+
     use super::{
         extract_safe_tar_gz, load_release_index, parse_release_index, parse_resource_manifest,
-        resolve_release, verify_detached_release_signature, verify_file_sha256,
-        AdapterClassification, DetachedSignature, ReleaseChannel, ReleaseKeyring, ReleasePublicKey,
+        resolve_release, resolve_release_with_profile,
+        validate_release_index_against_core_profiles, verify_detached_release_signature,
+        verify_file_sha256, verify_resolved_v2_sidecar, AdapterClassification,
+        AdapterPlatformRelease, AdapterRelease, AdapterReleaseIndex, AdapterReleaseProduct,
+        DetachedSignature, ReleaseChannel, ReleaseKeyring, ReleasePublicKey,
+        ReleasedCoreCompatibilityV2,
     };
 
     const OPEN_AND_COMMERCIAL: &str =
         include_str!("../tests/fixtures/release-index/open-and-commercial.json");
+    const A: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    fn v2_requirements(
+        protocol: i32,
+        minimum_core_schema: i32,
+        capabilities: &[&str],
+        central_components: Vec<CentralComponentRequirementV2>,
+    ) -> CompatibilityRequirementsV2 {
+        CompatibilityRequirementsV2 {
+            adapter_protocol_epoch: protocol,
+            minimum_core_schema,
+            required_core_capabilities: capabilities
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect(),
+            central_components,
+        }
+    }
+
+    fn fixture_platform() -> AdapterPlatformRelease {
+        AdapterPlatformRelease {
+            platform: "linux-aarch64".to_owned(),
+            asset_url: "https://example.invalid/example.tar.gz".to_owned(),
+            archive_root: "example-1.0.0".to_owned(),
+            binary: "ldgr-example".to_owned(),
+            sha256: "0".repeat(64),
+            signature_url: "https://example.invalid/example.tar.gz.sig".to_owned(),
+            signing_key_id: "fixture-key".to_owned(),
+            resource_manifest: "adapter-resources.json".to_owned(),
+        }
+    }
+
+    fn v2_release(
+        version: &str,
+        channel: ReleaseChannel,
+        compatibility: CompatibilityRequirementsV2,
+    ) -> AdapterRelease {
+        let compatibility_sha256 = compatibility.compatibility_sha256().unwrap();
+        AdapterRelease {
+            version: version.to_owned(),
+            channel,
+            core_compatibility: String::new(),
+            compatibility: Some(compatibility),
+            compatibility_sha256: Some(compatibility_sha256),
+            platforms: vec![fixture_platform()],
+        }
+    }
+
+    fn v2_index(releases: Vec<AdapterRelease>) -> AdapterReleaseIndex {
+        AdapterReleaseIndex {
+            schema_version: 2,
+            adapters: vec![AdapterReleaseProduct {
+                domain: "example".to_owned(),
+                primary_namespace: "example".to_owned(),
+                title: "Example".to_owned(),
+                aliases: vec!["reference".to_owned()],
+                classification: AdapterClassification::OpenSource,
+                source_url: None,
+                releases,
+            }],
+        }
+    }
+
+    fn core_profile(schema: i32) -> CoreCompatibilityProfileV2 {
+        CoreCompatibilityProfileV2 {
+            format: CORE_COMPATIBILITY_FORMAT_V2.to_owned(),
+            core_schema_version: schema,
+            supported_adapter_protocol_epochs: vec![1],
+            core_capabilities: vec!["prompt.v1".to_owned(), "work.v1".to_owned()],
+            central_components: Vec::<CentralComponentDescriptorV2>::new(),
+        }
+    }
 
     #[test]
     fn parses_open_and_commercial_release_entries() -> anyhow::Result<()> {
@@ -725,7 +1177,7 @@ mod tests {
     #[test]
     fn rejects_unknown_schema_versions() {
         let invalid =
-            OPEN_AND_COMMERCIAL.replacen("\"schema_version\": 1", "\"schema_version\": 2", 1);
+            OPEN_AND_COMMERCIAL.replacen("\"schema_version\": 1", "\"schema_version\": 3", 1);
         let error = parse_release_index(&invalid).expect_err("unknown schema must fail");
         assert!(error
             .to_string()
@@ -770,6 +1222,333 @@ mod tests {
     fn loads_explicit_local_index_without_network() -> anyhow::Result<()> {
         let index = load_release_index("tests/fixtures/release-index/open-and-commercial.json")?;
         assert_eq!(index.adapters[0].domain, "example");
+        Ok(())
+    }
+
+    #[test]
+    fn v2_resolution_ignores_core_patch_and_accepts_additive_schema() -> anyhow::Result<()> {
+        let index = v2_index(vec![
+            v2_release(
+                "2.0.0",
+                ReleaseChannel::Stable,
+                v2_requirements(1, 5, &["work.v2"], Vec::new()),
+            ),
+            v2_release(
+                "1.9.0",
+                ReleaseChannel::Stable,
+                v2_requirements(1, 5, &["work.v1"], Vec::new()),
+            ),
+        ]);
+        let encoded = serde_json::to_string(&index)?;
+        assert!(encoded.contains("\"compatibility\""));
+        assert!(!encoded.contains("core_compatibility"));
+        let index = parse_release_index(&encoded)?;
+        let core5 = core_profile(5);
+        let core6 = core_profile(6);
+        for (package_patch, profile) in [
+            (Version::parse("0.1.14")?, &core5),
+            (Version::parse("0.1.99")?, &core5),
+            (Version::parse("0.2.0")?, &core6),
+        ] {
+            let resolved = resolve_release_with_profile(
+                &index,
+                "reference",
+                &package_patch,
+                profile,
+                &[],
+                "linux-aarch64",
+                None,
+                false,
+            )?;
+            assert_eq!(resolved.version, Version::parse("1.9.0")?);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn publication_gate_uses_released_profiles_and_rejects_overlapping_variants() {
+        let compatible = v2_release(
+            "1.0.0",
+            ReleaseChannel::Stable,
+            v2_requirements(1, 5, &["work.v1"], Vec::new()),
+        );
+        let cores = vec![
+            ReleasedCoreCompatibilityV2 {
+                version: "0.1.14".to_owned(),
+                profile: core_profile(5),
+                projected_database_components: Vec::new(),
+            },
+            ReleasedCoreCompatibilityV2 {
+                version: "0.1.15".to_owned(),
+                profile: core_profile(6),
+                projected_database_components: Vec::new(),
+            },
+        ];
+        validate_release_index_against_core_profiles(&v2_index(vec![compatible.clone()]), &cores)
+            .unwrap();
+
+        let incompatible = v2_release(
+            "2.0.0",
+            ReleaseChannel::Stable,
+            v2_requirements(1, 5, &["work.v2"], Vec::new()),
+        );
+        let error =
+            validate_release_index_against_core_profiles(&v2_index(vec![incompatible]), &cores)
+                .unwrap_err();
+        assert!(format!("{error:#}").contains("every released stable Core"));
+
+        let overlap = v2_release(
+            "1.0.0",
+            ReleaseChannel::Stable,
+            v2_requirements(1, 4, &[], Vec::new()),
+        );
+        let error = validate_release_index_against_core_profiles(
+            &v2_index(vec![compatible, overlap]),
+            &cores,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("overlap"));
+    }
+
+    #[test]
+    fn v2_resolver_rejects_protocol_and_component_incompatibility_before_selection(
+    ) -> anyhow::Result<()> {
+        let component = CentralComponentRequirementV2 {
+            namespace: "notes".to_owned(),
+            schema_epoch: 1,
+            minimum_schema_version: 1,
+            accepted_lineage_digests: vec![A.to_owned()],
+        };
+        let index = v2_index(vec![
+            v2_release(
+                "3.0.0",
+                ReleaseChannel::Stable,
+                v2_requirements(2, 5, &[], Vec::new()),
+            ),
+            v2_release(
+                "2.0.0",
+                ReleaseChannel::Stable,
+                v2_requirements(1, 5, &[], vec![component]),
+            ),
+            v2_release(
+                "1.0.0",
+                ReleaseChannel::Stable,
+                v2_requirements(1, 5, &[], Vec::new()),
+            ),
+        ]);
+        let core = core_profile(5);
+        let resolved = resolve_release_with_profile(
+            &index,
+            "example",
+            &Version::parse("9.9.9")?,
+            &core,
+            &[],
+            "linux-aarch64",
+            None,
+            false,
+        )?;
+        assert_eq!(resolved.version, Version::parse("1.0.0")?);
+
+        let incompatible_only = v2_index(index.adapters[0].releases[..2].to_vec());
+        assert!(resolve_release_with_profile(
+            &incompatible_only,
+            "example",
+            &Version::parse("9.9.9")?,
+            &core,
+            &[],
+            "linux-aarch64",
+            None,
+            false,
+        )
+        .is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn same_version_variants_have_deterministic_generation_order() -> anyhow::Result<()> {
+        let older_generation = v2_release(
+            "1.2.3",
+            ReleaseChannel::Stable,
+            v2_requirements(1, 4, &[], Vec::new()),
+        );
+        let newer_generation = v2_release(
+            "1.2.3",
+            ReleaseChannel::Stable,
+            v2_requirements(1, 5, &[], Vec::new()),
+        );
+        let expected = newer_generation.compatibility_sha256.clone();
+        let core = core_profile(6);
+        for releases in [
+            vec![older_generation.clone(), newer_generation.clone()],
+            vec![newer_generation.clone(), older_generation.clone()],
+        ] {
+            let index = v2_index(releases);
+            let resolved = resolve_release_with_profile(
+                &index,
+                "example",
+                &Version::parse("0.1.14")?,
+                &core,
+                &[],
+                "linux-aarch64",
+                Some(&Version::parse("1.2.3")?),
+                false,
+            )?;
+            assert_eq!(resolved.release.compatibility_sha256, expected);
+        }
+
+        let epoch1 = v2_release(
+            "1.5.0",
+            ReleaseChannel::Stable,
+            v2_requirements(1, 5, &[], Vec::new()),
+        );
+        let epoch2 = v2_release(
+            "1.5.0",
+            ReleaseChannel::Stable,
+            v2_requirements(2, 5, &[], Vec::new()),
+        );
+        let mut transition_core = core.clone();
+        transition_core.supported_adapter_protocol_epochs = vec![1, 2];
+        let transition_index = v2_index(vec![epoch1, epoch2]);
+        let resolved = resolve_release_with_profile(
+            &transition_index,
+            "example",
+            &Version::parse("0.1.14")?,
+            &transition_core,
+            &[],
+            "linux-aarch64",
+            None,
+            false,
+        )?;
+        assert_eq!(
+            resolved
+                .release
+                .compatibility
+                .as_ref()
+                .unwrap()
+                .adapter_protocol_epoch,
+            2
+        );
+
+        let left = v2_release(
+            "2.0.0",
+            ReleaseChannel::Stable,
+            v2_requirements(1, 5, &[], Vec::new()),
+        );
+        let right = v2_release(
+            "2.0.0",
+            ReleaseChannel::Stable,
+            v2_requirements(1, 5, &["prompt.v1"], Vec::new()),
+        );
+        let expected_digest = std::cmp::min(
+            left.compatibility_sha256.clone().unwrap(),
+            right.compatibility_sha256.clone().unwrap(),
+        );
+        for releases in [vec![left.clone(), right.clone()], vec![right, left]] {
+            let index = v2_index(releases);
+            let resolved = resolve_release_with_profile(
+                &index,
+                "example",
+                &Version::parse("0.1.14")?,
+                &core,
+                &[],
+                "linux-aarch64",
+                None,
+                false,
+            )?;
+            assert_eq!(
+                resolved.release.compatibility_sha256.as_deref(),
+                Some(expected_digest.as_str())
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn v2_catalog_rejects_mixed_fields_bad_fingerprints_and_ambiguous_versions() {
+        let release = v2_release(
+            "1.0.0",
+            ReleaseChannel::Stable,
+            v2_requirements(1, 5, &[], Vec::new()),
+        );
+        let mut mixed = v2_index(vec![release.clone()]);
+        mixed.adapters[0].releases[0].core_compatibility = ">=0.1.0".to_owned();
+        assert!(
+            format!("{:#}", super::validate_release_index(&mixed).unwrap_err())
+                .contains("forbidden")
+        );
+
+        let mut bad_digest = v2_index(vec![release.clone()]);
+        bad_digest.adapters[0].releases[0].compatibility_sha256 = Some(A.to_owned());
+        let error = format!(
+            "{:#}",
+            super::validate_release_index(&bad_digest).unwrap_err()
+        );
+        assert!(error.contains("compatibility_sha256"), "{error}");
+
+        let duplicate = v2_index(vec![release.clone(), release.clone()]);
+        assert!(format!(
+            "{:#}",
+            super::validate_release_index(&duplicate).unwrap_err()
+        )
+        .contains("duplicates release tuple"));
+
+        let mut build_collision = release;
+        build_collision.version = "1.0.0+rebuilt".to_owned();
+        let collision = v2_index(vec![
+            v2_release(
+                "1.0.0+original",
+                ReleaseChannel::Stable,
+                v2_requirements(1, 5, &[], Vec::new()),
+            ),
+            build_collision,
+        ]);
+        assert!(format!(
+            "{:#}",
+            super::validate_release_index(&collision).unwrap_err()
+        )
+        .contains("collides in SemVer precedence"));
+    }
+
+    #[test]
+    fn staged_v2_sidecar_must_match_the_signed_variant() -> anyhow::Result<()> {
+        use crate::adapter_compatibility::{
+            AdapterCompatibilitySidecarV2, ADAPTER_COMPATIBILITY_FORMAT_V2,
+        };
+
+        let compatibility = v2_requirements(1, 5, &["work.v1"], Vec::new());
+        let index = v2_index(vec![v2_release(
+            "1.0.0",
+            ReleaseChannel::Stable,
+            compatibility.clone(),
+        )]);
+        let resolved = resolve_release(
+            &index,
+            "example",
+            &Version::parse("0.1.14")?,
+            "linux-aarch64",
+            None,
+            false,
+        )?;
+        let root = tempfile::tempdir()?;
+        let sidecar = AdapterCompatibilitySidecarV2 {
+            format: ADAPTER_COMPATIBILITY_FORMAT_V2.to_owned(),
+            adapter: "example".to_owned(),
+            compatibility,
+            local_stores: Vec::new(),
+        };
+        std::fs::write(
+            root.path().join("adapter-compatibility.json"),
+            sidecar.canonical_file_json().unwrap(),
+        )?;
+        verify_resolved_v2_sidecar(root.path(), &resolved)?;
+
+        let mut changed = sidecar;
+        changed.compatibility.minimum_core_schema = 4;
+        std::fs::write(
+            root.path().join("adapter-compatibility.json"),
+            changed.canonical_file_json().unwrap(),
+        )?;
+        assert!(verify_resolved_v2_sidecar(root.path(), &resolved).is_err());
         Ok(())
     }
 

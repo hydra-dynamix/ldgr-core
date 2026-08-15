@@ -186,7 +186,9 @@ fn validate_records(records: &[ComponentIngestRecord]) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::database_contract::{generated_adapter_contract_json, DATABASE_CONTRACT_HASH};
+    use crate::database_contract::{
+        generated_adapter_contract_json, DATABASE_RELEASE_SET_HASH, GENERATED_CORE_SCHEMA_VERSION,
+    };
     use crate::store::open_store;
     use tempfile::TempDir;
 
@@ -201,10 +203,10 @@ mod tests {
     struct Legacy;
     impl ComponentIngestionTransform for Legacy {
         fn component_namespace(&self) -> &str {
-            "research"
+            "core"
         }
         fn accepts(&self, version: i64, hash: &str) -> bool {
-            version == 3 && hash == "sha256:legacy-research-v3"
+            version == 3 && hash == "sha256:legacy-core-v3"
         }
         fn transform(
             &self,
@@ -222,12 +224,12 @@ mod tests {
     fn current_ingestion_retains_provenance_and_retries_idempotently() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let connection = open_store(&temp.path().join("ledger.db"))?;
-        let contract = generated_adapter_contract_json("example")?;
+        let contract = generated_adapter_contract_json("core")?;
         let first = ingest_component_records(
             &connection,
             &contract,
-            1,
-            DATABASE_CONTRACT_HASH,
+            GENERATED_CORE_SCHEMA_VERSION,
+            DATABASE_RELEASE_SET_HASH,
             "request-1",
             vec![record("a")],
             None,
@@ -235,8 +237,8 @@ mod tests {
         let retry = ingest_component_records(
             &connection,
             &contract,
-            1,
-            DATABASE_CONTRACT_HASH,
+            GENERATED_CORE_SCHEMA_VERSION,
+            DATABASE_RELEASE_SET_HASH,
             "request-1",
             vec![record("a")],
             None,
@@ -251,13 +253,17 @@ mod tests {
         )?;
         assert_eq!(
             provenance,
-            ("example".into(), 1, DATABASE_CONTRACT_HASH.into())
+            (
+                "core".into(),
+                GENERATED_CORE_SCHEMA_VERSION,
+                DATABASE_RELEASE_SET_HASH.into()
+            )
         );
         assert!(ingest_component_records(
             &connection,
             &contract,
-            1,
-            DATABASE_CONTRACT_HASH,
+            GENERATED_CORE_SCHEMA_VERSION,
+            DATABASE_RELEASE_SET_HASH,
             "request-1",
             vec![record("different")],
             None
@@ -270,7 +276,7 @@ mod tests {
     fn legacy_requires_registered_transform_and_bad_inputs_leave_no_writes() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let connection = open_store(&temp.path().join("ledger.db"))?;
-        let contract = generated_adapter_contract_json("research")?;
+        let contract = generated_adapter_contract_json("core")?;
         assert!(ingest_component_records(
             &connection,
             &contract,
@@ -284,7 +290,7 @@ mod tests {
         assert!(ingest_component_records(
             &connection,
             &contract,
-            5,
+            GENERATED_CORE_SCHEMA_VERSION + 1,
             "sha256:future",
             "bad-future",
             vec![record("a")],
@@ -294,7 +300,7 @@ mod tests {
         assert!(ingest_component_records(
             &connection,
             &contract,
-            4,
+            GENERATED_CORE_SCHEMA_VERSION,
             "sha256:wrong",
             "bad-hash",
             vec![record("a")],
@@ -305,7 +311,7 @@ mod tests {
             &connection,
             &contract,
             3,
-            "sha256:legacy-research-v3",
+            "sha256:legacy-core-v3",
             "legacy",
             vec![record("a")],
             None
@@ -315,7 +321,7 @@ mod tests {
             &connection,
             &contract,
             3,
-            "sha256:legacy-research-v3",
+            "sha256:legacy-core-v3",
             "legacy",
             vec![record("a")],
             Some(&Legacy),

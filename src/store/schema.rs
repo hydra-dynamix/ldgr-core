@@ -1,6 +1,9 @@
+use std::collections::BTreeSet;
+
 use super::*;
 use crate::database_contract::{
-    DATABASE_CONTRACT_HASH, GENERATED_CORE_SCHEMA_VERSION, GENERATED_DATABASE_COMPONENTS,
+    database_release_set_json, DATABASE_CONTRACT_HASH, GENERATED_CORE_SCHEMA_VERSION,
+    GENERATED_DATABASE_COMPONENTS,
 };
 use rusqlite::OpenFlags;
 
@@ -1729,8 +1732,8 @@ fn validate_component_catalog_contents(connection: &Connection) -> anyhow::Resul
     );
     let actual = list_schema_components(connection)?;
     anyhow::ensure!(
-        actual.len() == GENERATED_DATABASE_COMPONENTS.len(),
-        "schema component catalog has {} entries; expected {}",
+        actual.len() >= GENERATED_DATABASE_COMPONENTS.len(),
+        "schema component catalog has {} entries; expected at least {}",
         actual.len(),
         GENERATED_DATABASE_COMPONENTS.len()
     );
@@ -1767,6 +1770,32 @@ fn validate_component_catalog_contents(connection: &Connection) -> anyhow::Resul
             component.contract_hash == DATABASE_CONTRACT_HASH,
             "schema component {} contract hash does not match the active contract",
             generated.namespace
+        );
+    }
+
+    // Before compatibility v2, every adapter occupied this central catalog,
+    // including stateless adapters and adapters whose migrations owned local
+    // stores. Retain those rows as inert release/ingestion provenance so old
+    // databases remain readable, but never evaluate them as central
+    // components. Names outside the signed coherent release set still fail
+    // closed.
+    let release_set: serde_json::Value = serde_json::from_str(database_release_set_json())
+        .context("failed to parse generated database release set")?;
+    let release_names = release_set["components"]
+        .as_array()
+        .context("generated database release set components are not an array")?
+        .iter()
+        .filter_map(|component| component["namespace"].as_str())
+        .collect::<BTreeSet<_>>();
+    for component in actual.iter().filter(|component| {
+        !GENERATED_DATABASE_COMPONENTS
+            .iter()
+            .any(|generated| generated.namespace == component.namespace)
+    }) {
+        anyhow::ensure!(
+            release_names.contains(component.namespace.as_str()),
+            "schema component catalog contains unregistered component {}; expected only central or release-provenance components",
+            component.namespace
         );
     }
     Ok(())
@@ -2141,7 +2170,7 @@ mod tests {
             let connection = Connection::open(&db_path)?;
             create_current_schema(&connection)?;
             connection.execute(
-                "UPDATE schema_component SET contract_hash = 'sha256:tampered' WHERE namespace = 'research'",
+                "UPDATE schema_component SET contract_hash = 'sha256:tampered' WHERE namespace = 'core'",
                 [],
             )?;
         }
@@ -2153,11 +2182,37 @@ mod tests {
         );
         let connection = Connection::open(&db_path)?;
         let hash: String = connection.query_row(
-            "SELECT contract_hash FROM schema_component WHERE namespace = 'research'",
+            "SELECT contract_hash FROM schema_component WHERE namespace = 'core'",
             [],
             |row| row.get(0),
         )?;
         assert_eq!(hash, "sha256:tampered");
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_adapter_catalog_rows_are_inert_release_provenance() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let db_path = temp.path().join("ldgr.sqlite3");
+        {
+            let connection = Connection::open(&db_path)?;
+            create_current_schema(&connection)?;
+            connection.execute(
+                "INSERT INTO schema_component (
+                    namespace, schema_version, minimum_core_schema, migration_digest, contract_hash
+                 ) VALUES ('research', 3, 4, 'sha256:stale-local-store', 'sha256:old-release')",
+                [],
+            )?;
+        }
+
+        let connection = open_store(&db_path)?;
+        validate_component_catalog(&connection)?;
+        let retained: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM schema_component WHERE namespace = 'research'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(retained, 1);
         Ok(())
     }
 
@@ -2169,6 +2224,26 @@ mod tests {
             let connection = Connection::open(&db_path)?;
             create_current_schema(&connection)?;
             drop_v5_error_schema(&connection)?;
+            let release_set: serde_json::Value = serde_json::from_str(database_release_set_json())?;
+            let research = release_set["components"]
+                .as_array()
+                .and_then(|components| {
+                    components
+                        .iter()
+                        .find(|component| component["namespace"] == "research")
+                })
+                .context("release set is missing Research provenance")?;
+            connection.execute(
+                "INSERT INTO schema_component (
+                    namespace, schema_version, minimum_core_schema, migration_digest, contract_hash
+                 ) VALUES ('research', ?1, ?2, ?3, ?4)",
+                params![
+                    research["schema_version"].as_i64().unwrap(),
+                    research["minimum_core_schema"].as_i64().unwrap(),
+                    research["migration_digest"].as_str().unwrap(),
+                    release_set["contract_hash"].as_str().unwrap(),
+                ],
+            )?;
             connection.execute(
                 "INSERT INTO component_ingest (
                     component_namespace, source_schema_version, source_contract_hash,

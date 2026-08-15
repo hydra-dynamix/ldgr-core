@@ -7,6 +7,10 @@ use semver::Version;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
+use crate::adapter_compatibility::{
+    projected_database_components, CentralComponentDatabaseStateV2, CoreCompatibilityProfileV2,
+    LegacyCoreProfileV1,
+};
 use crate::release_index::{
     extract_safe_tar_gz, parse_detached_signature, parse_release_index, parse_release_keyring,
     validate_archive_root, validate_release_keyring, validate_sha256,
@@ -73,6 +77,76 @@ pub struct CoreReleaseCompatibility {
     pub launcher_compatibility_schema: String,
     pub error_recovery_schema: u32,
     pub release_metadata_schema: u32,
+    /// Signed candidate inventory used by Core self-update preflight. Older
+    /// catalog entries remain readable, but cannot replace Core while an
+    /// installed adapter needs compatibility proof.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapter_compatibility: Option<CandidateCoreAdapterCompatibilityV2>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CandidateCoreAdapterCompatibilityV2 {
+    pub profile: CoreCompatibilityProfileV2,
+    pub projected_database_components: Vec<CentralComponentDatabaseStateV2>,
+    pub legacy_profile: LegacyCoreProfileV1,
+}
+
+impl CandidateCoreAdapterCompatibilityV2 {
+    pub fn generated() -> Self {
+        let profile = crate::adapter_compatibility::core_compatibility_inventory();
+        Self {
+            projected_database_components: projected_database_components(&profile),
+            profile,
+            legacy_profile: crate::adapter_compatibility::legacy_core_compatibility_inventory(),
+        }
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        self.profile.validate().map_err(anyhow::Error::new)?;
+        for component in &self.projected_database_components {
+            component.validate().map_err(anyhow::Error::new)?;
+        }
+        ensure!(
+            self.projected_database_components == projected_database_components(&self.profile),
+            "projected central database components differ from the candidate Core inventory"
+        );
+        ensure!(
+            self.legacy_profile.core_schema_version == i64::from(self.profile.core_schema_version),
+            "legacy and v2 candidate Core schema inventories differ"
+        );
+        ensure!(
+            self.legacy_profile.contract_hash.len() == 71
+                && self.legacy_profile.contract_hash.starts_with("sha256:")
+                && self.legacy_profile.contract_hash[7..]
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+            "candidate legacy global contract hash is not canonical SHA-256"
+        );
+        let mut previous = None;
+        for component in &self.legacy_profile.components {
+            ensure!(
+                component.schema_version > 0 && component.minimum_core_schema > 0,
+                "candidate legacy component versions must be positive"
+            );
+            ensure!(
+                previous
+                    .as_deref()
+                    .is_none_or(|value| value < component.namespace.as_str()),
+                "candidate legacy components must be unique and sorted by namespace"
+            );
+            ensure!(
+                component.migration_digest.len() == 71
+                    && component.migration_digest.starts_with("sha256:")
+                    && component.migration_digest[7..]
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+                "candidate legacy component digest is invalid"
+            );
+            previous = Some(component.namespace.clone());
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -146,6 +220,26 @@ pub struct CoreReleaseMetadata {
     pub platform: String,
     pub commit: String,
     pub source_repository: String,
+}
+
+/// Metadata emitted by the last supported Core release before the signed
+/// catalog contract landed. Only the paired-agentctl shape is accepted; older
+/// archives without agentctl are intentionally ineligible for bootstrap.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct HistoricalPairedCoreReleaseMetadata {
+    schema_version: u32,
+    package: String,
+    binary: String,
+    version: String,
+    agentctl_version: String,
+    agentctl_repository: String,
+    agentctl_commit: String,
+    component: String,
+    component_commit: String,
+    root_commit: String,
+    platform: String,
+    source_repository: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -502,7 +596,67 @@ pub fn verify_release_metadata_binding(
         "extracted Core archive root does not match catalog archive_root `{}`",
         resolved.platform.archive_root
     );
-    let metadata = read_release_metadata(extracted_root)?;
+    let metadata_path = extracted_root.join("RELEASE-METADATA.json");
+    let metadata_file = fs::symlink_metadata(&metadata_path).with_context(|| {
+        format!(
+            "Core archive is missing release metadata {}",
+            metadata_path.display()
+        )
+    })?;
+    ensure!(
+        metadata_file.file_type().is_file(),
+        "Core release metadata must be a regular file"
+    );
+    let metadata_text = read_bounded_utf8(
+        &metadata_path,
+        MAX_RELEASE_METADATA_BYTES,
+        "Core release metadata",
+    )?;
+    let metadata = match serde_json::from_str::<CoreReleaseMetadata>(&metadata_text) {
+        Ok(metadata) => metadata,
+        Err(current_error) => {
+            let historical: HistoricalPairedCoreReleaseMetadata = serde_json::from_str(&metadata_text)
+                .with_context(|| format!(
+                    "Core release metadata matches neither the current schema nor the supported paired historical schema: {current_error}"
+                ))?;
+            ensure_equal(
+                historical.component.as_str(),
+                "ldgr-core",
+                "historical release metadata component",
+            )?;
+            ensure_equal(
+                historical.component_commit.as_str(),
+                resolved.release.core_commit.as_str(),
+                "historical release metadata Core commit",
+            )?;
+            ensure!(
+                historical.root_commit.len() == 40
+                    && historical
+                        .root_commit
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+                "historical release metadata root_commit is not a canonical Git commit"
+            );
+            CoreReleaseMetadata {
+                schema_version: historical.schema_version,
+                package: historical.package,
+                binary: historical.binary,
+                version: historical.version,
+                agentctl_version: historical.agentctl_version,
+                agentctl_repository: historical.agentctl_repository,
+                agentctl_commit: historical.agentctl_commit,
+                launcher_compatibility_schema: resolved
+                    .release
+                    .compatibility
+                    .launcher_compatibility_schema
+                    .clone(),
+                error_recovery_schema: resolved.release.compatibility.error_recovery_schema,
+                platform: historical.platform,
+                commit: historical.component_commit,
+                source_repository: historical.source_repository,
+            }
+        }
+    };
     ensure_equal(
         metadata.schema_version,
         resolved.release.compatibility.release_metadata_schema,
@@ -654,6 +808,11 @@ pub fn validate_core_update_catalog(catalog: &CoreUpdateCatalog) -> anyhow::Resu
             release.compatibility.release_metadata_schema > 0,
             "{path}.compatibility.release_metadata_schema must be positive"
         );
+        if let Some(candidate) = &release.compatibility.adapter_compatibility {
+            candidate.validate().with_context(|| {
+                format!("{path}.compatibility.adapter_compatibility is invalid")
+            })?;
+        }
         ensure!(
             !release.platforms.is_empty(),
             "{path}.platforms must not be empty"

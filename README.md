@@ -57,12 +57,13 @@ cargo install --path .
 
 SQLite is bundled; source fallback requires a recent stable Rust toolchain.
 
-Before an upgrade, `ldgr schema doctor` inspects the active schema, generated
-adapter contract set, pending migrations, and last verified backup without
-changing the database. Upgrade Core before adapters; Core applies the complete
-migration plan atomically and refuses unknown shapes or incompatible sidecars.
-See `docs/database-upgrade-and-recovery.md` in the LDGR repository for the
-backup and restore procedure.
+Before an upgrade, `ldgr schema doctor` inspects the active central schema,
+registered components, pending migrations, and last verified backup without
+changing the database. Compatibility-v2 discovery separately evaluates adapter
+protocol, monotonic minimum Core schema, required capabilities, and optional
+central components; it does not require exact global release-set identity. See
+`docs/database-upgrade-and-recovery.md` in the LDGR integration repository for
+the backup, rollback, legacy diagnosis, and restore procedure.
 
 ## Check for updates
 
@@ -82,8 +83,11 @@ ldgr update --check --offline
 `--json` writes exactly one schema-versioned result to stdout; diagnostics stay
 on stderr. Check mode may update the user-level check cache under `~/.ldgr`, but
 never downloads release archives, runs installers, or changes installed files
-or the current project. Applying a plan remains disabled until verified staging
-and plan-wide rollback are available.
+or the current project. Apply with `ldgr update` (or deliberate non-interactive
+`ldgr update --yes`): Core stages and verifies the whole plan before mutation
+and rolls back Core/agentctl, adapter bundles, resources, receipts, and central
+database bytes together on failure. `--core-only` cannot bypass an incompatible
+retained adapter.
 
 ## Numerical sequence telemetry
 

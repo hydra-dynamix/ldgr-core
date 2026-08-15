@@ -8,7 +8,10 @@ use anyhow::{bail, Context};
 use semver::Version;
 use serde::Serialize;
 
-use crate::adapter_registry::AdapterRegistry;
+use crate::adapter_compatibility::{
+    parse_adapter_compatibility, CompatibilityReasonCode, ParsedAdapterCompatibility,
+};
+use crate::adapter_registry::{AdapterOperationalState, AdapterRegistry, DiscoveredAdapter};
 use crate::cli::args::UpdateArgs;
 use crate::harness_config::UpdateChannel;
 use crate::release_index::{AdapterReleaseIndex, ReleaseKeyring};
@@ -28,9 +31,9 @@ use crate::update::installation::{
 use crate::update::network::UpdateNetworkClient;
 use crate::update::plan::{
     build_update_plan, AdapterInstallationKind, AdapterInstallationSnapshot, AdapterOrigin,
-    CoreInstallationSnapshot, CorePlanOwnership, UpdateAction, UpdateComponentKind,
-    UpdateInventory, UpdatePlan, UpdatePlanRequest, UpdateResult, UpdateResultMode,
-    UpdateResultStatus, VerifiedCatalogSnapshots,
+    CoreInstallationSnapshot, CorePlanOwnership, InstalledAdapterCompatibility, UpdateAction,
+    UpdateComponentKind, UpdateInventory, UpdatePlan, UpdatePlanRequest, UpdateResult,
+    UpdateResultMode, UpdateResultStatus, VerifiedCatalogSnapshots,
 };
 use crate::update::state::{
     CachedCheckResult, ComponentResult, TerminalError, TerminalOutcome, UpdateCache, UpdateLock,
@@ -379,6 +382,16 @@ fn empty_adapter_catalog() -> VerifiedAdapterUpdateCatalog {
 }
 
 fn adapter_catalog_required(args: &UpdateArgs, inventory: &UpdateInventory) -> bool {
+    if !args.adapters_only && args.adapters.is_empty() && !args.core_only {
+        // A candidate Core may require a same-version compatibility variant,
+        // even when the installed adapter itself has no ordinary upgrade.
+        return inventory.adapters.iter().any(|adapter| {
+            matches!(
+                adapter.installation,
+                AdapterInstallationKind::Release { .. }
+            )
+        });
+    }
     if args.core_only {
         return false;
     }
@@ -410,7 +423,9 @@ fn inspect_inventory(
     let roots = AdapterRoots::discover(home)?;
     let mut adapters = Vec::new();
     let mut adapter_ownership = BTreeMap::new();
+    let mut adapter_roots = BTreeMap::new();
     for installed in &registry.adapters {
+        adapter_roots.insert(installed.slug.clone(), installed.root_path.clone());
         let origin = roots.origin(&installed.root_path);
         let installation = if origin == AdapterOrigin::User {
             let Some(user_root) = roots.user_root(&installed.root_path) else {
@@ -425,6 +440,7 @@ fn inspect_inventory(
                         reason: "install root is outside its canonical user adapter boundary"
                             .to_owned(),
                     },
+                    compatibility: snapshot_installed_compatibility(installed),
                 });
                 continue;
             };
@@ -458,6 +474,7 @@ fn inspect_inventory(
             slug: installed.slug.clone(),
             origin,
             installation,
+            compatibility: snapshot_installed_compatibility(installed),
         });
     }
     Ok((
@@ -470,8 +487,47 @@ fn inspect_inventory(
             home: home.to_path_buf(),
             core: core_receipt,
             adapters: adapter_ownership,
+            adapter_roots,
         },
     ))
+}
+
+fn snapshot_installed_compatibility(
+    installed: &DiscoveredAdapter,
+) -> InstalledAdapterCompatibility {
+    let invalid_reason = || InstalledAdapterCompatibility::Invalid {
+        reason: installed
+            .reasons
+            .first()
+            .map(|reason| format!("{}: {}", reason.code, reason.message))
+            .unwrap_or_else(|| "installed compatibility could not be proved".to_owned()),
+    };
+    if installed.state == AdapterOperationalState::Invalid
+        || installed.reasons.iter().any(|reason| {
+            matches!(
+                reason.code,
+                CompatibilityReasonCode::UnsupportedFormat
+                    | CompatibilityReasonCode::AdapterIdentityMismatch
+            ) || (reason.code == CompatibilityReasonCode::InvalidMetadata
+                && reason.subject != "receipt.core_compatibility")
+        })
+    {
+        return invalid_reason();
+    }
+    let v2 = std::fs::read_to_string(installed.root_path.join("adapter-compatibility.json")).ok();
+    let legacy =
+        std::fs::read_to_string(installed.root_path.join("adapter-database-contract.json")).ok();
+    match parse_adapter_compatibility(v2.as_deref(), legacy.as_deref()) {
+        Ok(ParsedAdapterCompatibility::V2 { sidecar }) => {
+            InstalledAdapterCompatibility::V2 { sidecar }
+        }
+        Ok(ParsedAdapterCompatibility::LegacyV1 { contract }) => {
+            InstalledAdapterCompatibility::LegacyV1 { contract }
+        }
+        Err(error) => InstalledAdapterCompatibility::Invalid {
+            reason: format!("{}: {}", error.reason.code, error.reason.message),
+        },
+    }
 }
 
 fn core_snapshot(ownership: CoreInstallationOwnership) -> CoreInstallationSnapshot {

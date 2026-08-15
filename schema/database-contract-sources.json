@@ -1,0 +1,162 @@
+{
+  "adapters": [
+    {
+      "adapter": "bench",
+      "adapter_protocol_epoch": 1,
+      "central_components": [],
+      "local_stores": [],
+      "minimum_core_schema": 5,
+      "required_core_capabilities": [
+        "telemetry.v1",
+        "work.v1"
+      ]
+    },
+    {
+      "adapter": "code",
+      "adapter_protocol_epoch": 1,
+      "central_components": [],
+      "local_stores": [],
+      "minimum_core_schema": 5,
+      "required_core_capabilities": [
+        "telemetry.v1",
+        "work.v1"
+      ]
+    },
+    {
+      "adapter": "conduct",
+      "adapter_protocol_epoch": 1,
+      "central_components": [],
+      "local_stores": [],
+      "minimum_core_schema": 5,
+      "required_core_capabilities": [
+        "prompt.v1",
+        "telemetry.v1",
+        "work.v1"
+      ]
+    },
+    {
+      "adapter": "evidence",
+      "adapter_protocol_epoch": 1,
+      "central_components": [],
+      "local_stores": [
+        {
+          "engine": "sqlite",
+          "migration_sources": [
+            "ldgr-evidence/src/schema.rs"
+          ],
+          "store_id": "evidence"
+        },
+        {
+          "engine": "postgresql",
+          "migration_sources": [
+            "ldgr-evidence/src/postgres_backend.rs"
+          ],
+          "store_id": "evidence-postgresql"
+        }
+      ],
+      "minimum_core_schema": 5,
+      "required_core_capabilities": [
+        "telemetry.v1"
+      ]
+    },
+    {
+      "adapter": "example",
+      "adapter_protocol_epoch": 1,
+      "central_components": [],
+      "local_stores": [],
+      "minimum_core_schema": 5,
+      "required_core_capabilities": [
+        "prompt.v1",
+        "telemetry.v1"
+      ]
+    },
+    {
+      "adapter": "explore",
+      "adapter_protocol_epoch": 1,
+      "central_components": [],
+      "local_stores": [],
+      "minimum_core_schema": 5,
+      "required_core_capabilities": [
+        "telemetry.v1"
+      ]
+    },
+    {
+      "adapter": "private-commercial",
+      "adapter_protocol_epoch": 1,
+      "central_components": [],
+      "local_stores": [],
+      "minimum_core_schema": 5,
+      "required_core_capabilities": []
+    },
+    {
+      "adapter": "programbench",
+      "adapter_protocol_epoch": 1,
+      "central_components": [],
+      "local_stores": [],
+      "minimum_core_schema": 5,
+      "required_core_capabilities": [
+        "telemetry.v1",
+        "work.v1"
+      ]
+    },
+    {
+      "adapter": "recall",
+      "adapter_protocol_epoch": 1,
+      "central_components": [],
+      "local_stores": [
+        {
+          "engine": "sqlite",
+          "migration_sources": [
+            "ldgr-recall/src/schema.rs"
+          ],
+          "store_id": "recall"
+        }
+      ],
+      "minimum_core_schema": 5,
+      "required_core_capabilities": []
+    },
+    {
+      "adapter": "research",
+      "adapter_protocol_epoch": 1,
+      "central_components": [],
+      "local_stores": [
+        {
+          "engine": "sqlite",
+          "migration_sources": [
+            "ldgr-research/src/migrations.rs"
+          ],
+          "store_id": "research"
+        }
+      ],
+      "minimum_core_schema": 5,
+      "required_core_capabilities": [
+        "prompt.v1",
+        "telemetry.v1",
+        "work.v1"
+      ]
+    },
+    {
+      "adapter": "security",
+      "adapter_protocol_epoch": 1,
+      "central_components": [],
+      "local_stores": [],
+      "minimum_core_schema": 5,
+      "required_core_capabilities": [
+        "telemetry.v1",
+        "work.v1"
+      ]
+    }
+  ],
+  "central_components": [],
+  "core": {
+    "core_capabilities": [
+      "prompt.v1",
+      "telemetry.v1",
+      "work.v1"
+    ],
+    "supported_adapter_protocol_epochs": [
+      1
+    ]
+  },
+  "format": "ldgr.database-contract-sources.v2"
+}

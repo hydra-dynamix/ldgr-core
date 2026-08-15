@@ -1,0 +1,103 @@
+name: Compatibility v2 matrix
+
+on:
+  push:
+    branches: [main, release-candidate]
+  pull_request:
+    branches: [main, release-candidate]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compatibility-v2:
+    name: Compatibility and rollback (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux-x86_64
+          - os: macos-14
+            platform: macos-aarch64
+          - os: windows-latest
+            platform: windows-x86_64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run isolated compatibility-v2 fixtures
+        shell: bash
+        env:
+          LDGR_EXPECTED_TEST_PLATFORM: ${{ matrix.platform }}
+        run: cargo test --locked --test adapter_compatibility_v2_matrix -- --test-threads=1
+
+  research-canonical-e2e:
+    name: Canonical Research install (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux-x86_64
+            binary_ext: ""
+          - os: ubuntu-24.04-arm
+            platform: linux-aarch64
+            binary_ext: ""
+          - os: macos-15-intel
+            platform: macos-x86_64
+            binary_ext: ""
+          - os: macos-14
+            platform: macos-aarch64
+            binary_ext: ""
+          - os: windows-latest
+            platform: windows-x86_64
+            binary_ext: ".exe"
+    steps:
+      - name: Check out Core under the release workspace
+        uses: actions/checkout@v4
+        with:
+          path: source/ldgr-core
+
+      - name: Check out the real Research adapter
+        uses: actions/checkout@v4
+        with:
+          repository: hydra-dynamix/ldgr-research
+          path: source/ldgr-research
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            source/ldgr-core
+            source/ldgr-research
+
+      - name: Build canonical Core and Research binaries
+        shell: bash
+        run: |
+          cargo build --locked --manifest-path source/ldgr-core/Cargo.toml --bin ldgr
+          cargo build --locked --manifest-path source/ldgr-research/Cargo.toml --bin ldgr-research
+
+      - name: Run clean-room signed Research workflow
+        shell: bash
+        env:
+          LDGR_RESEARCH_E2E_BINARY: ${{ github.workspace }}/source/ldgr-research/target/debug/ldgr-research${{ matrix.binary_ext }}
+          LDGR_RESEARCH_E2E_SOURCE: ${{ github.workspace }}/source/ldgr-research
+        run: cargo test --locked --manifest-path source/ldgr-core/Cargo.toml --test research_canonical_e2e -- --ignored --test-threads=1
