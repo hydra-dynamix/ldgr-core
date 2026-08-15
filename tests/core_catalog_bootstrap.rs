@@ -2,7 +2,7 @@ use std::fs;
 use std::path::Path;
 use std::process::{Command, Output};
 
-use anyhow::ensure;
+use anyhow::{ensure, Context};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use ed25519_dalek::SigningKey;
 use flate2::write::GzEncoder;
@@ -52,7 +52,7 @@ fn bootstrap_is_key_gated_fail_closed_and_append_compatible() -> anyhow::Result<
         &catalog,
         &catalog_signature,
     )
-    .output()?;
+    .output_context("bootstrap catalog without signing keys")?;
     ensure!(!missing_key.status.success());
     ensure!(!catalog.exists() && !catalog_signature.exists());
 
@@ -71,7 +71,7 @@ fn bootstrap_is_key_gated_fail_closed_and_append_compatible() -> anyhow::Result<
         "LDGR_ARCHIVE_SIGNING_KEY",
         STANDARD.encode(wrong_key.to_bytes()),
     )
-    .output()?;
+    .output_context("bootstrap catalog with untrusted signing keys")?;
     ensure!(!mismatched_key.status.success());
     ensure!(!catalog.exists() && !catalog_signature.exists());
 
@@ -115,7 +115,7 @@ fn bootstrap_is_key_gated_fail_closed_and_append_compatible() -> anyhow::Result<
         &catalog_signature,
         &trusted_key,
     )
-    .output()?;
+    .output_context("bootstrap catalog with a missing archive checksum")?;
     ensure!(!missing_checksum.status.success());
     ensure!(!catalog.exists() && !catalog_signature.exists());
     fs::write(&checksum, saved_checksum)?;
@@ -133,7 +133,7 @@ fn bootstrap_is_key_gated_fail_closed_and_append_compatible() -> anyhow::Result<
         &catalog_signature,
         &trusted_key,
     )
-    .output()?;
+    .output_context("bootstrap catalog with a tampered archive")?;
     ensure!(!mismatched_archive.status.success());
     ensure!(!catalog.exists() && !catalog_signature.exists());
     fs::write(&archive, saved_archive)?;
@@ -146,7 +146,7 @@ fn bootstrap_is_key_gated_fail_closed_and_append_compatible() -> anyhow::Result<
         &catalog_signature,
         &trusted_key,
     )
-    .output()?;
+    .output_context("bootstrap valid signed catalog")?;
     ensure!(success.status.success(), "{}", stderr(&success));
     let verified = verify_catalog(&catalog, &catalog_signature, &keyring_path)?;
     ensure!(verified.releases.len() == 1);
@@ -197,7 +197,7 @@ fn bootstrap_is_key_gated_fail_closed_and_append_compatible() -> anyhow::Result<
             "LDGR_ARCHIVE_SIGNING_KEY",
             STANDARD.encode(trusted_key.to_bytes()),
         )
-        .output()?;
+        .output_context("append a release to the signed catalog")?;
     ensure!(append.status.success(), "{}", stderr(&append));
     ensure!(fs::read_to_string(previous)?.trim() == "1.0.0");
     ensure!(
@@ -225,8 +225,8 @@ fn assert_inventory_failure(
     let catalog = root.join(format!("{name}-catalog.json"));
     let signature = root.join(format!("{name}-catalog.json.sig"));
     fs::write(&inventory, serde_json::to_vec_pretty(&changed)?)?;
-    let output =
-        signed_bootstrap_command(&inventory, keyring, dist, &catalog, &signature, key).output()?;
+    let output = signed_bootstrap_command(&inventory, keyring, dist, &catalog, &signature, key)
+        .output_context(&format!("reject invalid {name} bootstrap inventory"))?;
     ensure!(
         !output.status.success(),
         "invalid inventory unexpectedly passed"
@@ -460,6 +460,18 @@ fn append<W: std::io::Write>(
     header.set_cksum();
     archive.append_data(&mut header, name, bytes)?;
     Ok(())
+}
+
+trait CommandOutputContext {
+    fn output_context(&mut self, operation: &str) -> anyhow::Result<Output>;
+}
+
+impl CommandOutputContext for Command {
+    fn output_context(&mut self, operation: &str) -> anyhow::Result<Output> {
+        let program = self.get_program().to_string_lossy().into_owned();
+        self.output()
+            .with_context(|| format!("{operation}: spawn child process `{program}`"))
+    }
 }
 
 fn path(path: &Path) -> &str {
