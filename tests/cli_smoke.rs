@@ -5287,6 +5287,30 @@ fn web_cockpit_serves_context_artifact_viewer_and_loop_controls() -> anyhow::Res
     assert!(steer.contains(r#""action": "steer""#), "{steer}");
     assert!(steer.contains("Record progress clearly"), "{steer}");
 
+    // Verify the persisted intervention state before the launched loop appends
+    // lifecycle events to the bounded latest-events context projection.
+    let intervention_context = http_get(port, "/api/context")?;
+    assert!(
+        intervention_context.contains(r#""action": "pause""#),
+        "{intervention_context}"
+    );
+    assert!(
+        intervention_context.contains(r#""status": "cleared""#),
+        "{intervention_context}"
+    );
+    assert!(
+        intervention_context.contains(r#""action": "steer""#),
+        "{intervention_context}"
+    );
+    assert!(
+        intervention_context.contains("Record progress clearly"),
+        "{intervention_context}"
+    );
+    assert!(
+        intervention_context.contains(r#""event_type": "resume""#),
+        "{intervention_context}"
+    );
+
     fs::create_dir_all(project.path().join("prompts"))?;
     fs::write(
         project.path().join("prompts/loop-prompt.md"),
@@ -5339,7 +5363,6 @@ fn web_cockpit_serves_context_artifact_viewer_and_loop_controls() -> anyhow::Res
     assert!(context.contains(r#""latest_events""#));
     assert!(context.contains(r#""loop_interventions""#));
     assert!(context.contains(r#""action": "steer""#));
-    assert!(context.contains(r#""event_type": "resume""#));
     assert!(!context.contains(r#""due_fact_revalidation_policies""#));
     assert!(!context.contains(r#""adapter_context""#));
     assert!(!context.contains(r#""latest_expectations""#));
@@ -5426,6 +5449,11 @@ fn web_cockpit_serves_context_artifact_viewer_and_loop_controls() -> anyhow::Res
     assert!(logs.contains(r#""events""#));
     assert!(logs.contains(r#""entity_type": "artifact""#), "{logs}");
     assert!(logs.contains(r#""event_type": "add""#), "{logs}");
+    assert!(
+        logs.contains(r#""entity_type": "loop_intervention""#),
+        "{logs}"
+    );
+    assert!(logs.contains(r#""event_type": "resume""#), "{logs}");
 
     let run_page = http_get(port, "/runs/1")?;
     assert!(run_page.contains("Operations cockpit"), "{run_page}");
