@@ -1,5 +1,6 @@
 pub mod args;
 pub mod commands;
+mod database_alignment;
 pub(crate) mod render;
 mod rust_toolchain;
 
@@ -15,7 +16,9 @@ use clap::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::adapter_registry::{AdapterCommandNamespace, AdapterOperationalState, AdapterRegistry};
+use crate::adapter_registry::{
+    AdapterCommandNamespace, AdapterOperationalState, AdapterRegistry, DiscoveredAdapter,
+};
 use crate::store::open_store;
 
 use args::*;
@@ -36,7 +39,7 @@ pub(crate) const CLI_DEFAULT_HELP_SECTIONS: &str = r#"Core loop:
   artifact add <run-id-or-work-slug> --path <file> --description <why-it-matters>
   artifact show <artifact-id>
   validation record <run-id-or-work-slug> --outcome <pass|fail|error|skipped> --rationale <why-if-skipped>
-  error record --occurrence-id <id> --producer <producer> --idempotency-key <key> ...
+  error <command> <task|validation|infrastructure|interruption|cancellation> <message>
   error list
   error context <error-id> [--occurrence-id <id>] [--limit 5]
   decision record <work-slug> --outcome continue --rationale <why> --next-slug <slug> --next-title <title> --next-description <description>
@@ -367,6 +370,49 @@ fn normalize_command_aliases(mut args: Vec<OsString>) -> Vec<OsString> {
     let Some(command) = args[command_index].to_str() else {
         return args;
     };
+    if command == "error" {
+        let known_subcommands = [
+            "report",
+            "record",
+            "list",
+            "show",
+            "context",
+            "occurrence",
+            "disposition",
+            "retry-check",
+            "acknowledge",
+            "resolve",
+            "accept",
+            "link",
+        ];
+        let error_type = args
+            .get(command_index + 2)
+            .and_then(|argument| argument.to_str());
+        let simple_types = [
+            "task",
+            "validation",
+            "infrastructure",
+            "infra",
+            "interruption",
+            "cancellation",
+            "cancel",
+        ];
+        let is_simple_type = error_type.is_some_and(|error_type| {
+            simple_types
+                .iter()
+                .any(|known| known.eq_ignore_ascii_case(error_type))
+        });
+        let first_argument = args
+            .get(command_index + 1)
+            .and_then(|argument| argument.to_str());
+        if first_argument.is_some_and(|argument| !known_subcommands.contains(&argument))
+            && is_simple_type
+            && args.get(command_index + 3).is_some()
+        {
+            args.insert(command_index + 1, OsString::from("report"));
+        }
+        return args;
+    }
     if command != "observation" {
         return args;
     }
@@ -514,28 +560,28 @@ fn handle_cli(cli: Cli) -> anyhow::Result<()> {
         Command::Prompt(args) => commands::prompts::handle_prompt(&open_store(&cli.db)?, args),
         Command::Bundle(args) => commands::prompts::handle_bundle(&open_store(&cli.db)?, args),
         Command::Status(args) => {
-            let (connection, migration) = crate::store::open_store_with_migration_info(&cli.db)?;
-            commands::ops::print_migration_notice(migration.as_ref());
+            let (connection, alignment) = database_alignment::align_existing_database(&cli.db)?;
+            database_alignment::print_migration_notice(&alignment);
             let recovery = crate::recovery::reconcile_startup(
                 &connection,
                 &crate::recovery::project_root_for_db(&cli.db),
             )?;
             crate::recovery::print_startup_recovery_report(&recovery);
-            commands::ops::handle_status(&connection, &cli.artifact_root, args)
+            commands::ops::handle_status(&connection, &cli.artifact_root, &alignment, args)
         }
         Command::Schema(args) => commands::ops::handle_schema(&cli.db, args),
         Command::Migrate(args) => commands::ops::handle_migrate(&cli.db, args),
         Command::Workflow(args) => commands::ops::handle_workflow(args),
         Command::Config(args) => commands::ops::handle_config(args),
         Command::Context(args) => {
-            let (connection, migration) = crate::store::open_store_with_migration_info(&cli.db)?;
-            commands::ops::print_migration_notice(migration.as_ref());
+            let (connection, alignment) = database_alignment::align_existing_database(&cli.db)?;
+            database_alignment::print_migration_notice(&alignment);
             let recovery = crate::recovery::reconcile_startup(
                 &connection,
                 &crate::recovery::project_root_for_db(&cli.db),
             )?;
             crate::recovery::print_startup_recovery_report(&recovery);
-            commands::ops::handle_context(&connection, &cli.artifact_root, args)
+            commands::ops::handle_context(&connection, &cli.artifact_root, &alignment, args)
         }
         Command::Web(args) => commands::ops::handle_web(&cli.db, &cli.artifact_root, args),
         Command::Loop(args) => commands::ops::handle_loop_entry(&cli.db, &cli.artifact_root, args),
@@ -597,8 +643,105 @@ fn try_dispatch_adapter_namespace(args: &[OsString]) -> anyhow::Result<bool> {
         return Ok(false);
     };
     request.namespace = command.namespace.clone();
+    if let Some(json) = adapter_workflow_request(&request.remaining)? {
+        let adapter = registry.find(&command.adapter_slug).with_context(|| {
+            format!(
+                "adapter `{}` disappeared while rendering its workflow",
+                command.adapter_slug
+            )
+        })?;
+        print_adapter_workflow(adapter, command, json)?;
+        return Ok(true);
+    }
     dispatch_adapter_namespace(command, request)?;
     Ok(true)
+}
+
+fn adapter_workflow_request(arguments: &[OsString]) -> anyhow::Result<Option<bool>> {
+    let Some(command) = arguments.first().and_then(|argument| argument.to_str()) else {
+        return Ok(None);
+    };
+    if command != "workflow" {
+        return Ok(None);
+    }
+    match arguments {
+        [_] => Ok(Some(false)),
+        [_, flag] if flag == "--json" => Ok(Some(true)),
+        [_, flag] if matches!(flag.to_str(), Some("--help" | "-h")) => Ok(Some(false)),
+        _ => bail!("adapter workflow accepts only `--json`"),
+    }
+}
+
+fn print_adapter_workflow(
+    adapter: &DiscoveredAdapter,
+    command: &AdapterCommandNamespace,
+    json: bool,
+) -> anyhow::Result<()> {
+    let canonical = format!("ldgr {}", command.namespace);
+    let status_command = (!command.status_args.is_empty())
+        .then(|| format!("{canonical} {}", command.status_args.join(" ")));
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "adapter": adapter.slug,
+                "namespace": command.namespace,
+                "title": adapter.title,
+                "canonical_command": canonical,
+                "help_command": format!("{canonical} --help"),
+                "status_command": status_command,
+                "profile": {
+                    "loop_prompt_path": adapter.profile.loop_prompt_path,
+                    "default_milestone_template": adapter.profile.default_milestone_template,
+                    "spec_artifact_path": adapter.profile.spec_artifact_path,
+                    "readiness_policy": adapter.profile.readiness_policy,
+                },
+                "target_profiles": adapter.target_profiles,
+            }))?
+        );
+        return Ok(());
+    }
+
+    println!("# {} workflow", adapter.title);
+    println!();
+    println!("Canonical command: `{canonical} <command>`");
+    println!("Start with: `{canonical} --help`");
+    if let Some(status_command) = &status_command {
+        println!("Inspect adapter state with: `{status_command}`");
+    }
+    println!("Inspect Core state with: `ldgr context`");
+    println!();
+    println!("Adapter resources:");
+    println!("- specification: `{}`", adapter.profile.spec_artifact_path);
+    println!(
+        "- milestone template: `{}`",
+        adapter.profile.default_milestone_template
+    );
+    println!("- loop prompt: `{}`", adapter.profile.loop_prompt_path);
+    println!();
+    println!("Readiness policy:");
+    println!("{}", adapter.profile.readiness_policy);
+
+    if !adapter.target_profiles.is_empty() {
+        println!();
+        println!("Validation profiles:");
+        for profile in &adapter.target_profiles {
+            println!(
+                "- {} (`{}`): {}",
+                profile.title, profile.slug, profile.description
+            );
+            for probe in &profile.probes {
+                println!(
+                    "  - {} (`{}`): {}",
+                    probe.title, probe.slug, probe.description
+                );
+                if let Some(hint) = &probe.validation_hint {
+                    println!("    Validate: {hint}");
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 struct AdapterNamespaceRequest {

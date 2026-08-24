@@ -11,7 +11,7 @@ use reqwest::{Certificate, Url};
 
 use super::serializer::parse_exact_sequence;
 use super::transition::NumericalProtocol;
-use super::{load_telemetry_consent, telemetry_kill_switch_active, TELEMETRY_PENDING_DIRECTORY};
+use super::{anonymous_collection_is_eligible, TELEMETRY_PENDING_DIRECTORY};
 
 pub const DEFAULT_MAX_TRANSMISSION_DELAY: Duration = Duration::from_secs(30);
 pub const DEFAULT_TRANSMISSION_TIMEOUT: Duration = Duration::from_secs(10);
@@ -258,10 +258,7 @@ fn build_sequence_request(
 }
 
 fn collection_is_eligible(ldgr_home: &Path) -> bool {
-    !telemetry_kill_switch_active()
-        && load_telemetry_consent(ldgr_home)
-            .map(|consent| consent.collection_enabled())
-            .unwrap_or(false)
+    anonymous_collection_is_eligible(ldgr_home)
 }
 
 #[derive(Debug)]
@@ -504,6 +501,10 @@ mod tests {
             .expect("environment lock poisoned");
         let home = tempfile::tempdir()?;
         let transport = CaptureTransport::default();
+        save_telemetry_consent(
+            home.path(),
+            &TelemetryConsent::current(TelemetryConsentDecision::Disabled),
+        )?;
         let disabled = zero_delay_client()?.transmit_with(home.path(), &CORE_WORK_V1, &transport);
         assert!(disabled.disabled);
         assert_eq!(disabled.attempted, 0);

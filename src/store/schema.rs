@@ -9,6 +9,12 @@ use rusqlite::OpenFlags;
 
 pub const CURRENT_SCHEMA_VERSION: i64 = 5;
 
+// Released Core contracts whose schema-v5 shape and migration digest are
+// identical to the active contract. These may be rebound only after the full
+// current schema shape and generated component metadata have been verified.
+const REBINDABLE_DATABASE_CONTRACT_HASHES: &[&str] =
+    &["sha256:39beaf2a23ce5b9099adc6dd9458887fde58b9a101fbc70da0b0690c10482158"];
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SchemaDoctorReport {
     pub database: PathBuf,
@@ -1164,10 +1170,16 @@ pub(crate) fn preflight_schema_migration(connection: &Connection) -> anyhow::Res
         4 => Err(incompatible_schema_error(
             "obsolete schema version 4 shape is not eligible for normalization to schema v5",
         )),
-        5 if current_schema_matches(connection)? => {
-            validate_component_catalog(connection)?;
-            Ok(None)
-        }
+        5 if current_schema_matches(connection)? => match validate_component_catalog(connection) {
+            Ok(()) => Ok(None),
+            Err(active_contract_error) => {
+                if component_catalog_is_rebindable(connection)? {
+                    Ok(Some(5))
+                } else {
+                    Err(active_contract_error)
+                }
+            }
+        },
         5 => Err(incompatible_schema_error(
             "schema version 5 shape does not match the current Core contract",
         )),
@@ -1210,6 +1222,12 @@ fn apply_pending_schema_migrations_locked(
 ) -> anyhow::Result<()> {
     let version = schema_version(connection)?;
     if version == CURRENT_SCHEMA_VERSION {
+        seed_generated_component_catalog(connection)?;
+        validate_component_catalog(connection)?;
+        validate_foreign_keys(connection)?;
+        if failpoint == Some(MigrationFailpoint::BeforeCommit) {
+            anyhow::bail!("injected migration failure before v5 contract rebind commit");
+        }
         return Ok(());
     }
     if version == 1 {
@@ -1801,6 +1819,44 @@ fn validate_component_catalog_contents(connection: &Connection) -> anyhow::Resul
     Ok(())
 }
 
+fn component_catalog_is_rebindable(connection: &Connection) -> anyhow::Result<bool> {
+    let actual = list_schema_components(connection)?;
+    if actual.len() < GENERATED_DATABASE_COMPONENTS.len() {
+        return Ok(false);
+    }
+
+    for generated in GENERATED_DATABASE_COMPONENTS {
+        let Some(component) = actual
+            .iter()
+            .find(|component| component.namespace == generated.namespace)
+        else {
+            return Ok(false);
+        };
+        if component.schema_version != generated.schema_version
+            || component.minimum_core_schema != generated.minimum_core_schema
+            || component.migration_digest != generated.migration_digest
+            || !REBINDABLE_DATABASE_CONTRACT_HASHES.contains(&component.contract_hash.as_str())
+        {
+            return Ok(false);
+        }
+    }
+
+    let release_set: serde_json::Value = serde_json::from_str(database_release_set_json())
+        .context("failed to parse generated database release set")?;
+    let release_names = release_set["components"]
+        .as_array()
+        .context("generated database release set components are not an array")?
+        .iter()
+        .filter_map(|component| component["namespace"].as_str())
+        .collect::<BTreeSet<_>>();
+    Ok(actual.iter().all(|component| {
+        GENERATED_DATABASE_COMPONENTS
+            .iter()
+            .any(|generated| generated.namespace == component.namespace)
+            || release_names.contains(component.namespace.as_str())
+    }))
+}
+
 pub fn current_schema_version(connection: &Connection) -> anyhow::Result<i64> {
     connection
         .query_row(
@@ -2187,6 +2243,57 @@ mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(hash, "sha256:tampered");
+        Ok(())
+    }
+
+    #[test]
+    fn released_v5_contract_is_rebound_with_verified_backup() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let db_path = temp.path().join("ldgr.sqlite3");
+        {
+            let connection = Connection::open(&db_path)?;
+            create_current_schema(&connection)?;
+            connection.execute(
+                "UPDATE schema_component SET contract_hash = ?1 WHERE namespace = 'core'",
+                [REBINDABLE_DATABASE_CONTRACT_HASHES[0]],
+            )?;
+        }
+
+        let before = doctor_schema(&db_path);
+        assert!(before.compatible);
+        assert_eq!(before.pending_migrations, vec![CURRENT_SCHEMA_VERSION]);
+
+        let connection = open_store(&db_path)?;
+        validate_component_catalog(&connection)?;
+        let active_hash: String = connection.query_row(
+            "SELECT contract_hash FROM schema_component WHERE namespace = 'core'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(active_hash, DATABASE_CONTRACT_HASH);
+
+        let backups = fs::read_dir(temp.path())?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.contains("backup-schema-v5-to-v5"))
+                    && path.extension().and_then(|value| value.to_str()) == Some("sqlite3")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            backups.len(),
+            1,
+            "expected one verified contract-rebind backup"
+        );
+        let backup = Connection::open(&backups[0])?;
+        let backup_hash: String = backup.query_row(
+            "SELECT contract_hash FROM schema_component WHERE namespace = 'core'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(backup_hash, REBINDABLE_DATABASE_CONTRACT_HASHES[0]);
         Ok(())
     }
 

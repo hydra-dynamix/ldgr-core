@@ -54,6 +54,13 @@ pub struct NumericalProtocol {
     declared_states: &'static [StateCode],
     allowed_transitions: &'static [(StateCode, StateCode)],
     max_sequence_len: usize,
+    grammar: NumericalGrammar,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NumericalGrammar {
+    ExplicitTransitions,
+    CommandExperienceV1,
 }
 
 impl NumericalProtocol {
@@ -70,6 +77,22 @@ impl NumericalProtocol {
             declared_states,
             allowed_transitions,
             max_sequence_len,
+            grammar: NumericalGrammar::ExplicitTransitions,
+        }
+    }
+
+    pub const fn command_experience_v1(
+        endpoint: &'static str,
+        declared_states: &'static [StateCode],
+        max_sequence_len: usize,
+    ) -> Self {
+        Self {
+            endpoint,
+            initial_state: PENDING,
+            declared_states,
+            allowed_transitions: &[],
+            max_sequence_len,
+            grammar: NumericalGrammar::CommandExperienceV1,
         }
     }
 
@@ -143,6 +166,12 @@ impl NumericalProtocol {
                 "duplicate transition {from} -> {to}"
             );
         }
+        if self.grammar == NumericalGrammar::CommandExperienceV1 {
+            ensure!(
+                self.allowed_transitions.is_empty(),
+                "command-experience/v1 uses its finite category grammar, not an explicit transition list"
+            );
+        }
         Ok(())
     }
 
@@ -151,8 +180,43 @@ impl NumericalProtocol {
     }
 
     pub fn permits(&self, from: StateCode, to: StateCode) -> bool {
-        self.allowed_transitions.contains(&(from, to))
+        match self.grammar {
+            NumericalGrammar::ExplicitTransitions => self.allowed_transitions.contains(&(from, to)),
+            NumericalGrammar::CommandExperienceV1 => {
+                command_experience_v1_transition_allowed(from, to)
+            }
+        }
     }
+}
+
+fn command_experience_v1_transition_allowed(from: StateCode, to: StateCode) -> bool {
+    use crate::telemetry::command_experience::{
+        is_action_code, is_artifact_count_code, is_artifact_role_code, is_condition_code,
+        is_context_reduction_code, is_macro_event_code, is_object_code, is_residual_ratio_code,
+        is_retrieval_basin_code, is_success_rate_code, is_support_code, is_tool_class_code,
+        is_validation_code, SEPARATOR,
+    };
+
+    (from == PENDING && is_action_code(to))
+        || (is_action_code(from) && is_object_code(to))
+        || (is_object_code(from) && (is_condition_code(to) || to == SEPARATOR))
+        || (is_condition_code(from) && (is_condition_code(to) || to == SEPARATOR))
+        || (from == SEPARATOR && (is_macro_event_code(to) || is_validation_code(to)))
+        || (is_macro_event_code(from)
+            && (is_macro_event_code(to)
+                || is_tool_class_code(to)
+                || is_artifact_role_code(to)
+                || to == SEPARATOR))
+        || (is_tool_class_code(from)
+            && (is_tool_class_code(to) || is_artifact_role_code(to) || to == SEPARATOR))
+        || (is_artifact_role_code(from) && (is_artifact_role_code(to) || to == SEPARATOR))
+        || (is_validation_code(from) && is_artifact_count_code(to))
+        || (is_artifact_count_code(from) && is_support_code(to))
+        || (is_support_code(from) && is_success_rate_code(to))
+        || (is_success_rate_code(from) && is_residual_ratio_code(to))
+        || (is_residual_ratio_code(from) && is_context_reduction_code(to))
+        || (is_context_reduction_code(from) && is_retrieval_basin_code(to))
+        || (is_retrieval_basin_code(from) && is_terminal(to))
 }
 
 pub const CORE_WORK_V1: NumericalProtocol = NumericalProtocol::new(
@@ -197,9 +261,6 @@ pub const RESEARCH_WORKFLOW_V1: NumericalProtocol = NumericalProtocol::new(
     RESEARCH_WORKFLOW_TRANSITIONS,
     32,
 );
-
-pub const RELEASED_NUMERICAL_PROTOCOLS_V1: &[&NumericalProtocol] =
-    &[&CORE_WORK_V1, &RESEARCH_WORKFLOW_V1];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TransitionAcceptance {

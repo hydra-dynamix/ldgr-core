@@ -31,13 +31,13 @@
       "schema_version": 5
     },
     {
-      "migration_digest": "sha256:c6ccb9b2d2981ee82f02e915eb9d5be3c5b5a9e7d49ae256eae133b05e68e6fe",
+      "migration_digest": "sha256:5b985f31f08336fe65d54586d6d36d05fe79c0ef6dc1136c4b5ee3c486903452",
       "migration_sources": [
         "ldgr-evidence/src/schema.rs"
       ],
       "minimum_core_schema": 5,
       "namespace": "evidence",
-      "schema_version": 1
+      "schema_version": 3
     },
     {
       "migration_digest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
@@ -93,7 +93,7 @@
       "schema_version": 1
     }
   ],
-  "contract_hash": "sha256:4cac4b614e5c0d712e76baad95cd984b7e2eaa2377c8bbb770aabf87db8f6f5a",
+  "contract_hash": "sha256:bce8cec3135d79fb73bc64336c17129bd8253b24fc4f7520adeda325b425ed9f",
   "core_schema_version": 5,
   "format": "ldgr.database-contract.v1"
 }

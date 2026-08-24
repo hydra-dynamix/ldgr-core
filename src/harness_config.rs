@@ -229,6 +229,7 @@ impl HarnessConfig {
     pub fn resource_paths(&self, kind: HarnessResourceKind) -> Vec<&PathBuf> {
         self.installed
             .iter()
+            .filter(|harness| harness.harness != "agents")
             .flat_map(|harness| match kind {
                 HarnessResourceKind::Prompt => &harness.prompt_paths,
                 HarnessResourceKind::Skill => &harness.skill_paths,
@@ -245,7 +246,7 @@ impl HarnessConfig {
     ) -> Vec<&PathBuf> {
         self.installed
             .iter()
-            .filter(|harness| harness.harness == harness_name)
+            .filter(|harness| harness.harness != "agents" && harness.harness == harness_name)
             .flat_map(|harness| match kind {
                 HarnessResourceKind::Prompt => &harness.prompt_paths,
                 HarnessResourceKind::Skill => &harness.skill_paths,
@@ -279,6 +280,7 @@ mod tests {
               "default_harness": "pi",
               "selected_harnesses": ["pi", "codex"],
               "installed": [
+                {"harness":"agents","skill_paths":["/tmp/shared-skills"]},
                 {"harness":"pi","extension_paths":["/tmp/pi.ts"],"skill_paths":["/tmp/pi-skills"],"reload":"ignored extension"},
                 {"harness":"codex","prompt_paths":["/tmp/prompts"],"skill_paths":["/tmp/codex-skills"]}
               ],
@@ -288,6 +290,9 @@ mod tests {
         assert_eq!(config.selected_harnesses, ["pi", "codex"]);
         assert_eq!(config.resource_paths(HarnessResourceKind::Skill).len(), 2);
         assert_eq!(config.resource_paths(HarnessResourceKind::Prompt).len(), 1);
+        assert!(config
+            .harness_resource_paths("agents", HarnessResourceKind::Skill)
+            .is_empty());
         assert_eq!(config.updates.check, UpdateCheck::Startup);
         assert_eq!(config.updates.interval_hours, 24);
         assert_eq!(config.updates.channel, UpdateChannel::Stable);

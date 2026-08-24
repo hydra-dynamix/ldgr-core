@@ -9,10 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- Narrow agent error handling to substantive durable, blocking, ambiguous, or integrity-relevant failures; transient command/tool mistakes and safely corrected validation failures now stay out of first-class error and disposition workflows.
+- Add `ldgr error <command> <type> <message>` as the agent-first recording path, with generated durable metadata and automatic active run/work links.
 - Resume the current active run when `ldgr loop run` starts instead of refusing the invocation or claiming a second work item, and document the full loop execution model and operational controls in focused help.
 
 ### Fixed
 
+- Stop Core and adapter resource installs from writing duplicate `~/.agents/skills` copies; selected harness-specific skill roots are now authoritative, including for legacy configs.
 - Resolve and probe Windows source-adapter Cargo/Rustup configurations across split harness and user-profile homes, preserve working explicit homes, reject relative overrides, and record redacted first-class infrastructure errors before spawn when fallbacks are unavailable or ambiguous.
 
 ## [0.1.13] - 2026-07-30

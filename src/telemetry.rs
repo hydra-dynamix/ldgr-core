@@ -8,15 +8,26 @@ use tempfile::NamedTempFile;
 
 pub mod adapter_conformance;
 pub mod buffer;
+pub mod command_experience;
 pub mod serializer;
 pub mod transition;
 pub mod transmission;
 
 pub const TELEMETRY_CONSENT_SCHEMA_VERSION: u32 = 1;
-pub const TELEMETRY_CONSENT_POLICY_VERSION: u32 = 1;
+pub const TELEMETRY_CONSENT_POLICY_VERSION: u32 = 2;
 pub const TELEMETRY_CONSENT_FILE: &str = "telemetry-consent.json";
 pub const TELEMETRY_PENDING_DIRECTORY: &str = "telemetry-pending";
-pub const NUMERICAL_SEQUENCE_PROTOCOLS_V1: &[&str] = &["core-work/v1", "research-workflow/v1"];
+pub const NUMERICAL_SEQUENCE_PROTOCOLS_V1: &[&str] = &[
+    "core-work/v1",
+    "research-workflow/v1",
+    "command-experience/v1",
+];
+pub const DEFAULT_TELEMETRY_COLLECTOR_ORIGIN: &str = "https://ldgr.run";
+pub const RELEASED_NUMERICAL_PROTOCOLS_V1: &[&transition::NumericalProtocol] = &[
+    &transition::CORE_WORK_V1,
+    &transition::RESEARCH_WORKFLOW_V1,
+    &command_experience::COMMAND_EXPERIENCE_V1,
+];
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -42,11 +53,17 @@ pub struct TelemetryConsent {
     pub schema_version: u32,
     pub policy_version: u32,
     pub decision: TelemetryConsentDecision,
+    #[serde(default = "default_donation_decision")]
+    pub donation_decision: TelemetryConsentDecision,
+}
+
+const fn default_donation_decision() -> TelemetryConsentDecision {
+    TelemetryConsentDecision::Disabled
 }
 
 impl Default for TelemetryConsent {
     fn default() -> Self {
-        Self::current(TelemetryConsentDecision::Undecided)
+        Self::current(TelemetryConsentDecision::Enabled)
     }
 }
 
@@ -56,6 +73,7 @@ impl TelemetryConsent {
             schema_version: TELEMETRY_CONSENT_SCHEMA_VERSION,
             policy_version: TELEMETRY_CONSENT_POLICY_VERSION,
             decision,
+            donation_decision: TelemetryConsentDecision::Disabled,
         }
     }
 
@@ -63,6 +81,17 @@ impl TelemetryConsent {
         self.schema_version == TELEMETRY_CONSENT_SCHEMA_VERSION
             && self.policy_version == TELEMETRY_CONSENT_POLICY_VERSION
             && self.decision == TelemetryConsentDecision::Enabled
+    }
+
+    pub fn donation_enabled(&self) -> bool {
+        self.schema_version == TELEMETRY_CONSENT_SCHEMA_VERSION
+            && self.policy_version == TELEMETRY_CONSENT_POLICY_VERSION
+            && self.donation_decision == TelemetryConsentDecision::Enabled
+    }
+
+    pub fn with_donation(mut self, decision: TelemetryConsentDecision) -> Self {
+        self.donation_decision = decision;
+        self
     }
 
     fn validate(&self) -> anyhow::Result<()> {
@@ -96,9 +125,19 @@ pub fn load_telemetry_consent(ldgr_home: &Path) -> anyhow::Result<TelemetryConse
                 .with_context(|| format!("failed to read telemetry consent {}", path.display()));
         }
     };
-    let consent: TelemetryConsent = serde_json::from_str(&text)
+    let mut consent: TelemetryConsent = serde_json::from_str(&text)
         .with_context(|| format!("failed to parse telemetry consent {}", path.display()))?;
     consent.validate()?;
+    if consent.policy_version == 1 {
+        // Policy v1 required an explicit choice. Preserve explicit disables and
+        // enables, while treating its never-chosen state as the v2 opt-out
+        // default. Donation remains disabled unless separately enabled later.
+        if consent.decision == TelemetryConsentDecision::Undecided {
+            consent.decision = TelemetryConsentDecision::Enabled;
+        }
+        consent.policy_version = TELEMETRY_CONSENT_POLICY_VERSION;
+        consent.donation_decision = TelemetryConsentDecision::Disabled;
+    }
     Ok(consent)
 }
 
@@ -146,6 +185,13 @@ pub fn telemetry_kill_switch_active() -> bool {
     })
 }
 
+pub fn anonymous_collection_is_eligible(ldgr_home: &Path) -> bool {
+    !telemetry_kill_switch_active()
+        && load_telemetry_consent(ldgr_home)
+            .map(|consent| consent.collection_enabled())
+            .unwrap_or(false)
+}
+
 #[cfg(test)]
 pub(crate) fn telemetry_environment_lock() -> &'static std::sync::Mutex<()> {
     static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
@@ -156,7 +202,10 @@ pub fn clear_unsent_telemetry(ldgr_home: &Path) -> anyhow::Result<()> {
     let pending = ldgr_home.join(TELEMETRY_PENDING_DIRECTORY);
     let metadata = match fs::symlink_metadata(&pending) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            clear_local_construction_store(ldgr_home)?;
+            return Ok(());
+        }
         Err(error) => {
             return Err(error).with_context(|| {
                 format!("failed to inspect unsent telemetry {}", pending.display())
@@ -170,7 +219,33 @@ pub fn clear_unsent_telemetry(ldgr_home: &Path) -> anyhow::Result<()> {
         fs::remove_file(&pending)
             .with_context(|| format!("failed to clear unsent telemetry {}", pending.display()))?;
     }
+    clear_local_construction_store(ldgr_home)?;
     Ok(())
+}
+
+fn clear_local_construction_store(ldgr_home: &Path) -> anyhow::Result<()> {
+    let path = command_experience::construction_store_path(ldgr_home);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_file() && !metadata.file_type().is_symlink() => {
+            fs::remove_file(&path).with_context(|| {
+                format!(
+                    "failed to clear local telemetry constructions {}",
+                    path.display()
+                )
+            })
+        }
+        Ok(_) => bail!(
+            "telemetry construction path {} is not a real file",
+            path.display()
+        ),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "failed to inspect local telemetry constructions {}",
+                path.display()
+            )
+        }),
+    }
 }
 
 #[cfg(unix)]
@@ -191,14 +266,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn missing_consent_is_undecided_and_off() -> anyhow::Result<()> {
+    fn missing_consent_uses_the_anonymous_opt_out_default() -> anyhow::Result<()> {
         let home = tempfile::tempdir()?;
         let consent = load_telemetry_consent(home.path())?;
         assert_eq!(
             consent,
-            TelemetryConsent::current(TelemetryConsentDecision::Undecided)
+            TelemetryConsent::current(TelemetryConsentDecision::Enabled)
         );
-        assert!(!consent.collection_enabled());
+        assert!(consent.collection_enabled());
+        assert!(!consent.donation_enabled());
         assert!(!telemetry_consent_path(home.path()).exists());
         Ok(())
     }
@@ -260,9 +336,31 @@ mod tests {
             schema_version: TELEMETRY_CONSENT_SCHEMA_VERSION,
             policy_version: 0,
             decision: TelemetryConsentDecision::Enabled,
+            donation_decision: TelemetryConsentDecision::Disabled,
         };
         assert!(save_telemetry_consent(home.path(), &consent).is_err());
         assert!(!telemetry_consent_path(home.path()).exists());
+        Ok(())
+    }
+
+    #[test]
+    fn policy_v1_choices_migrate_without_enabling_donation() -> anyhow::Result<()> {
+        let home = tempfile::tempdir()?;
+        let path = telemetry_consent_path(home.path());
+        for (old, expected) in [
+            ("disabled", TelemetryConsentDecision::Disabled),
+            ("enabled", TelemetryConsentDecision::Enabled),
+            ("undecided", TelemetryConsentDecision::Enabled),
+        ] {
+            fs::write(
+                &path,
+                format!(r#"{{"schema_version":1,"policy_version":1,"decision":"{old}"}}"#),
+            )?;
+            let migrated = load_telemetry_consent(home.path())?;
+            assert_eq!(migrated.decision, expected);
+            assert_eq!(migrated.policy_version, TELEMETRY_CONSENT_POLICY_VERSION);
+            assert!(!migrated.donation_enabled());
+        }
         Ok(())
     }
 
@@ -272,8 +370,13 @@ mod tests {
         let pending = home.path().join(TELEMETRY_PENDING_DIRECTORY);
         fs::create_dir_all(&pending)?;
         fs::write(pending.join("sequence.json"), "[0,1,3]")?;
+        fs::write(
+            command_experience::construction_store_path(home.path()),
+            "local finite projection",
+        )?;
         clear_unsent_telemetry(home.path())?;
         assert!(!pending.exists());
+        assert!(!command_experience::construction_store_path(home.path()).exists());
         clear_unsent_telemetry(home.path())?;
         Ok(())
     }

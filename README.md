@@ -91,32 +91,35 @@ retained adapter.
 
 ## Numerical sequence telemetry
 
-LDGR can optionally share numerical state-transition sequences for research.
-Collection is disabled until an explicit telemetry choice is recorded. The first
-interactive `ldgr install` asks for Yes or No with no default; non-interactive
-installs must pass `--telemetry enable` or `--telemetry disable` because `--yes`
-is not telemetry consent. Later installs remember the stored decision.
+LDGR can share privacy-minimized numerical constructions for research.
+Anonymous construction telemetry is enabled by default and can be opted out at
+any time. Installation never prompts for telemetry and `--telemetry disable`
+records an opt-out. Experience donation is separate, non-anonymous, disabled by
+default, and requires `ldgr telemetry donation enable`.
 
-When enabled, Core buffers only committed terminal sequences as bare JSON integer
-arrays under `~/.ldgr/telemetry-pending/<protocol>/`. The released v1 protocols
-are `core-work/v1` and `research-workflow/v1`; adapters inherit Core consent and
-must use Core-owned buffering and transmission.
+Core maps raw local command/run data immediately into a finite ontology and
+stores only consolidated numerical construction keys and bucketed counts. A
+`command-experience/v1` construction is suppressed below local support five,
+released once per seven-day window, and subject to a 20-construction window cap.
+Pending wire payloads remain bare JSON integer arrays under
+`~/.ldgr/telemetry-pending/<protocol>/`.
 
 ```sh
 ldgr telemetry status
 ldgr telemetry preview
+ldgr telemetry transmit
 ldgr telemetry transmit --collector https://collector.example
 ldgr telemetry transmit --collector https://collector.example --root-ca-pem /path/to/ca.pem --max-delay-ms 30000 --timeout-ms 10000
 ldgr telemetry disable
+ldgr telemetry donation status
 ```
 
-`preview` prints the exact raw arrays and destination endpoints without sending
-them. `transmit` is best-effort, HTTPS-only, and can also read the collector
-origin from `LDGR_TELEMETRY_COLLECTOR`; failed sends are retained locally and do
-not affect ordinary LDGR commands. `disable` requires no network request, deletes
-unsent local payloads, and sends no final event. `LDGR_TELEMETRY=off` disables
-collection and transmission for the current process without changing the stored
-choice.
+`preview` performs the release check and prints exact raw arrays, endpoints, and
+decoded command constructions without sending them. `transmit` is best-effort,
+HTTPS-only, and resolves its origin from the flag, environment, then
+`https://ldgr.run`. Failed sends are retained and never affect ordinary commands.
+`disable` requires no network request, deletes pending payloads and local
+construction aggregates, and sends no final event.
 
 Already-ingested sequences cannot be individually located for deletion because
 the collector intentionally receives and stores no user, installation, request,

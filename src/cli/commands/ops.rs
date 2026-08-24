@@ -16,18 +16,15 @@ use crate::recovery::{
     print_startup_recovery_report, project_root_for_db, reconcile_startup, ExecutionAttempt,
     FailureKind,
 };
-use crate::store::{
-    doctor_schema, init_store_with_migration_info, open_store_with_migration_info, read_context,
-    MigrationBackupInfo,
-};
-use crate::telemetry::transition::RELEASED_NUMERICAL_PROTOCOLS_V1;
+use crate::store::{doctor_schema, open_store_with_migration_info, read_context};
 use crate::telemetry::transmission::{
     preview_pending_sequences, TransmissionClient, TransmissionReport,
 };
 use crate::telemetry::{
     clear_unsent_telemetry, load_telemetry_consent, save_telemetry_consent,
     telemetry_kill_switch_active, TelemetryConsent, TelemetryConsentDecision,
-    NUMERICAL_SEQUENCE_PROTOCOLS_V1, TELEMETRY_CONSENT_POLICY_VERSION,
+    DEFAULT_TELEMETRY_COLLECTOR_ORIGIN, NUMERICAL_SEQUENCE_PROTOCOLS_V1,
+    RELEASED_NUMERICAL_PROTOCOLS_V1, TELEMETRY_CONSENT_POLICY_VERSION,
 };
 use crate::tool_runner::parse_argv_json;
 use crate::update::adapter::InstallTransaction;
@@ -37,8 +34,8 @@ use super::super::args::{
     AdapterReconcileArgs, AdapterUninstallArgs, AdapterUpdateArgs, CliLoopAgent, ConfigArgs,
     ConfigCommand, ContextArgs, HarnessKind, InstallAdapterArgs, InstallArgs, InstallCommand,
     LoopArgs, LoopCommand, LoopRunArgs, MigrateArgs, SchemaArgs, SchemaCommand, StatusArgs,
-    TelemetryArgs, TelemetryCommand, TelemetryInstallChoice, TelemetryTransmitArgs, WebArgs,
-    WorkflowArgs,
+    TelemetryArgs, TelemetryCommand, TelemetryDonationCommand, TelemetryInstallChoice,
+    TelemetryTransmitArgs, WebArgs, WorkflowArgs,
 };
 use super::super::render::brief_context::{
     brief_context, print_brief_context, BriefContextOptions,
@@ -105,14 +102,15 @@ pub fn handle_compatibility(agentctl_version: &str, json_output: bool) -> anyhow
 
 pub fn handle_init(db: &Path, artifact_root: &Path) -> anyhow::Result<()> {
     let existing_database = db.exists();
-    let migration = init_store_with_migration_info(db, artifact_root)?;
-    print_migration_notice(migration.as_ref());
+    let (connection, alignment) =
+        super::super::database_alignment::align_or_initialize_database(db, artifact_root)?;
+    super::super::database_alignment::print_migration_notice(&alignment);
+    super::super::database_alignment::print_database_alignment(&alignment);
     if existing_database {
         println!("opened existing {} (no data erased)", db.display());
     } else {
         println!("initialized {}", db.display());
     }
-    let connection = crate::store::open_store(db)?;
     let recovery = reconcile_startup(&connection, &project_root_for_db(db))?;
     print_startup_recovery_report(&recovery);
     install_core_harness_resources()?;
@@ -158,7 +156,6 @@ pub fn handle_install(args: InstallArgs) -> anyhow::Result<()> {
     fs::write(&core_loop_prompt, LDGR_CORE_LOOP_PROMPT)?;
     println!("├─ Core loop prompt {}", core_loop_prompt.display());
     let mut installed = Vec::new();
-    installed.push(install_shared_skill(&home)?);
     for harness in &harnesses {
         installed.push(install_harness(*harness, &home)?);
     }
@@ -252,7 +249,8 @@ pub fn handle_telemetry(args: TelemetryArgs) -> anyhow::Result<()> {
             let stdout = io::stdout();
             let mut output = stdout.lock();
             print_telemetry_scope(&mut output)?;
-            let consent = TelemetryConsent::current(TelemetryConsentDecision::Enabled);
+            let mut consent = load_telemetry_consent(&ldgr_home)?;
+            consent.decision = TelemetryConsentDecision::Enabled;
             save_telemetry_consent(&ldgr_home, &consent)?;
             writeln!(output, "sequence collection: enabled")?;
             if telemetry_kill_switch_active() {
@@ -264,10 +262,42 @@ pub fn handle_telemetry(args: TelemetryArgs) -> anyhow::Result<()> {
             Ok(())
         }
         TelemetryCommand::Disable => {
-            let consent = TelemetryConsent::current(TelemetryConsentDecision::Disabled);
+            let mut consent = load_telemetry_consent(&ldgr_home)?;
+            consent.decision = TelemetryConsentDecision::Disabled;
             save_telemetry_consent(&ldgr_home, &consent)?;
             clear_unsent_telemetry(&ldgr_home)?;
             println!("sequence collection: disabled");
+            Ok(())
+        }
+        TelemetryCommand::Donation(donation) => {
+            let mut consent = load_telemetry_consent(&ldgr_home)?;
+            match donation.command {
+                TelemetryDonationCommand::Status => {}
+                TelemetryDonationCommand::Enable => {
+                    consent = consent.with_donation(TelemetryConsentDecision::Enabled);
+                    save_telemetry_consent(&ldgr_home, &consent)?;
+                }
+                TelemetryDonationCommand::Disable => {
+                    consent = consent.with_donation(TelemetryConsentDecision::Disabled);
+                    save_telemetry_consent(&ldgr_home, &consent)?;
+                }
+            }
+            println!(
+                "experience donation: {}",
+                if consent.donation_enabled() {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            );
+            println!(
+                "anonymous construction telemetry: {}",
+                if consent.collection_enabled() {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            );
             Ok(())
         }
     }
@@ -278,7 +308,7 @@ fn print_telemetry_status(ldgr_home: &Path) -> anyhow::Result<()> {
     let kill_switch = telemetry_kill_switch_active();
     let effective = consent.collection_enabled() && !kill_switch;
     println!(
-        "sequence collection decision: {}",
+        "anonymous construction telemetry decision: {}",
         consent.decision.as_str()
     );
     println!(
@@ -298,11 +328,24 @@ fn print_telemetry_status(ldgr_home: &Path) -> anyhow::Result<()> {
         "eligible numerical protocols: {}",
         NUMERICAL_SEQUENCE_PROTOCOLS_V1.join(", ")
     );
+    println!(
+        "experience donation: {} (separate opt-in)",
+        if consent.donation_enabled() {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
     println!("disable: ldgr telemetry disable");
     Ok(())
 }
 
 fn print_telemetry_preview(ldgr_home: &Path) -> anyhow::Result<()> {
+    let release = crate::telemetry::command_experience::release_eligible_constructions(ldgr_home)?;
+    println!(
+        "local construction release: eligible={} queued={} rare_suppressed={} cap_suppressed={}",
+        release.eligible, release.queued, release.suppressed_rare, release.suppressed_cap
+    );
     let mut previews = Vec::new();
     let mut invalid = 0;
     let mut unreadable = 0;
@@ -324,6 +367,18 @@ fn print_telemetry_preview(ldgr_home: &Path) -> anyhow::Result<()> {
             .context("validated telemetry payload was not utf-8")?;
         println!("- destination protocol: {}", preview.protocol_endpoint);
         println!("  raw array: {raw_array}");
+        if preview.protocol_endpoint
+            == crate::telemetry::command_experience::COMMAND_EXPERIENCE_V1.endpoint()
+        {
+            let states = crate::telemetry::serializer::parse_exact_sequence(
+                &crate::telemetry::command_experience::COMMAND_EXPERIENCE_V1,
+                &preview.raw_array,
+            )?;
+            println!(
+                "  decoded: {}",
+                crate::telemetry::command_experience::decode_command_experience(&states)?
+            );
+        }
     }
     if invalid > 0 {
         println!("invalid pending payloads: {invalid} (not shown; transmission will drop them)");
@@ -337,12 +392,15 @@ fn print_telemetry_preview(ldgr_home: &Path) -> anyhow::Result<()> {
 }
 
 fn transmit_telemetry(ldgr_home: &Path, args: TelemetryTransmitArgs) -> anyhow::Result<()> {
+    let release = crate::telemetry::command_experience::release_eligible_constructions(ldgr_home)?;
+    println!(
+        "local construction release: eligible={} queued={} rare_suppressed={} cap_suppressed={}",
+        release.eligible, release.queued, release.suppressed_rare, release.suppressed_cap
+    );
     let collector = args
         .collector
         .or_else(|| std::env::var("LDGR_TELEMETRY_COLLECTOR").ok())
-        .context(
-            "telemetry collector required; pass --collector https://host or set LDGR_TELEMETRY_COLLECTOR",
-        )?;
+        .unwrap_or_else(|| DEFAULT_TELEMETRY_COLLECTOR_ORIGIN.to_owned());
     let mut client = TransmissionClient::new(&collector)?
         .with_max_delay(Duration::from_millis(args.max_delay_ms))
         .with_timeout(Duration::from_millis(args.timeout_ms));
@@ -3188,57 +3246,27 @@ fn resolve_install_telemetry_consent_with_io(
             TelemetryInstallChoice::Enable => TelemetryConsentDecision::Enabled,
             TelemetryInstallChoice::Disable => TelemetryConsentDecision::Disabled,
         };
-        let consent = TelemetryConsent::current(decision);
+        let mut consent = existing;
+        consent.decision = decision;
         save_telemetry_consent(ldgr_home, &consent)?;
         return Ok(consent);
     }
-    if existing.decision != TelemetryConsentDecision::Undecided {
-        return Ok(existing);
-    }
-    if args.yes || !stdin_is_interactive {
-        bail!(
-            "telemetry choice required for the first non-interactive install; pass `--telemetry enable` or `--telemetry disable` (`--yes` is not telemetry consent)"
-        );
-    }
-
-    let decision = prompt_telemetry_consent(input, output)?;
-    let consent = TelemetryConsent::current(decision);
-    save_telemetry_consent(ldgr_home, &consent)?;
-    Ok(consent)
-}
-
-fn prompt_telemetry_consent(
-    input: &mut impl BufRead,
-    output: &mut impl Write,
-) -> anyhow::Result<TelemetryConsentDecision> {
-    print_telemetry_scope(output)?;
-    loop {
-        write!(output, "Share these sequences? Type Yes or No: ")?;
-        output.flush()?;
-        let mut answer = String::new();
-        if input.read_line(&mut answer)? == 0 {
-            bail!("telemetry choice required; enter Yes or No");
-        }
-        match answer.trim().to_ascii_lowercase().as_str() {
-            "yes" | "y" => return Ok(TelemetryConsentDecision::Enabled),
-            "no" | "n" => return Ok(TelemetryConsentDecision::Disabled),
-            _ => writeln!(output, "Please enter Yes or No. No option is preselected.")?,
-        }
-    }
+    let _ = (stdin_is_interactive, input, output);
+    Ok(existing)
 }
 
 fn print_telemetry_scope(output: &mut impl Write) -> anyhow::Result<()> {
     writeln!(
         output,
-        "LDGR can share numerical state-transition sequences for research."
+        "LDGR shares privacy-minimized anonymous construction telemetry by default."
     )?;
     writeln!(
         output,
-        "The sequence records state order and whether execution completed with a positive, negative, inconclusive, failed, or cancelled result."
+        "Finite command, execution, validation, artifact, and outcome classes are consolidated locally; rare constructions are suppressed before release."
     )?;
     writeln!(
         output,
-        "It does not include project data, names, labels, identifiers, timestamps, environment information, or linkable installation data."
+        "It does not include prompts, content, paths, commands, arguments, output, names, arbitrary labels, identifiers, exact timestamps, or linkable installation data. Disable with `ldgr telemetry disable`. Experience donation is separate and off by default."
     )?;
     Ok(())
 }
@@ -3639,12 +3667,6 @@ fn harness_skill_root(harness: HarnessKind, home: &Path) -> PathBuf {
     }
 }
 
-/// The cross-tool convention root. Several harnesses scan it, including some
-/// with no global root of their own, so it is always written.
-fn shared_skill_root(home: &Path) -> PathBuf {
-    home.join(".agents/skills")
-}
-
 /// Installing ldgr into a harness means one thing: writing the single skill.
 /// There are no extensions, slash commands, or per-harness guides — the skill
 /// routes the agent to the CLI, and the CLI describes itself.
@@ -3657,21 +3679,6 @@ fn install_harness_skill(harness: HarnessKind, home: &Path) -> anyhow::Result<se
         "harness": harness_name(harness),
         "skill_paths": [root],
         "skill_file": skill,
-    }))
-}
-
-/// Written on every install so harnesses that read the shared convention pick
-/// ldgr up without being named explicitly.
-fn install_shared_skill(home: &Path) -> anyhow::Result<serde_json::Value> {
-    let root = shared_skill_root(home);
-    let skill = root.join("ldgr/SKILL.md");
-    write_file(&skill, LDGR_SKILL)?;
-    println!("├─ Shared agent skill {}", skill.display());
-    Ok(serde_json::json!({
-        "harness": "agents",
-        "skill_paths": [root],
-        "skill_file": skill,
-        "note": "Cross-tool convention root scanned by several harnesses.",
     }))
 }
 
@@ -3989,21 +3996,10 @@ pub fn handle_migrate(db: &Path, args: MigrateArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn print_migration_notice(migration: Option<&MigrationBackupInfo>) {
-    let Some(migration) = migration else {
-        return;
-    };
-    eprintln!(
-        "migration: LDGR Core upgraded schema v{} -> v{}; verified backup: {}",
-        migration.from_schema_version,
-        migration.to_schema_version,
-        migration.backup.display()
-    );
-}
-
 pub fn handle_status(
     connection: &rusqlite::Connection,
     _artifact_root: &Path,
+    alignment: &super::super::database_alignment::DatabaseAlignment,
     args: StatusArgs,
 ) -> anyhow::Result<()> {
     let context = read_context(connection)?;
@@ -4015,6 +4011,7 @@ pub fn handle_status(
         args.recent,
         args.width,
         args.full,
+        alignment.clone(),
     )?;
     emit(args.json, &status, print_status_summary)?;
     Ok(())
@@ -4023,19 +4020,30 @@ pub fn handle_status(
 pub fn handle_context(
     connection: &rusqlite::Connection,
     _artifact_root: &Path,
+    alignment: &super::super::database_alignment::DatabaseAlignment,
     args: ContextArgs,
 ) -> anyhow::Result<()> {
     let context = read_context(connection)?;
     if args.brief {
         let brief = brief_context(&context, brief_options(args.recent, args.width));
-        return emit(args.json, &brief, print_brief_context);
+        if args.json {
+            let mut value = serde_json::to_value(&brief)?;
+            value["database_alignment"] = serde_json::to_value(alignment)?;
+            println!("{}", serde_json::to_string_pretty(&value)?);
+        } else {
+            super::super::database_alignment::print_database_alignment(alignment);
+            print_brief_context(&brief);
+        }
+        return Ok(());
     }
     if args.json {
         let mut value = serde_json::to_value(&context)?;
+        value["database_alignment"] = serde_json::to_value(alignment)?;
         value["installed_adapter_namespaces"] =
             serde_json::to_value(AdapterRegistry::discover().installed_domains())?;
         println!("{}", serde_json::to_string_pretty(&value)?);
     } else {
+        super::super::database_alignment::print_database_alignment(alignment);
         print_context(&context);
         print_installed_adapter_summary();
     }
@@ -4483,44 +4491,7 @@ mod tests {
     }
 
     #[test]
-    fn telemetry_prompt_requires_an_explicit_yes_or_no() -> anyhow::Result<()> {
-        let mut input = std::io::Cursor::new(b"\nmaybe\nNo\n");
-        let mut output = Vec::new();
-        assert_eq!(
-            prompt_telemetry_consent(&mut input, &mut output)?,
-            TelemetryConsentDecision::Disabled
-        );
-        let output = String::from_utf8(output)?;
-        assert!(output.contains("positive, negative, inconclusive, failed, or cancelled"));
-        assert!(output.contains("Please enter Yes or No. No option is preselected."));
-        assert_eq!(output.matches("Share these sequences?").count(), 3);
-        Ok(())
-    }
-
-    #[test]
-    fn telemetry_prompt_can_enable_collection_explicitly() -> anyhow::Result<()> {
-        let mut input = std::io::Cursor::new(b"Yes\n");
-        let mut output = Vec::new();
-        assert_eq!(
-            prompt_telemetry_consent(&mut input, &mut output)?,
-            TelemetryConsentDecision::Enabled
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn telemetry_prompt_can_disable_collection_explicitly() -> anyhow::Result<()> {
-        let mut input = std::io::Cursor::new(b"No\n");
-        let mut output = Vec::new();
-        assert_eq!(
-            prompt_telemetry_consent(&mut input, &mut output)?,
-            TelemetryConsentDecision::Disabled
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn first_interactive_install_records_yes_and_skips_later_prompt() -> anyhow::Result<()> {
+    fn first_interactive_install_uses_anonymous_default_without_prompt() -> anyhow::Result<()> {
         let ldgr_home = tempfile::tempdir()?;
         let args = install_args_for_telemetry(false, None);
         let mut input = std::io::Cursor::new(b"Yes\n");
@@ -4535,12 +4506,9 @@ mod tests {
         )?;
 
         assert_eq!(consent.decision, TelemetryConsentDecision::Enabled);
-        assert_eq!(
-            load_telemetry_consent(ldgr_home.path())?.decision,
-            TelemetryConsentDecision::Enabled
-        );
         let output = String::from_utf8(output)?;
-        assert!(output.contains("Share these sequences? Type Yes or No: "));
+        assert!(output.is_empty());
+        assert!(!ldgr_home.path().join("telemetry-consent.json").exists());
 
         let mut later_input = std::io::Cursor::new(b"");
         let mut later_output = Vec::new();
@@ -4558,9 +4526,9 @@ mod tests {
     }
 
     #[test]
-    fn first_interactive_install_records_no_after_blank_reprompt() -> anyhow::Result<()> {
+    fn explicit_install_disable_overrides_anonymous_default() -> anyhow::Result<()> {
         let ldgr_home = tempfile::tempdir()?;
-        let args = install_args_for_telemetry(false, None);
+        let args = install_args_for_telemetry(false, Some(TelemetryInstallChoice::Disable));
         let mut input = std::io::Cursor::new(b"\nNo\n");
         let mut output = Vec::new();
 
@@ -4577,32 +4545,25 @@ mod tests {
             load_telemetry_consent(ldgr_home.path())?.decision,
             TelemetryConsentDecision::Disabled
         );
-        let output = String::from_utf8(output)?;
-        assert!(output.contains("Please enter Yes or No. No option is preselected."));
-        assert_eq!(output.matches("Share these sequences?").count(), 2);
+        assert!(String::from_utf8(output)?.is_empty());
         Ok(())
     }
 
     #[test]
-    fn non_interactive_install_requires_telemetry_flag_and_yes_is_not_consent() -> anyhow::Result<()>
-    {
+    fn non_interactive_install_uses_default_and_accepts_explicit_overrides() -> anyhow::Result<()> {
         let ldgr_home = tempfile::tempdir()?;
         let mut input = std::io::Cursor::new(b"Yes\n");
         let mut output = Vec::new();
         let yes_without_telemetry = install_args_for_telemetry(true, None);
 
-        let error = resolve_install_telemetry_consent_with_io(
+        let default = resolve_install_telemetry_consent_with_io(
             &yes_without_telemetry,
             ldgr_home.path(),
             false,
             &mut input,
             &mut output,
-        )
-        .expect_err("--yes must not provide telemetry consent");
-
-        let message = format!("{error:#}");
-        assert!(message.contains("telemetry choice required"));
-        assert!(message.contains("--yes` is not telemetry consent"));
+        )?;
+        assert_eq!(default.decision, TelemetryConsentDecision::Enabled);
         assert!(!ldgr_home.path().join("telemetry-consent.json").exists());
 
         let explicit_disable =

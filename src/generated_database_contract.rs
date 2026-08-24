@@ -5,7 +5,7 @@ pub const ADAPTER_DATABASE_CONTRACT_FORMAT: &str = "ldgr.adapter-database-contra
 pub const DATABASE_CONTRACT_HASH: &str =
     "sha256:b7677218bb9fb3fe39ef63d25b89fcf3fe7fe6d94cc6bbef22dbc448e0e9fb92";
 pub const DATABASE_RELEASE_SET_HASH: &str =
-    "sha256:4cac4b614e5c0d712e76baad95cd984b7e2eaa2377c8bbb770aabf87db8f6f5a";
+    "sha256:bce8cec3135d79fb73bc64336c17129bd8253b24fc4f7520adeda325b425ed9f";
 pub const GENERATED_CORE_SCHEMA_VERSION: i64 = 5;
 pub const GENERATED_DATABASE_CONTRACT_JSON: &str = include_str!("../schema/database-contract.json");
 pub const GENERATED_DATABASE_RELEASE_SET_JSON: &str =

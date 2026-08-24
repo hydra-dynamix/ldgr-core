@@ -6,6 +6,8 @@ use crate::store::{
 };
 
 const ERROR_HELP: &str = "Examples:
+  ldgr error cargo-test validation \"focused test still fails\"
+  ldgr error deploy infrastructure \"remote host is unavailable\"
   ldgr error record --occurrence-id 0198... --producer agentctl --idempotency-key 0198...:pre-spawn --operation-id 0198... --attempt-id 0198... --class infrastructure-error --domain agentctl.bootstrap --code home-unavailable --boundary config-discovery --component agentctl --subject ldgr-config --severity error --retryability after-change --source agentctl:pre-spawn --summary \"Home unavailable\" --observed-at 2026-07-31T00:00:00Z
   ldgr error list --state open --json
   ldgr error show 7
@@ -27,6 +29,9 @@ pub struct ErrorArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum ErrorCommand {
+    /// Internal target for `ldgr error <command> <type> <message>`.
+    #[command(hide = true)]
+    Report(SimpleErrorArgs),
     /// Record one immutable occurrence and create or update its aggregate.
     Record(Box<RecordErrorArgs>),
     /// List error aggregates.
@@ -49,6 +54,71 @@ pub enum ErrorCommand {
     Accept(ErrorLifecycleArgs),
     /// Add an audited relation to a Core or namespace-qualified external entity.
     Link(LinkErrorArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct SimpleErrorArgs {
+    /// Stable command label without arguments, such as `cargo-test` or `deploy`.
+    pub failed_command: String,
+    /// Broad error type used to derive the durable error policy.
+    #[arg(value_enum, ignore_case = true)]
+    pub error_type: CliSimpleErrorType,
+    /// Concise error message. Quotes are optional when it is the final argument.
+    #[arg(num_args = 1.., trailing_var_arg = true)]
+    pub message: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum CliSimpleErrorType {
+    Task,
+    Validation,
+    #[value(alias = "infra")]
+    Infrastructure,
+    Interruption,
+    #[value(alias = "cancel")]
+    Cancellation,
+}
+
+impl CliSimpleErrorType {
+    pub fn policy(self) -> (ErrorClass, ErrorSeverity, ErrorRetryability) {
+        match self {
+            Self::Task => (
+                ErrorClass::TaskFailure,
+                ErrorSeverity::Error,
+                ErrorRetryability::AfterChange,
+            ),
+            Self::Validation => (
+                ErrorClass::ValidationFailure,
+                ErrorSeverity::Error,
+                ErrorRetryability::AfterChange,
+            ),
+            Self::Infrastructure => (
+                ErrorClass::InfrastructureError,
+                ErrorSeverity::Error,
+                ErrorRetryability::AfterChange,
+            ),
+            Self::Interruption => (
+                ErrorClass::Interruption,
+                ErrorSeverity::Warning,
+                ErrorRetryability::Transient,
+            ),
+            Self::Cancellation => (
+                ErrorClass::OperatorCancellation,
+                ErrorSeverity::Info,
+                ErrorRetryability::Never,
+            ),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Task => "task",
+            Self::Validation => "validation",
+            Self::Infrastructure => "infrastructure",
+            Self::Interruption => "interruption",
+            Self::Cancellation => "cancellation",
+        }
+    }
 }
 
 #[derive(Debug, Args)]

@@ -32,11 +32,14 @@ Read additional files only when this outline is insufficient to choose the first
 `ldgr init` also installs `.pi/extensions/ldgr-context.ts` for Pi-compatible harnesses. Identify the current harness. If it is Pi, run `/reload` when appropriate and use `/ldgr <args>` to run LDGR CLI commands and pipe stdout/stderr into the conversation; `/ldgr` with no args and `/ldgr-context` both capture `ldgr context --brief`. If the harness cannot load Pi extensions, read `.ldgr/harness-setup.md`; extension commands will not work, but `ldgr ...` remains available from the shell.
 
 Read `.ldgr/operator-errors.md` and `.ldgr/agent-errors.md`. Errors are
-first-class causal records. Record failures, interruptions, validation errors,
-and other unexpected behavior after an operation was accepted. Checkpoint
-durable state after unexpected behavior, after a user correction, at process
-handoff, and before exit; repeated errors require surfaced prior context and an
-explicit disposition before an unchanged retry.
+first-class causal records only when they have durable, blocking, ambiguous, or
+integrity-relevant impact. Correct transient command, quoting, path, discovery,
+and expected-test failures inline. A validation result does not also need an
+error record unless the cause remains blocking or may have unsafe partial
+effects. Checkpoint changed durable state and unresolved handoffs; repeated
+substantive errors require surfaced prior context and an explicit disposition
+before an unchanged retry. Record a substantive error with `ldgr error
+<command> <type> <msg>`; Core supplies its identities and active run/work links.
 
 ### 2. Identify the first loop
 
@@ -91,6 +94,7 @@ Create a prompt file or LDGR artifact for future autonomous runs. It should inst
 - complete only that work item;
 - produce a compact machine-summarizable run record for routine cycles (for example `run_summary.json` with objective/hypothesis, changed files/surfaces, commands, metrics, outcome, artifact refs, and next work);
 - avoid duplicating the same evidence in observations, docs, decisions, and final prose;
+- keep transient tool and syntax corrections out of the ledger;
 - reserve long narrative reports for promotion points such as claim changes, surprising failures, external-validity shifts, or milestone synthesis;
 - record observations, artifacts, and decisions only where they add durable continuity;
 - queue follow-up work only when new scope is found;

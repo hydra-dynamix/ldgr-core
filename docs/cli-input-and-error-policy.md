@@ -33,6 +33,11 @@ label, and dependency normalization as direct CLI commands.
 
 ## Parse failures
 
+Parse failures occur before command acceptance and are not first-class error
+occurrences. Agents should correct a unique harmless mistake and retry once;
+they should not create observations, error records, dispositions, or handoff
+narratives for the rejected command.
+
 Core never fuzzy-executes a correction. A unique typo suggestion fails with
 exit code 2, shows help for the deepest valid command, and prints a complete
 `Suggested rerun (not executed)` command that preserves the other input. An

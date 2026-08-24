@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use anyhow::Context;
 use serde::Serialize;
 
+use crate::cli::database_alignment::DatabaseAlignment;
 use crate::store::{
     last_completed_work_item, list_decisions, list_observations_for_work,
     list_validation_records_for_work, list_work_item_views_filtered, list_work_items_filtered,
@@ -17,6 +18,7 @@ use super::brief_context::{
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct StatusSummary {
+    pub database_alignment: DatabaseAlignment,
     pub state: String,
     pub filters: StatusFilters,
     pub work_items: StatusWorkCounts,
@@ -91,6 +93,7 @@ pub(crate) fn build_status_summary(
     recent: usize,
     width: usize,
     full: bool,
+    database_alignment: DatabaseAlignment,
 ) -> anyhow::Result<StatusSummary> {
     let normalized_program = program.map(|value| value.trim().to_ascii_lowercase());
     let normalized_priority = normalize_priority(priority)?;
@@ -191,6 +194,7 @@ pub(crate) fn build_status_summary(
                 .collect()
         });
     Ok(StatusSummary {
+        database_alignment,
         state,
         filters: StatusFilters {
             program: normalized_program,
@@ -380,6 +384,7 @@ fn held_by_reason(work_items: &[WorkItem]) -> BTreeMap<String, usize> {
 
 pub(crate) fn print_status_summary(summary: &StatusSummary) {
     println!("LDGR brief context");
+    super::super::database_alignment::print_database_alignment(&summary.database_alignment);
     println!("state: {}", summary.state);
     if summary.filters.program.is_some() || summary.filters.priority.is_some() {
         println!(

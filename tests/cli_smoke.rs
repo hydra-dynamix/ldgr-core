@@ -16,9 +16,8 @@ use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 #[test]
-fn init_status_and_context_migrate_every_supported_legacy_schema_to_the_error_schema(
-) -> anyhow::Result<()> {
-    for legacy_version in 1..=4 {
+fn init_status_and_context_align_every_supported_legacy_database() -> anyhow::Result<()> {
+    for legacy_version in 1..=5 {
         for entrypoint in [["status"], ["context"], ["init"]] {
             let project = TempDir::new()?;
             let db_path = project.path().join(".ldgr/ldgr.db");
@@ -52,6 +51,15 @@ fn init_status_and_context_migrate_every_supported_legacy_schema_to_the_error_sc
                 |row| row.get(0),
             )?;
             assert_eq!(version, 5);
+            let active_contract: String = connection.query_row(
+                "SELECT contract_hash FROM schema_component WHERE namespace = 'core'",
+                [],
+                |row| row.get(0),
+            )?;
+            assert_eq!(
+                active_contract,
+                ldgr_core::database_contract::DATABASE_CONTRACT_HASH
+            );
             let migrated_id: i64 = connection.query_row(
                 "SELECT id FROM work_item WHERE slug=?1",
                 [format!("preserved-v{legacy_version}")],
@@ -86,6 +94,84 @@ fn init_status_and_context_migrate_every_supported_legacy_schema_to_the_error_sc
                     .is_ok_and(|entry| entry.file_name().to_string_lossy().contains(&backup_marker))
             }));
         }
+    }
+    Ok(())
+}
+
+#[test]
+fn status_and_context_json_report_same_version_contract_alignment() -> anyhow::Result<()> {
+    for entrypoint in ["status", "context"] {
+        let project = TempDir::new()?;
+        let db_path = project.path().join(".ldgr/ldgr.db");
+        let artifact_root = project.path().join(".ldgr/artifacts");
+        run(project.path(), &db_path, &artifact_root, ["init"])?;
+        let connection = Connection::open(&db_path)?;
+        downgrade_cli_fixture(&connection, 5)?;
+        drop(connection);
+
+        let output = command(
+            project.path(),
+            &db_path,
+            &artifact_root,
+            [entrypoint, "--json"],
+        )?
+        .output()?;
+        assert!(
+            output.status.success(),
+            "{entrypoint} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+        let alignment = &value["database_alignment"];
+        assert_eq!(alignment["state"], "migrated");
+        assert_eq!(alignment["compatible"], true);
+        assert_eq!(alignment["active_schema_version"], 5);
+        assert_eq!(alignment["target_schema_version"], 5);
+        assert_eq!(alignment["issues"], serde_json::json!([]));
+        assert_eq!(alignment["migration"]["from_schema_version"], 5);
+        assert_eq!(alignment["migration"]["to_schema_version"], 5);
+        assert!(alignment["migration"]["verified_backup"]
+            .as_str()
+            .is_some_and(|path| path.contains("backup-schema-v5-to-v5")));
+    }
+    Ok(())
+}
+
+#[test]
+fn init_status_and_context_diagnose_unrecognized_database_without_mutation() -> anyhow::Result<()> {
+    for entrypoint in ["init", "status", "context"] {
+        let project = TempDir::new()?;
+        let db_path = project.path().join(".ldgr/ldgr.db");
+        let artifact_root = project.path().join(".ldgr/artifacts");
+        run(project.path(), &db_path, &artifact_root, ["init"])?;
+        let connection = Connection::open(&db_path)?;
+        connection.execute(
+            "UPDATE schema_component
+             SET contract_hash = 'sha256:unrecognized-contract'
+             WHERE namespace = 'core'",
+            [],
+        )?;
+        drop(connection);
+
+        command(project.path(), &db_path, &artifact_root, [entrypoint])?
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("database alignment failed"))
+            .stderr(predicate::str::contains(
+                "schema doctor: readable=true compatible=false active=5 target=5",
+            ))
+            .stderr(predicate::str::contains(
+                "schema component core contract hash does not match",
+            ))
+            .stderr(predicate::str::contains("schema doctor --json"));
+
+        let connection = Connection::open(&db_path)?;
+        let retained_hash: String = connection.query_row(
+            "SELECT contract_hash FROM schema_component WHERE namespace = 'core'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(retained_hash, "sha256:unrecognized-contract");
     }
     Ok(())
 }
@@ -324,18 +410,18 @@ fn adapter_install_list_reads_explicit_release_index_without_recompile() -> anyh
 }
 
 #[test]
-fn first_install_requires_explicit_telemetry_choice_and_remembers_no() -> anyhow::Result<()> {
+fn first_install_uses_anonymous_default_and_remembers_explicit_opt_out() -> anyhow::Result<()> {
     let project = TempDir::new()?;
     let home = project.path().join(".ldgr/test-empty-home");
     let consent_path = home.join(".ldgr/telemetry-consent.json");
 
-    let mut missing = isolated_command(project.path())?;
-    missing.args(["install", "--harness", "codex", "--yes", "--no-agentctl"]);
-    missing
+    let mut default = isolated_command(project.path())?;
+    default.args(["install", "--harness", "codex", "--yes", "--no-agentctl"]);
+    default
         .assert()
-        .failure()
-        .stderr(predicate::str::contains("telemetry choice required"))
-        .stderr(predicate::str::contains("--yes` is not telemetry consent"));
+        .success()
+        .stdout(predicate::str::contains("sequence collection: enabled"))
+        .stdout(predicate::str::contains("Share these sequences?").not());
     assert!(!consent_path.exists());
 
     let mut decline = isolated_command(project.path())?;
@@ -396,6 +482,9 @@ fn install_writes_canonical_toml_and_keeps_legacy_json_in_sync() -> anyhow::Resu
     assert_eq!(canonical["selected_harnesses"][1].as_str(), Some("claude"));
     assert_eq!(legacy["default_harness"], "codex");
     assert_eq!(legacy["selected_harnesses"][1], "claude");
+    assert!(home.join(".codex/skills/ldgr/SKILL.md").is_file());
+    assert!(home.join(".claude/skills/ldgr/SKILL.md").is_file());
+    assert!(!home.join(".agents").exists());
     assert_eq!(canonical["updates"]["check"].as_str(), Some("startup"));
     assert_eq!(
         canonical["updates"]["interval_hours"].as_integer(),
@@ -574,8 +663,9 @@ fn explicit_install_opt_in_records_enabled_consent() -> anyhow::Result<()> {
         home.join(".ldgr/telemetry-consent.json"),
     )?)?;
     assert_eq!(consent["schema_version"], 1);
-    assert_eq!(consent["policy_version"], 1);
+    assert_eq!(consent["policy_version"], 2);
     assert_eq!(consent["decision"], "enabled");
+    assert_eq!(consent["donation_decision"], "disabled");
     Ok(())
 }
 
@@ -593,8 +683,8 @@ fn non_interactive_install_accepts_explicit_telemetry_flag_without_yes() -> anyh
             "Which harness would you like to configure? › pi",
         ))
         .stdout(predicate::str::contains("sequence collection: disabled"))
-        .stdout(predicate::str::contains("Share these sequences?").not())
-        .stdout(predicate::str::contains("disable: ldgr telemetry disable").not());
+        .stdout(predicate::str::contains("disable: ldgr telemetry disable").not())
+        .stdout(predicate::str::contains("Share these sequences?").not());
 
     let consent: serde_json::Value = serde_json::from_str(&fs::read_to_string(
         home.join(".ldgr/telemetry-consent.json"),
@@ -613,9 +703,9 @@ fn no_argument_screen_reports_sequence_collection_without_prompting() -> anyhow:
     initial
         .assert()
         .success()
-        .stdout(predicate::str::contains("sequence collection: disabled"))
+        .stdout(predicate::str::contains("sequence collection: enabled"))
         .stdout(predicate::str::contains("Share these sequences?").not())
-        .stdout(predicate::str::contains("disable: ldgr telemetry disable").not());
+        .stdout(predicate::str::contains("disable: ldgr telemetry disable"));
 
     let mut enable = isolated_command(project.path())?;
     enable.args(["telemetry", "enable"]);
@@ -644,11 +734,11 @@ fn telemetry_controls_report_override_and_disable_without_network() -> anyhow::R
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "sequence collection decision: undecided",
+            "anonymous construction telemetry decision: enabled",
         ))
-        .stdout(predicate::str::contains("effective collection: disabled"))
+        .stdout(predicate::str::contains("effective collection: enabled"))
         .stdout(predicate::str::contains(
-            "eligible numerical protocols: core-work/v1, research-workflow/v1",
+            "eligible numerical protocols: core-work/v1, research-workflow/v1, command-experience/v1",
         ));
     assert!(!consent_path.exists());
 
@@ -658,7 +748,7 @@ fn telemetry_controls_report_override_and_disable_without_network() -> anyhow::R
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "does not include project data, names, labels, identifiers, timestamps, environment information, or linkable installation data",
+            "does not include prompts, content, paths, commands, arguments, output, names, arbitrary labels, identifiers, exact timestamps, or linkable installation data",
         ))
         .stdout(predicate::str::contains("sequence collection: enabled"));
 
@@ -670,7 +760,7 @@ fn telemetry_controls_report_override_and_disable_without_network() -> anyhow::R
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "sequence collection decision: enabled",
+            "anonymous construction telemetry decision: enabled",
         ))
         .stdout(predicate::str::contains("effective collection: disabled"))
         .stdout(predicate::str::contains("environment kill switch: active"));
@@ -688,6 +778,42 @@ fn telemetry_controls_report_override_and_disable_without_network() -> anyhow::R
     assert!(!pending.exists());
     let consent: serde_json::Value = serde_json::from_str(&fs::read_to_string(consent_path)?)?;
     assert_eq!(consent["decision"], "disabled");
+    Ok(())
+}
+
+#[test]
+fn experience_donation_is_separate_and_requires_explicit_opt_in() -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    let home = project.path().join(".ldgr/test-empty-home");
+    let consent_path = home.join(".ldgr/telemetry-consent.json");
+
+    let mut status = isolated_command(project.path())?;
+    status.args(["telemetry", "donation", "status"]);
+    status
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("experience donation: disabled"))
+        .stdout(predicate::str::contains(
+            "anonymous construction telemetry: enabled",
+        ));
+    assert!(!consent_path.exists());
+
+    let mut enable = isolated_command(project.path())?;
+    enable.args(["telemetry", "donation", "enable"]);
+    enable
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("experience donation: enabled"));
+    let enabled: serde_json::Value = serde_json::from_str(&fs::read_to_string(&consent_path)?)?;
+    assert_eq!(enabled["decision"], "enabled");
+    assert_eq!(enabled["donation_decision"], "enabled");
+
+    let mut disable_anonymous = isolated_command(project.path())?;
+    disable_anonymous.args(["telemetry", "disable"]);
+    disable_anonymous.assert().success();
+    let separated: serde_json::Value = serde_json::from_str(&fs::read_to_string(&consent_path)?)?;
+    assert_eq!(separated["decision"], "disabled");
+    assert_eq!(separated["donation_decision"], "enabled");
     Ok(())
 }
 
@@ -2214,6 +2340,62 @@ fn adapter_namespace_dispatch_preserves_argv_and_exports_context() -> anyhow::Re
 }
 
 #[test]
+fn adapter_namespace_workflow_is_core_rendered_without_spawning_adapter() -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    let db_path = project.path().join(".ldgr/ldgr.db");
+    let artifact_root = project.path().join(".ldgr/artifacts");
+    let adapter_root = project.path().join("adapters");
+    write_adapter_namespace_fixture(
+        &adapter_root.join("example"),
+        "example",
+        "example",
+        r#"["ldgr-definitely-missing-adapter-command-for-test"]"#,
+    )?;
+
+    command(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        ["example", "workflow"],
+    )?
+    .env("LDGR_ADAPTER_PATH", &adapter_root)
+    .assert()
+    .success()
+    .stdout(
+        predicate::str::contains("# example title workflow")
+            .and(predicate::str::contains(
+                "Canonical command: `ldgr example <command>`",
+            ))
+            .and(predicate::str::contains(
+                "specification: `templates/spec.md`",
+            ))
+            .and(predicate::str::contains("Readiness policy:"))
+            .and(predicate::str::contains("ready")),
+    );
+
+    let output = command(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        ["example", "workflow", "--json"],
+    )?
+    .env("LDGR_ADAPTER_PATH", &adapter_root)
+    .output()?;
+    assert!(output.status.success());
+    let workflow: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(workflow["adapter"], "example");
+    assert_eq!(workflow["namespace"], "example");
+    assert_eq!(workflow["canonical_command"], "ldgr example");
+    assert_eq!(
+        workflow["profile"]["spec_artifact_path"],
+        "templates/spec.md"
+    );
+    assert!(workflow["status_command"].is_null());
+
+    Ok(())
+}
+
+#[test]
 fn adapter_namespace_dispatch_propagates_nonzero_exit_status_and_stderr() -> anyhow::Result<()> {
     let project = TempDir::new()?;
     let db_path = project.path().join(".ldgr/ldgr.db");
@@ -2632,17 +2814,17 @@ fn init_prints_setup_prompt_and_command_workflow() -> anyhow::Result<()> {
         .stdout(predicate::str::contains("Core command tree:").not());
 
     let operator_guidance = fs::read_to_string(project.path().join(".ldgr/operator-errors.md"))?;
-    assert!(operator_guidance.contains("Errors are first-class causal records"));
-    assert!(operator_guidance.contains("after unexpected behavior"));
-    assert!(operator_guidance.contains("after a user correction"));
+    assert!(operator_guidance.contains("Substantive errors are first-class causal records"));
+    assert!(operator_guidance.contains("ordinary working mistakes"));
+    assert!(operator_guidance.contains("Correct those inline"));
+    assert!(operator_guidance.contains("only when it changes durable task scope or policy"));
     assert!(operator_guidance.contains("at process handoff"));
-    assert!(operator_guidance.contains("before exit"));
+    assert!(operator_guidance.contains("before exit only when"));
     let agent_guidance = fs::read_to_string(project.path().join(".ldgr/agent-errors.md"))?;
-    assert!(agent_guidance.contains("Treat errors as first-class causal records"));
-    assert!(agent_guidance.contains("after unexpected behavior"));
-    assert!(agent_guidance.contains("after a user correction"));
-    assert!(agent_guidance.contains("before handing work"));
-    assert!(agent_guidance.contains("before exiting"));
+    assert!(agent_guidance.contains("Keep implementation work primary"));
+    assert!(agent_guidance.contains("retry once without creating an error record"));
+    assert!(agent_guidance.contains("expected failures in negative tests"));
+    assert!(agent_guidance.contains("Do not run status or create ledger records merely because"));
 
     command(project.path(), &db_path, &artifact_root, ["init"])?
         .assert()
@@ -7333,6 +7515,13 @@ fn downgrade_cli_fixture(connection: &Connection, legacy_version: i64) -> anyhow
                    minimum_core_schema = 4,
                    contract_hash = 'sha256:cli-smoke-v4';
             UPDATE schema_version SET version = 4 WHERE id = 1;
+            "#,
+        )?,
+        5 => connection.execute_batch(
+            r#"
+            UPDATE schema_component
+               SET contract_hash = 'sha256:39beaf2a23ce5b9099adc6dd9458887fde58b9a101fbc70da0b0690c10482158'
+             WHERE namespace = 'core';
             "#,
         )?,
         other => anyhow::bail!("unsupported legacy fixture version {other}"),

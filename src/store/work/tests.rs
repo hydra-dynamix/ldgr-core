@@ -600,6 +600,12 @@ mod tests {
             .expect("telemetry environment lock poisoned");
         let home = TempDir::new()?;
         let _env = TelemetryEnvGuard::install(home.path());
+        crate::telemetry::save_telemetry_consent(
+            &home.path().join(".ldgr"),
+            &crate::telemetry::TelemetryConsent::current(
+                crate::telemetry::TelemetryConsentDecision::Disabled,
+            ),
+        )?;
 
         let (_temp, connection) = temp_store()?;
         create_work_item(&connection, None, "off", "Off", "Consent off work")?;

@@ -3,6 +3,9 @@
 // validation outcomes. It does not query work titles, descriptions,
 // observations, artifacts, commands, notes, rationales, paths, or timestamps.
 use crate::telemetry::buffer::queue_committed_terminal_sequence;
+use crate::telemetry::command_experience::{
+    record_private_episode, ArtifactRole, PrivateEpisodeProjection, ValidationBucket,
+};
 use crate::telemetry::transition::{
     StateCode, CANCELLED, COMPLETED_INCONCLUSIVE, COMPLETED_NEGATIVE, COMPLETED_POSITIVE,
     CORE_WORK_V1, HELD, OPERATIONAL_FAILURE, PENDING, RUNNING,
@@ -39,6 +42,7 @@ fn queue_core_work_run_terminal(
         return Ok(());
     };
     let terminal = core_terminal_for_run(connection, run_id, run_status, decision_outcome)?;
+    best_effort_record_command_experience(connection, run_id, terminal);
     queue_core_work_terminal_before_event(connection, work_item_id, terminal_event_id, terminal)
 }
 
@@ -56,6 +60,7 @@ fn queue_core_work_completion(
         if let Some((_work_item_id, run_finish_event_id)) = run_finish_context(connection, run_id)?
         {
             let terminal = core_terminal_for_run(connection, run_id, run_status, decision_outcome)?;
+            best_effort_record_command_experience(connection, run_id, terminal);
             return queue_core_work_terminal_before_event(
                 connection,
                 work_item_id,
@@ -70,6 +75,80 @@ fn queue_core_work_completion(
         _ => COMPLETED_POSITIVE,
     };
     queue_core_work_item_terminal(connection, work_item_id, "finish", terminal)
+}
+
+fn best_effort_record_command_experience(
+    connection: &Connection,
+    run_id: i64,
+    terminal: StateCode,
+) {
+    let _ = record_command_experience(connection, run_id, terminal);
+}
+
+fn record_command_experience(
+    connection: &Connection,
+    run_id: i64,
+    terminal: StateCode,
+) -> anyhow::Result<()> {
+    let Some(ldgr_home) = telemetry_ldgr_home() else { return Ok(()); };
+    if !crate::telemetry::anonymous_collection_is_eligible(&ldgr_home) {
+        return Ok(());
+    }
+    let terminal = crate::telemetry::transition::NormalizedTerminal::try_from(terminal)?;
+    let raw_input = connection
+        .query_row(
+            "SELECT COALESCE(run.command, work_item.title)
+             FROM run
+             JOIN work_item ON work_item.id = run.work_item_id
+             WHERE run.id = ?1",
+            params![run_id],
+            |row| row.get::<_, String>(0),
+        )
+        .context("failed to read the local command-experience classification input")?;
+
+    let mut validation_statement = connection.prepare(
+        "SELECT json_extract(payload_json, '$.outcome')
+         FROM event_log
+         WHERE entity_type = 'run' AND entity_id = ?1 AND event_type = 'validation'
+         ORDER BY id",
+    )?;
+    let outcomes = validation_statement
+        .query_map(params![run_id], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    let validation = if outcomes.iter().any(|value| value == "fail" || value == "error") {
+        ValidationBucket::AnyFail
+    } else {
+        let passed = outcomes.iter().filter(|value| value.as_str() == "pass").count();
+        if passed == 0 {
+            ValidationBucket::None
+        } else if passed == outcomes.len() {
+            ValidationBucket::AllPass
+        } else {
+            ValidationBucket::SomePass
+        }
+    };
+
+    let mut artifact_statement = connection.prepare(
+        "SELECT kind FROM artifact WHERE run_id = ?1 ORDER BY id",
+    )?;
+    let artifact_kinds = artifact_statement
+        .query_map(params![run_id], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    let artifact_roles = artifact_kinds.iter().map(|kind| match kind.as_str() {
+        "json" | "csv" => ArtifactRole::Data,
+        "report" | "image" => ArtifactRole::Report,
+        _ => ArtifactRole::Other,
+    });
+    let episode = PrivateEpisodeProjection::from_local_inputs(
+        &raw_input,
+        validation,
+        artifact_roles,
+        artifact_kinds.len(),
+        terminal,
+    );
+    // The raw input is dropped here. Only the finite projection and bucketed
+    // counts can cross into the local telemetry construction store.
+    record_private_episode(&ldgr_home, &episode)
 }
 
 fn queue_core_work_item_terminal(

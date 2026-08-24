@@ -1,20 +1,26 @@
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use anyhow::{anyhow, Context};
+
 use crate::store::{
     check_error_retry_authorization, error_context_packet, get_error_occurrence, link_error,
-    list_error_occurrences, list_errors, record_error, record_error_disposition,
+    list_error_occurrences, list_errors, oldest_active_run, record_error, record_error_disposition,
     resolve_fingerprint, show_error, transition_error, ErrorContextBounds, ErrorContextPacket,
     ErrorDisposition, ErrorOccurrence, ErrorRecord, ErrorRetryAuthorization, ErrorState, ErrorView,
     FingerprintRequest, RecordErrorDispositionInput, RecordErrorInput, RecordErrorResult,
+    RecoveryOrigin,
 };
 
 use super::super::args::{
     ErrorArgs, ErrorCommand, ErrorDispositionArgs, ErrorLifecycleArgs, ErrorOccurrenceCommand,
-    RecordErrorArgs,
+    RecordErrorArgs, SimpleErrorArgs,
 };
 use super::super::checked_limit;
 use super::super::render::emit;
 
 pub fn handle_error(connection: &rusqlite::Connection, args: ErrorArgs) -> anyhow::Result<()> {
     match args.command {
+        ErrorCommand::Report(args) => handle_simple_report(connection, args),
         ErrorCommand::Record(args) => handle_record(connection, *args),
         ErrorCommand::List(args) => {
             let errors = list_errors(
@@ -82,6 +88,140 @@ pub fn handle_error(connection: &rusqlite::Connection, args: ErrorArgs) -> anyho
             })
         }
     }
+}
+
+fn handle_simple_report(
+    connection: &rusqlite::Connection,
+    args: SimpleErrorArgs,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        (1..=128).contains(&args.failed_command.len())
+            && args.failed_command.chars().all(|character| {
+                character.is_ascii_alphanumeric() || "-_.:".contains(character)
+            }),
+        "<command> must be a 1-128 character stable label using only letters, numbers, -, _, ., or :; omit command arguments"
+    );
+    let message = args.message.join(" ");
+    anyhow::ensure!(
+        !message.trim().is_empty() && message.len() <= 4096,
+        "<msg> must contain 1-4096 characters"
+    );
+
+    let active = oldest_active_run(connection)?;
+    let (class, severity, retryability) = args.error_type.policy();
+    let fingerprint = resolve_fingerprint(FingerprintRequest {
+        version: "structured-v1",
+        supplied_fingerprint: None,
+        override_rationale: None,
+        split_key: None,
+        split_rationale: None,
+        class,
+        domain: "agent.command",
+        code: args.error_type.as_str(),
+        boundary: Some("cli-shorthand"),
+        component: Some(&args.failed_command),
+        subject: active.as_ref().map(|run| run.work_item.slug.as_str()),
+    })?;
+    let occurrence_id = simple_uuid_v7()?;
+    let operation_id = simple_uuid_v7()?;
+    let attempt_id = simple_uuid_v7()?;
+    let idempotency_key = format!("{occurrence_id}:{}", args.failed_command);
+    let observed_at: String =
+        connection.query_row("SELECT strftime('%Y-%m-%dT%H:%M:%SZ', 'now')", [], |row| {
+            row.get(0)
+        })?;
+    let details = serde_json::json!({"command": args.failed_command});
+    let environment = serde_json::json!({});
+    let result = record_error(
+        connection,
+        &RecordErrorInput {
+            occurrence_id: &occurrence_id,
+            producer: "ldgr-cli",
+            idempotency_key: &idempotency_key,
+            operation_id: &operation_id,
+            attempt_id: &attempt_id,
+            fingerprint_version: &fingerprint.version,
+            fingerprint: &fingerprint.fingerprint,
+            fingerprint_inputs: Some(&fingerprint.inputs),
+            fingerprint_provenance: Some(&fingerprint.provenance),
+            class,
+            domain: "agent.command",
+            code: args.error_type.as_str(),
+            severity,
+            retryability,
+            source: "ldgr-cli:shorthand",
+            summary: &message,
+            details: &details,
+            environment: &environment,
+            observed_at: &observed_at,
+            recovery_origin: RecoveryOrigin::Database,
+        },
+    )?;
+
+    if let Some(active) = &active {
+        link_error(
+            connection,
+            result.error.id,
+            Some(&occurrence_id),
+            "affected",
+            "run",
+            &active.run.id.to_string(),
+            "ldgr-cli:shorthand",
+        )?;
+        link_error(
+            connection,
+            result.error.id,
+            Some(&occurrence_id),
+            "affected",
+            "work_item",
+            &active.work_item.id.to_string(),
+            "ldgr-cli:shorthand",
+        )?;
+        println!(
+            "recorded error {} command={} type={} run={} work={}",
+            result.error.id,
+            args.failed_command,
+            args.error_type.as_str(),
+            active.run.id,
+            active.work_item.slug
+        );
+    } else {
+        println!(
+            "recorded error {} command={} type={}",
+            result.error.id,
+            args.failed_command,
+            args.error_type.as_str()
+        );
+    }
+    println!("message: {message}");
+    if result.recurrent {
+        println!("recurrence: true");
+        println!("next: ldgr error context {}", result.error.id);
+    }
+    Ok(())
+}
+
+fn simple_uuid_v7() -> anyhow::Result<String> {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")?
+        .as_millis() as u64;
+    let mut bytes = [0_u8; 16];
+    getrandom::getrandom(&mut bytes)
+        .map_err(|error| anyhow!("generating error occurrence identity: {error}"))?;
+    bytes[..6].copy_from_slice(&millis.to_be_bytes()[2..]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x70;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Ok(format!(
+        "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+        u32::from_be_bytes(bytes[0..4].try_into().expect("four bytes")),
+        u16::from_be_bytes(bytes[4..6].try_into().expect("two bytes")),
+        u16::from_be_bytes(bytes[6..8].try_into().expect("two bytes")),
+        u16::from_be_bytes(bytes[8..10].try_into().expect("two bytes")),
+        u64::from_be_bytes([
+            0, 0, bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
+        ])
+    ))
 }
 
 fn print_retry_authorization(authorization: &ErrorRetryAuthorization) {
