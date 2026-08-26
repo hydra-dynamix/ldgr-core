@@ -303,9 +303,9 @@ fn init_status_and_context_share_installed_domain_help_projection() -> anyhow::R
     let project = TempDir::new()?;
     let adapter = project.path().join("adapter");
     write_adapter_namespace_fixture(&adapter, "bench", "fixture", "[\"true\"]")?;
-    fs::copy(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../ldgr-bench/adapter-database-contract.json"),
+    fs::write(
         adapter.join("adapter-database-contract.json"),
+        ldgr_core::database_contract::generated_adapter_contract_json("bench")?,
     )?;
     let manifest = fs::read_to_string(adapter.join("adapter.toml"))?
         .replace("core_version = \"0.1\"", "core_version = \"generated\"")
@@ -1357,7 +1357,7 @@ fn noninteractive_normal_command_schedules_a_due_startup_worker_without_notice(
 ) -> anyhow::Result<()> {
     let project = TempDir::new()?;
     let adapter_fixture = write_update_check_fixture(project.path())?;
-    let (core_index, core_keyring, _) = write_core_update_check_fixture(project.path())?;
+    let (core_index, core_keyring, _, _) = write_core_update_check_fixture(project.path())?;
     let home = project.path().join(".ldgr/test-empty-home");
     let state_path = home.join(".ldgr/update-state.json");
     let lock_path = home.join(".ldgr/updates/update.lock");
@@ -1776,7 +1776,8 @@ fn update_apply_runs_a_changed_local_source_only_when_selected() -> anyhow::Resu
 #[test]
 fn update_core_check_authenticates_catalog_but_never_fetches_the_archive() -> anyhow::Result<()> {
     let project = TempDir::new()?;
-    let (index, keyring, archive) = write_core_update_check_fixture(project.path())?;
+    let (index, keyring, archive, target_version) =
+        write_core_update_check_fixture(project.path())?;
     let mut command = isolated_command(project.path())?;
     command
         .env("LDGR_CORE_UPDATE_INDEX", &index)
@@ -1793,7 +1794,7 @@ fn update_core_check_authenticates_catalog_but_never_fetches_the_archive() -> an
     assert_eq!(result["mode"], "check");
     assert_eq!(result["status"], "blocked");
     assert_eq!(result["components"][0]["kind"], "core_bundle");
-    assert_eq!(result["components"][0]["target"], "0.1.15");
+    assert_eq!(result["components"][0]["target"], target_version);
     assert!(String::from_utf8(output.stderr)?.contains("update.no-compatible-release"));
     assert!(!archive.exists());
     Ok(())
@@ -7303,7 +7304,12 @@ fn digest_update_fixture_bundle(root: &Path) -> anyhow::Result<String> {
 
 fn write_core_update_check_fixture(
     project: &Path,
-) -> anyhow::Result<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)> {
+) -> anyhow::Result<(
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    String,
+)> {
     fs::create_dir_all(project.join(".ldgr/test-empty-home"))?;
     let platform = format!(
         "{}-{}",
@@ -7315,13 +7321,16 @@ fn write_core_update_check_fixture(
         }
     );
     let archive = project.join("must-not-download-core.tar.gz");
+    let current = semver::Version::parse(env!("CARGO_PKG_VERSION"))?;
+    let target_version =
+        semver::Version::new(current.major, current.minor, current.patch + 1).to_string();
     let catalog_value = serde_json::json!({
         "schema_version": 1,
         "release_keys": [],
         "releases": [{
-            "version": "0.1.15",
+            "version": target_version.clone(),
             "channel": "stable",
-            "minimum_updater_version": "0.1.14",
+            "minimum_updater_version": current.to_string(),
             "core_commit": "1111111111111111111111111111111111111111",
             "source_repository": "hydra-dynamix/ldgr-core",
             "agentctl": {
@@ -7337,7 +7346,7 @@ fn write_core_update_check_fixture(
             "platforms": [{
                 "platform": platform,
                 "archive_url": format!("file://{}", archive.display()),
-                "archive_root": "ldgr-core-0.1.15",
+                "archive_root": format!("ldgr-core-{target_version}"),
                 "sha256": "33".repeat(32),
                 "signature_url": format!("file://{}.sig", archive.display()),
                 "signing_key_id": "fixture-core-key"
@@ -7371,7 +7380,7 @@ fn write_core_update_check_fixture(
             }]
         }))?,
     )?;
-    Ok((index, keyring, archive))
+    Ok((index, keyring, archive, target_version))
 }
 
 fn write_startup_recovery_fixture(

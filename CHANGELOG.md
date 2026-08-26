@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.15] - 2026-08-26
+
+### Added
+
+- Add signed Core and adapter update catalogs with compatibility-bound planning, detached signature verification, and five-platform release resolution.
+- Add atomic Core, agentctl, and adapter staging with durable rollback journals, Windows finalization, startup checks, and explicit check-only mode.
+- Add compatibility-v2 adapter capabilities, central-component requirements, local-store isolation, canonical Research installation, and actionable repair diagnostics.
+- Add the reviewed one-time signed Core catalog bootstrap and append-only release publication workflow.
+
 ### Changed
 
 - Narrow agent error handling to substantive durable, blocking, ambiguous, or integrity-relevant failures; transient command/tool mistakes and safely corrected validation failures now stay out of first-class error and disposition workflows.
@@ -15,6 +24,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Refresh the standalone lockfile for release tooling and normalize it for reproducible cross-platform builds.
+- Canonicalize transactional temporary roots on macOS and compare Windows receipt paths by filesystem identity.
+- Verify both current and reviewed historical paired-Core metadata through the official installer helper.
 - Stop Core and adapter resource installs from writing duplicate `~/.agents/skills` copies; selected harness-specific skill roots are now authoritative, including for legacy configs.
 - Resolve and probe Windows source-adapter Cargo/Rustup configurations across split harness and user-profile homes, preserve working explicit homes, reject relative overrides, and record redacted first-class infrastructure errors before spawn when fallbacks are unavailable or ambiguous.
 
