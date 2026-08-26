@@ -628,11 +628,11 @@ pub(crate) fn handle_update_adapter(args: &AdapterUpdateArgs) -> anyhow::Result<
     if args.check || !plan.should_apply_for_single_adapter_command() {
         return Ok(());
     }
-    let temp = std::env::temp_dir().join(format!(
+    let temp = canonical_temp_path(format!(
         "ldgr-adapter-update-{}-{}",
         normalize_adapter_name(&args.name),
         std::process::id()
-    ));
+    ))?;
     remove_path_if_exists(&temp)?;
     let mut transaction = InstallTransaction::new(temp.join("rollback"))?;
     crate::update::adapter::stage_and_apply_adapter_update(&plan, &mut transaction)?;
@@ -749,11 +749,11 @@ fn reconcile_installed_adapters(home: &Path, requested: Option<&str>) -> anyhow:
             .iter()
             .map(|(_, target)| target.clone())
             .collect::<Vec<_>>();
-        let temp = std::env::temp_dir().join(format!(
+        let temp = canonical_temp_path(format!(
             "ldgr-adapter-reconcile-{}-{}",
             adapter.slug,
             std::process::id()
-        ));
+        ))?;
         remove_path_if_exists(&temp)?;
         let mut transaction = InstallTransaction::new(temp.join("rollback"))?;
         transaction.snapshot(&adapter.root_path)?;
@@ -917,11 +917,11 @@ fn reconcile_source_adapter(
             );
         }
     }
-    let temp = std::env::temp_dir().join(format!(
+    let temp = canonical_temp_path(format!(
         "ldgr-adapter-source-reconcile-{}-{}",
         adapter.slug,
         std::process::id()
-    ));
+    ))?;
     remove_path_if_exists(&temp)?;
     let mut transaction = InstallTransaction::new(temp.join("rollback"))?;
     transaction.snapshot(&adapter.root_path)?;
@@ -1297,11 +1297,11 @@ fn install_resolved_index_release(
     home: &Path,
     offline: bool,
 ) -> anyhow::Result<()> {
-    let temp = std::env::temp_dir().join(format!(
+    let temp = canonical_temp_path(format!(
         "ldgr-adapter-index-install-{}-{}",
         resolved.adapter.domain,
         std::process::id()
-    ));
+    ))?;
     let _ = fs::remove_dir_all(&temp);
     fs::create_dir_all(&temp)?;
     let mut transaction = InstallTransaction::new(temp.join("rollback"))?;
@@ -1661,6 +1661,16 @@ fn collect_digest_files(
         }
     }
     Ok(())
+}
+
+fn canonical_temp_path(name: impl AsRef<Path>) -> anyhow::Result<PathBuf> {
+    let root = fs::canonicalize(std::env::temp_dir())
+        .context("failed to resolve the canonical system temporary directory")?;
+    anyhow::ensure!(
+        root.is_dir(),
+        "canonical system temporary directory is not a directory"
+    );
+    Ok(root.join(name))
 }
 
 fn remove_path_if_exists(path: &Path) -> anyhow::Result<()> {
@@ -2166,10 +2176,10 @@ fn install_adapter_from_source_root_with_package(
     install_root: &Path,
     home: &Path,
 ) -> anyhow::Result<()> {
-    let temp = std::env::temp_dir().join(format!(
+    let temp = canonical_temp_path(format!(
         "ldgr-adapter-source-install-{adapter}-{}",
         std::process::id()
-    ));
+    ))?;
     remove_path_if_exists(&temp)?;
     let mut transaction = InstallTransaction::new(temp.join("rollback"))?;
     apply_source_adapter_update(
@@ -2784,11 +2794,11 @@ fn install_adapter_from_release(
         release.repo, tag, archive_name
     );
     println!("├─ Release {}", url);
-    let temp = std::env::temp_dir().join(format!(
+    let temp = canonical_temp_path(format!(
         "ldgr-adapter-install-{}-{}",
         entry.slug,
         std::process::id()
-    ));
+    ))?;
     let _ = fs::remove_dir_all(&temp);
     fs::create_dir_all(&temp)?;
     let archive = temp.join(&archive_name);
@@ -4474,6 +4484,14 @@ fn loop_result_failed(result: &LoopRuntimeResult, options: &LoopRuntimeOptions) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transactional_temp_paths_use_the_canonical_system_directory() -> anyhow::Result<()> {
+        let root = fs::canonicalize(std::env::temp_dir())?;
+        let path = canonical_temp_path("ldgr-canonical-temp-test")?;
+        assert_eq!(path.parent(), Some(root.as_path()));
+        Ok(())
+    }
 
     fn install_args_for_telemetry(
         yes: bool,
