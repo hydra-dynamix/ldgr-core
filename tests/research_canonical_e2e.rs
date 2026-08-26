@@ -27,7 +27,7 @@ fn canonical_research_install_workflow_is_clean_room_and_actionable() -> anyhow:
     );
 
     let temp = TempDir::new()?;
-    let root = temp.path().join("canonical research e2e-Δ");
+    let root = fs::canonicalize(temp.path())?.join("canonical research e2e-Δ");
     let home = root.join("isolated home");
     let project = root.join("project");
     let fixture = root.join("signed release");
@@ -107,8 +107,13 @@ fn canonical_research_install_workflow_is_clean_room_and_actionable() -> anyhow:
         "Core did not persist an absolute adapter binary argv: {}",
         dispatched_binary.display()
     );
+    let receipt_binary = PathBuf::from(
+        receipt["binary_path"]
+            .as_str()
+            .context("receipt binary path is missing")?,
+    );
     ensure!(
-        receipt["binary_path"].as_str() == Some(dispatched_binary.to_string_lossy().as_ref()),
+        fs::canonicalize(&receipt_binary)? == fs::canonicalize(&dispatched_binary)?,
         "receipt and dispatch binary disagree"
     );
 

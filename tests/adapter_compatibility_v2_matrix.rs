@@ -474,8 +474,9 @@ fn interrupted_native_activation_restores_core_adapters_receipts_resources_and_d
     }
 
     let root = tempfile::tempdir()?;
-    let installation = root.path().join("Program Files").join("LDGR matrix μ");
-    let staging = root.path().join("staging");
+    let canonical_root = fs::canonicalize(root.path())?;
+    let installation = canonical_root.join("Program Files").join("LDGR matrix μ");
+    let staging = canonical_root.join("staging");
     fs::create_dir_all(&installation)?;
     fs::create_dir_all(&staging)?;
 
@@ -545,7 +546,7 @@ fn interrupted_native_activation_restores_core_adapters_receipts_resources_and_d
         target(&installation, "example", "harness_resource", &resource),
         target(&installation, "core", "central_database", &central_db),
     ];
-    let journal = root.path().join("rollback journal");
+    let journal = canonical_root.join("rollback journal");
     let mut transaction = InstallTransaction::prepare(journal.clone(), &"d".repeat(64), &targets)?;
     transaction.activate_file(&staged_core, &core)?;
     transaction.activate_file(&staged_agentctl, &agentctl)?;
