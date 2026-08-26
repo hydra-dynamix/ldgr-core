@@ -12,9 +12,22 @@ exclude = ["Cargo.lock"]
 keywords = ["cli", "sqlite", "agents", "autonomous", "ledger"]
 categories = ["command-line-utilities", "development-tools"]
 
+[features]
+release-tooling = []
+
 [[bin]]
 name = "ldgr"
 path = "src/main.rs"
+
+[[bin]]
+name = "ldgr-release"
+path = "src/bin/ldgr-release.rs"
+required-features = ["release-tooling"]
+
+[[test]]
+name = "core_catalog_bootstrap"
+path = "tests/core_catalog_bootstrap.rs"
+required-features = ["release-tooling"]
 
 [dependencies]
 anyhow = "1.0"
@@ -37,7 +50,7 @@ thiserror = "1.0"
 tempfile = "3.10"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_JobObjects", "Win32_System_SystemServices", "Win32_System_Threading"] }
 
 [dev-dependencies]
 assert_cmd = "2.0"

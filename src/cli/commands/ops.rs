@@ -16,28 +16,26 @@ use crate::recovery::{
     print_startup_recovery_report, project_root_for_db, reconcile_startup, ExecutionAttempt,
     FailureKind,
 };
-use crate::store::{
-    doctor_schema, init_store_with_migration_info, open_store_with_migration_info, read_context,
-    MigrationBackupInfo,
-};
-use crate::telemetry::transition::RELEASED_NUMERICAL_PROTOCOLS_V1;
+use crate::store::{doctor_schema, open_store_with_migration_info, read_context};
 use crate::telemetry::transmission::{
     preview_pending_sequences, TransmissionClient, TransmissionReport,
 };
 use crate::telemetry::{
     clear_unsent_telemetry, load_telemetry_consent, save_telemetry_consent,
     telemetry_kill_switch_active, TelemetryConsent, TelemetryConsentDecision,
-    NUMERICAL_SEQUENCE_PROTOCOLS_V1, TELEMETRY_CONSENT_POLICY_VERSION,
+    DEFAULT_TELEMETRY_COLLECTOR_ORIGIN, NUMERICAL_SEQUENCE_PROTOCOLS_V1,
+    RELEASED_NUMERICAL_PROTOCOLS_V1, TELEMETRY_CONSENT_POLICY_VERSION,
 };
 use crate::tool_runner::parse_argv_json;
+use crate::update::adapter::InstallTransaction;
 use crate::web::{generate_control_token, serve, WebOptions};
 
 use super::super::args::{
     AdapterReconcileArgs, AdapterUninstallArgs, AdapterUpdateArgs, CliLoopAgent, ConfigArgs,
     ConfigCommand, ContextArgs, HarnessKind, InstallAdapterArgs, InstallArgs, InstallCommand,
     LoopArgs, LoopCommand, LoopRunArgs, MigrateArgs, SchemaArgs, SchemaCommand, StatusArgs,
-    TelemetryArgs, TelemetryCommand, TelemetryInstallChoice, TelemetryTransmitArgs, WebArgs,
-    WorkflowArgs,
+    TelemetryArgs, TelemetryCommand, TelemetryDonationCommand, TelemetryInstallChoice,
+    TelemetryTransmitArgs, WebArgs, WorkflowArgs,
 };
 use super::super::render::brief_context::{
     brief_context, print_brief_context, BriefContextOptions,
@@ -47,14 +45,14 @@ use super::super::render::emit;
 use super::super::render::status::{build_status_summary, print_status_summary};
 use super::super::render::text::print_loop_result;
 use super::super::{CLI_DEFAULT_HELP_SECTIONS, INIT_PROJECT_SETUP_PROMPT};
-use crate::harness_config::{HarnessConfig, InterviewDepth};
+use crate::harness_config::{HarnessConfig, InterviewDepth, UpdateChannel, UpdateCheck};
 
 const LDGR_CORE_LOOP_PROMPT: &str = include_str!("../../../prompts/loop-prompt.md");
 const LDGR_CORE_LOOP_PROMPT_FILE: &str = "ldgr-core-loop.md";
 const LDGR_RELEASE_KEYRING: &str = include_str!("../../../release-keyring.json");
 const LDGR_RELEASE_KEYRING_FILE: &str = "release-keyring.json";
 const AGENTCTL_REPO: &str = "https://github.com/hydra-dynamix/agentctl";
-const AGENTCTL_VERSION: &str = "0.1.2";
+pub(crate) const AGENTCTL_VERSION: &str = "0.1.2";
 const AGENTCTL_REQUIREMENT: &str = ">=0.1.2, <0.2.0";
 const LAUNCHER_COMPATIBILITY_SCHEMA: &str = "ldgr.launcher-compatibility.v1";
 const ERROR_RECOVERY_SCHEMA_VERSION: u32 = 1;
@@ -104,14 +102,15 @@ pub fn handle_compatibility(agentctl_version: &str, json_output: bool) -> anyhow
 
 pub fn handle_init(db: &Path, artifact_root: &Path) -> anyhow::Result<()> {
     let existing_database = db.exists();
-    let migration = init_store_with_migration_info(db, artifact_root)?;
-    print_migration_notice(migration.as_ref());
+    let (connection, alignment) =
+        super::super::database_alignment::align_or_initialize_database(db, artifact_root)?;
+    super::super::database_alignment::print_migration_notice(&alignment);
+    super::super::database_alignment::print_database_alignment(&alignment);
     if existing_database {
         println!("opened existing {} (no data erased)", db.display());
     } else {
         println!("initialized {}", db.display());
     }
-    let connection = crate::store::open_store(db)?;
     let recovery = reconcile_startup(&connection, &project_root_for_db(db))?;
     print_startup_recovery_report(&recovery);
     install_core_harness_resources()?;
@@ -157,7 +156,6 @@ pub fn handle_install(args: InstallArgs) -> anyhow::Result<()> {
     fs::write(&core_loop_prompt, LDGR_CORE_LOOP_PROMPT)?;
     println!("├─ Core loop prompt {}", core_loop_prompt.display());
     let mut installed = Vec::new();
-    installed.push(install_shared_skill(&home)?);
     for harness in &harnesses {
         installed.push(install_harness(*harness, &home)?);
     }
@@ -251,7 +249,8 @@ pub fn handle_telemetry(args: TelemetryArgs) -> anyhow::Result<()> {
             let stdout = io::stdout();
             let mut output = stdout.lock();
             print_telemetry_scope(&mut output)?;
-            let consent = TelemetryConsent::current(TelemetryConsentDecision::Enabled);
+            let mut consent = load_telemetry_consent(&ldgr_home)?;
+            consent.decision = TelemetryConsentDecision::Enabled;
             save_telemetry_consent(&ldgr_home, &consent)?;
             writeln!(output, "sequence collection: enabled")?;
             if telemetry_kill_switch_active() {
@@ -263,10 +262,42 @@ pub fn handle_telemetry(args: TelemetryArgs) -> anyhow::Result<()> {
             Ok(())
         }
         TelemetryCommand::Disable => {
-            let consent = TelemetryConsent::current(TelemetryConsentDecision::Disabled);
+            let mut consent = load_telemetry_consent(&ldgr_home)?;
+            consent.decision = TelemetryConsentDecision::Disabled;
             save_telemetry_consent(&ldgr_home, &consent)?;
             clear_unsent_telemetry(&ldgr_home)?;
             println!("sequence collection: disabled");
+            Ok(())
+        }
+        TelemetryCommand::Donation(donation) => {
+            let mut consent = load_telemetry_consent(&ldgr_home)?;
+            match donation.command {
+                TelemetryDonationCommand::Status => {}
+                TelemetryDonationCommand::Enable => {
+                    consent = consent.with_donation(TelemetryConsentDecision::Enabled);
+                    save_telemetry_consent(&ldgr_home, &consent)?;
+                }
+                TelemetryDonationCommand::Disable => {
+                    consent = consent.with_donation(TelemetryConsentDecision::Disabled);
+                    save_telemetry_consent(&ldgr_home, &consent)?;
+                }
+            }
+            println!(
+                "experience donation: {}",
+                if consent.donation_enabled() {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            );
+            println!(
+                "anonymous construction telemetry: {}",
+                if consent.collection_enabled() {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            );
             Ok(())
         }
     }
@@ -277,7 +308,7 @@ fn print_telemetry_status(ldgr_home: &Path) -> anyhow::Result<()> {
     let kill_switch = telemetry_kill_switch_active();
     let effective = consent.collection_enabled() && !kill_switch;
     println!(
-        "sequence collection decision: {}",
+        "anonymous construction telemetry decision: {}",
         consent.decision.as_str()
     );
     println!(
@@ -297,11 +328,24 @@ fn print_telemetry_status(ldgr_home: &Path) -> anyhow::Result<()> {
         "eligible numerical protocols: {}",
         NUMERICAL_SEQUENCE_PROTOCOLS_V1.join(", ")
     );
+    println!(
+        "experience donation: {} (separate opt-in)",
+        if consent.donation_enabled() {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
     println!("disable: ldgr telemetry disable");
     Ok(())
 }
 
 fn print_telemetry_preview(ldgr_home: &Path) -> anyhow::Result<()> {
+    let release = crate::telemetry::command_experience::release_eligible_constructions(ldgr_home)?;
+    println!(
+        "local construction release: eligible={} queued={} rare_suppressed={} cap_suppressed={}",
+        release.eligible, release.queued, release.suppressed_rare, release.suppressed_cap
+    );
     let mut previews = Vec::new();
     let mut invalid = 0;
     let mut unreadable = 0;
@@ -323,6 +367,18 @@ fn print_telemetry_preview(ldgr_home: &Path) -> anyhow::Result<()> {
             .context("validated telemetry payload was not utf-8")?;
         println!("- destination protocol: {}", preview.protocol_endpoint);
         println!("  raw array: {raw_array}");
+        if preview.protocol_endpoint
+            == crate::telemetry::command_experience::COMMAND_EXPERIENCE_V1.endpoint()
+        {
+            let states = crate::telemetry::serializer::parse_exact_sequence(
+                &crate::telemetry::command_experience::COMMAND_EXPERIENCE_V1,
+                &preview.raw_array,
+            )?;
+            println!(
+                "  decoded: {}",
+                crate::telemetry::command_experience::decode_command_experience(&states)?
+            );
+        }
     }
     if invalid > 0 {
         println!("invalid pending payloads: {invalid} (not shown; transmission will drop them)");
@@ -336,12 +392,15 @@ fn print_telemetry_preview(ldgr_home: &Path) -> anyhow::Result<()> {
 }
 
 fn transmit_telemetry(ldgr_home: &Path, args: TelemetryTransmitArgs) -> anyhow::Result<()> {
+    let release = crate::telemetry::command_experience::release_eligible_constructions(ldgr_home)?;
+    println!(
+        "local construction release: eligible={} queued={} rare_suppressed={} cap_suppressed={}",
+        release.eligible, release.queued, release.suppressed_rare, release.suppressed_cap
+    );
     let collector = args
         .collector
         .or_else(|| std::env::var("LDGR_TELEMETRY_COLLECTOR").ok())
-        .context(
-            "telemetry collector required; pass --collector https://host or set LDGR_TELEMETRY_COLLECTOR",
-        )?;
+        .unwrap_or_else(|| DEFAULT_TELEMETRY_COLLECTOR_ORIGIN.to_owned());
     let mut client = TransmissionClient::new(&collector)?
         .with_max_delay(Duration::from_millis(args.max_delay_ms))
         .with_timeout(Duration::from_millis(args.timeout_ms));
@@ -479,7 +538,20 @@ pub(crate) fn handle_install_adapter(args: &InstallAdapterArgs) -> anyhow::Resul
     if args.offline && source.starts_with("http") {
         bail!("--offline requires LDGR_ADAPTER_INDEX to reference a local file");
     }
-    match crate::release_index::load_release_index(source) {
+    let signed_index = (|| {
+        let sources = crate::update::catalog::AdapterCatalogSources::configured(args.offline)?;
+        let client = crate::update::network::UpdateNetworkClient::new(args.offline)?;
+        match crate::update::catalog::fetch_signed_adapter_update_catalog(&client, &sources, None)?
+        {
+            crate::update::catalog::AdapterCatalogFetch::Modified { verified, .. } => {
+                Ok(verified.catalog)
+            }
+            crate::update::catalog::AdapterCatalogFetch::NotModified { .. } => {
+                bail!("adapter release index unexpectedly returned not-modified")
+            }
+        }
+    })();
+    match signed_index {
         Ok(index) => install_adapter_from_index(args, &index),
         Err(index_error) if default_catalog_fallback_allowed(args, configured_source.is_some()) => {
             eprintln!(
@@ -543,93 +615,29 @@ fn install_adapter_from_catalog(args: &InstallAdapterArgs) -> anyhow::Result<()>
 }
 
 pub(crate) fn handle_update_adapter(args: &AdapterUpdateArgs) -> anyhow::Result<()> {
-    use semver::Version;
-
-    let registry = AdapterRegistry::discover();
-    let installed = registry
-        .find(&args.name)
-        .with_context(|| format!("adapter `{}` is not installed", args.name))?;
-    let receipt_value = installed
-        .installation_receipt
-        .as_ref()
-        .context("installed adapter has no tracked installation receipt; reinstall it first")?;
-    let receipt = parse_adapter_installation_receipt(receipt_value.clone())?;
-    if let AdapterInstallationReceipt::Source(receipt) = receipt {
-        if args.prerelease {
-            bail!(
-                "--prerelease applies only to signed release adapters, not local source installs"
-            );
-        }
-        let home = home_dir()?;
-        let drift = source_receipt_drift(&installed.root_path, &home, &receipt)?;
-        if !drift.is_empty() {
-            bail!(
-                "refusing to update modified source adapter-owned files:\n{}\nRestore them or run `ldgr adapter uninstall {} --force` before reinstalling.",
-                format_drift_paths(&drift),
-                installed.slug
-            );
-        }
-        let source = resolve_adapter_source_package(
-            &receipt.source.package,
-            Path::new(&receipt.source.bundle_root),
-        )?;
-        verify_source_identity_paths(&receipt, &source)?;
-        let current_source_sha256 = digest_source_bundle(&source.bundle_root)?;
-        let source_changed = current_source_sha256 != receipt.source.bundle_sha256;
-        println!(
-            "adapter={} install_kind=local_source source_changed={} verified_release=false",
-            installed.slug, source_changed
-        );
-        if args.check {
-            return Ok(());
-        }
-        return install_adapter_from_source_root_with_package(
-            &installed.slug,
-            &receipt.source.package,
-            &source.bundle_root,
-            &installed.root_path,
-            &home,
-        );
-    }
-    let AdapterInstallationReceipt::Release(receipt) = receipt else {
-        unreachable!()
+    let inspection = crate::update::adapter::inspect_adapter_installation(&args.name)?;
+    let target_core_version = semver::Version::parse(env!("CARGO_PKG_VERSION"))?;
+    let channel = if args.prerelease {
+        UpdateChannel::Prerelease
+    } else {
+        UpdateChannel::Stable
     };
-    let current_text = receipt.version;
-    let current = Version::parse(&current_text).context("installed receipt version is invalid")?;
-    let index = crate::release_index::load_configured_release_index()?;
-    let core = Version::parse(env!("CARGO_PKG_VERSION"))?;
-    let platform = platform_tag()?;
-    let resolved = crate::release_index::resolve_release(
-        &index,
-        &installed.slug,
-        &core,
-        &platform,
-        None,
-        args.prerelease,
-    )?;
-    if resolved.version <= current {
-        println!(
-            "adapter={} installed={} latest_compatible={} update_available=false",
-            installed.slug, current, resolved.version
-        );
+    let plan =
+        crate::update::adapter::plan_adapter_update(inspection, &target_core_version, channel)?;
+    plan.print_status();
+    if args.check || !plan.should_apply_for_single_adapter_command() {
         return Ok(());
     }
-    println!(
-        "adapter={} installed={} latest_compatible={} update_available=true",
-        installed.slug, current, resolved.version
-    );
-    if args.check {
-        return Ok(());
-    }
-    install_adapter_from_configured_index(&InstallAdapterArgs {
-        name: installed.slug.clone(),
-        source_root: None,
-        install_root: Some(installed.root_path.clone()),
-        version: Some(resolved.version.to_string()),
-        prerelease: args.prerelease,
-        offline: false,
-        yes: true,
-    })
+    let temp = std::env::temp_dir().join(format!(
+        "ldgr-adapter-update-{}-{}",
+        normalize_adapter_name(&args.name),
+        std::process::id()
+    ));
+    remove_path_if_exists(&temp)?;
+    let mut transaction = InstallTransaction::new(temp.join("rollback"))?;
+    crate::update::adapter::stage_and_apply_adapter_update(&plan, &mut transaction)?;
+    transaction.commit()?;
+    remove_path_if_exists(&temp)
 }
 
 pub(crate) fn handle_uninstall_adapter(args: &AdapterUninstallArgs) -> anyhow::Result<()> {
@@ -768,7 +776,7 @@ fn reconcile_installed_adapters(home: &Path, requested: Option<&str>) -> anyhow:
                 remove_path_if_exists(&path)?;
             }
         }
-        install_typed_harness_resources(&desired_plan)?;
+        install_typed_harness_resources(&desired_plan, false)?;
         receipt.owned_resources = desired_targets
             .iter()
             .map(|path| {
@@ -928,7 +936,7 @@ fn reconcile_source_adapter(
             remove_path_if_exists(old)?;
         }
     }
-    install_source_harness_resources(&plan)?;
+    install_source_harness_resources(&plan, false)?;
     receipt.owned_resources = source_owned_resources(&plan)?;
     receipt.ownership.external_resource_roots = source_resource_roots(&plan)?;
     write_source_receipt_file(&adapter.root_path, &receipt)?;
@@ -986,6 +994,67 @@ fn prepare_source_reinstall(
         );
     }
     Ok(Some(receipt))
+}
+
+pub(crate) fn inspect_source_installation_for_update(
+    install_root: &Path,
+    home: &Path,
+    receipt: &crate::release_index::SourceInstallationReceipt,
+) -> anyhow::Result<(PathBuf, String, bool)> {
+    let drift = source_receipt_drift(install_root, home, receipt)?;
+    if !drift.is_empty() {
+        bail!(
+            "refusing to update modified source adapter-owned files:\n{}\nRestore them or run `ldgr adapter uninstall {} --force` before reinstalling.",
+            format_drift_paths(&drift),
+            receipt.domain
+        );
+    }
+    let source = resolve_adapter_source_package(
+        &receipt.source.package,
+        Path::new(&receipt.source.bundle_root),
+    )?;
+    verify_source_identity_paths(receipt, &source)?;
+    let current_source_sha256 = digest_source_bundle(&source.bundle_root)?;
+    let source_changed = current_source_sha256 != receipt.source.bundle_sha256;
+    Ok((source.bundle_root, current_source_sha256, source_changed))
+}
+
+pub(crate) fn inspect_release_installation_for_update(
+    install_root: &Path,
+    home: &Path,
+    receipt: &crate::release_index::InstallationReceipt,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        digest_bundle(install_root)? == receipt.bundle_sha256,
+        "modified adapter-owned bundle"
+    );
+    let allowed_roots = source_allowed_resource_roots(home)?;
+    for resource in &receipt.owned_resources {
+        let path = absolute_path(Path::new(&resource.path))?;
+        anyhow::ensure!(
+            allowed_roots
+                .iter()
+                .any(|root| path != *root && path.starts_with(root)),
+            "adapter-owned resource is outside configured harness boundaries"
+        );
+        anyhow::ensure!(
+            path.exists() && digest_path(&path)? == resource.sha256,
+            "modified adapter-owned resource"
+        );
+    }
+    if let (Some(path), Some(expected)) = (&receipt.binary_path, &receipt.binary_sha256) {
+        let path = Path::new(path);
+        anyhow::ensure!(
+            path.is_absolute() && path.is_file() && digest_path(path)? == *expected,
+            "modified adapter-owned binary"
+        );
+    } else {
+        anyhow::ensure!(
+            receipt.binary_path.is_none() && receipt.binary_sha256.is_none(),
+            "adapter binary ownership fields must be paired"
+        );
+    }
+    Ok(())
 }
 
 fn source_receipt_drift(
@@ -1165,16 +1234,6 @@ fn absolute_path(path: &Path) -> anyhow::Result<PathBuf> {
     Ok(absolute)
 }
 
-fn install_adapter_from_configured_index(args: &InstallAdapterArgs) -> anyhow::Result<()> {
-    let configured_source = std::env::var(crate::release_index::ADAPTER_RELEASE_INDEX_ENV)
-        .unwrap_or_else(|_| crate::release_index::DEFAULT_ADAPTER_RELEASE_INDEX_URL.to_owned());
-    if args.offline && configured_source.starts_with("http") {
-        bail!("--offline requires LDGR_ADAPTER_INDEX to reference a local file");
-    }
-    let index = crate::release_index::load_release_index(&configured_source)?;
-    install_adapter_from_index(args, &index)
-}
-
 fn install_adapter_from_index(
     args: &InstallAdapterArgs,
     index: &crate::release_index::AdapterReleaseIndex,
@@ -1224,7 +1283,7 @@ fn install_adapter_from_index(
     println!("◇ Installing LDGR adapter `{}`", adapter.domain);
     println!("├─ Resolved version {} for {platform}", resolved.version);
     println!("├─ Install root {}", install_root.display());
-    install_resolved_index_release(&resolved, &install_root, &home)?;
+    install_resolved_index_release(&resolved, &install_root, &home, args.offline)?;
     println!(
         "└─ Installed adapter `{}`. Try `ldgr {} --help` or `ldgr adapter show {}`.",
         adapter.domain, adapter.domain, adapter.domain
@@ -1236,6 +1295,7 @@ fn install_resolved_index_release(
     resolved: &crate::release_index::ResolvedAdapterRelease<'_>,
     install_root: &Path,
     home: &Path,
+    offline: bool,
 ) -> anyhow::Result<()> {
     let temp = std::env::temp_dir().join(format!(
         "ldgr-adapter-index-install-{}-{}",
@@ -1244,24 +1304,41 @@ fn install_resolved_index_release(
     ));
     let _ = fs::remove_dir_all(&temp);
     fs::create_dir_all(&temp)?;
-    let archive = temp.join("adapter.tar.gz");
-    run_checked(
-        Command::new("curl")
-            .arg("-fsSL")
-            .arg(&resolved.platform.asset_url)
-            .arg("-o")
-            .arg(&archive),
-        "download indexed adapter release",
+    let mut transaction = InstallTransaction::new(temp.join("rollback"))?;
+    stage_and_apply_resolved_index_release(
+        resolved,
+        install_root,
+        home,
+        offline,
+        &temp,
+        &mut transaction,
+    )?;
+    transaction.commit()?;
+    let _ = fs::remove_dir_all(&temp);
+    Ok(())
+}
+
+pub(crate) fn stage_and_apply_resolved_index_release(
+    resolved: &crate::release_index::ResolvedAdapterRelease<'_>,
+    install_root: &Path,
+    home: &Path,
+    offline: bool,
+    staging_root: &Path,
+    transaction: &mut InstallTransaction,
+) -> anyhow::Result<()> {
+    let archive = staging_root.join("adapter.tar.gz");
+    let update_client = crate::update::network::UpdateNetworkClient::new(offline)?;
+    update_client.download_artifact(
+        &resolved.platform.asset_url,
+        &archive,
+        crate::update::network::MAX_UPDATE_ARTIFACT_BYTES,
     )?;
     crate::release_index::verify_file_sha256(&archive, &resolved.platform.sha256)?;
-    let signature = temp.join("adapter.sig");
-    run_checked(
-        Command::new("curl")
-            .arg("-fsSL")
-            .arg(&resolved.platform.signature_url)
-            .arg("-o")
-            .arg(&signature),
-        "download indexed adapter signature",
+    let signature = staging_root.join("adapter.sig");
+    update_client.download_artifact(
+        &resolved.platform.signature_url,
+        &signature,
+        crate::update::network::MAX_UPDATE_SIGNATURE_BYTES,
     )?;
     let keyring = configured_release_keyring(home)?;
     crate::release_index::verify_detached_release_signature(
@@ -1270,16 +1347,24 @@ fn install_resolved_index_release(
         &keyring,
         &resolved.platform.signing_key_id,
     )?;
-    crate::release_index::extract_safe_tar_gz(&archive, &temp, &resolved.platform.archive_root)?;
-    let extracted = temp.join(&resolved.platform.archive_root);
+    crate::release_index::extract_safe_tar_gz(
+        &archive,
+        staging_root,
+        &resolved.platform.archive_root,
+    )?;
+    let extracted = staging_root.join(&resolved.platform.archive_root);
     if !extracted.is_dir() {
         bail!(
             "release archive did not contain expected root {}",
             extracted.display()
         );
     }
-    validate_adapter_bundle_contract(&extracted, &resolved.adapter.domain)?;
-    let mut transaction = InstallTransaction::new(temp.join("rollback"))?;
+    if resolved.release.compatibility.is_some() {
+        validate_adapter_bundle_contract(&extracted, &resolved.adapter.domain)?;
+        crate::release_index::verify_resolved_v2_sidecar(&extracted, resolved)?;
+    } else {
+        validate_legacy_adapter_bundle_contract(&extracted, &resolved.adapter.domain)?;
+    }
     transaction.snapshot(install_root)?;
     let binary_source = extracted
         .join(&resolved.platform.platform)
@@ -1301,12 +1386,94 @@ fn install_resolved_index_release(
     for target in &resource_targets {
         transaction.snapshot(target)?;
     }
-    activate_bundle_atomically(&extracted, install_root)?;
+    apply_staged_resolved_index_release(
+        resolved,
+        &extracted,
+        install_root,
+        home,
+        transaction,
+        false,
+    )
+}
+
+pub(crate) fn apply_staged_resolved_index_release(
+    resolved: &crate::release_index::ResolvedAdapterRelease<'_>,
+    extracted: &Path,
+    install_root: &Path,
+    home: &Path,
+    transaction: &mut InstallTransaction,
+    quiet: bool,
+) -> anyhow::Result<()> {
+    if resolved.release.compatibility.is_some() {
+        validate_adapter_bundle_contract(extracted, &resolved.adapter.domain)?;
+        crate::release_index::verify_resolved_v2_sidecar(extracted, resolved)?;
+    } else {
+        validate_legacy_adapter_bundle_contract(extracted, &resolved.adapter.domain)?;
+    }
+    let binary_source = extracted
+        .join(&resolved.platform.platform)
+        .join(&resolved.platform.binary);
+    let previous_receipt = read_release_update_receipt(install_root, &resolved.adapter.domain)?;
+    let resource_plan =
+        typed_harness_resource_plan(extracted, home, &resolved.platform.resource_manifest)?;
+    let resource_targets = resource_plan
+        .iter()
+        .map(|(_, target)| target.clone())
+        .collect::<Vec<_>>();
+    let previously_owned = previous_receipt
+        .as_ref()
+        .map(|receipt| {
+            receipt
+                .owned_resources
+                .iter()
+                .map(|resource| PathBuf::from(&resource.path))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    for target in &resource_targets {
+        if target.exists() && !previously_owned.iter().any(|owned| owned == target) {
+            bail!(
+                "refusing to overwrite unowned harness resource {}; remove it or choose a different harness resource path",
+                target.display()
+            );
+        }
+        transaction.snapshot(target)?;
+    }
+    if let Some(previous) = &previous_receipt {
+        for resource in &previous.owned_resources {
+            transaction.snapshot(Path::new(&resource.path))?;
+        }
+    }
+    transaction.begin_activation()?;
+    if let Some(previous_binary) = previous_receipt
+        .as_ref()
+        .and_then(|receipt| receipt.binary_path.as_deref())
+    {
+        let desired_binary = binary_source
+            .is_file()
+            .then(|| home.join(".local/bin").join(&resolved.platform.binary));
+        if desired_binary
+            .as_ref()
+            .is_none_or(|desired| desired != Path::new(previous_binary))
+        {
+            remove_path_if_exists(Path::new(previous_binary))?;
+        }
+    }
+    if let Some(previous) = &previous_receipt {
+        for resource in &previous.owned_resources {
+            let path = PathBuf::from(&resource.path);
+            if !resource_targets.iter().any(|desired| desired == &path) {
+                remove_path_if_exists(&path)?;
+            }
+        }
+    }
+    activate_bundle_atomically(extracted, install_root)?;
     let installed_binary = install_release_binary(
         install_root,
         home,
         &resolved.platform.binary,
         &resolved.platform.platform,
+        quiet,
     )?;
     if installed_binary.is_none()
         && adapter_manifest_references_binary(install_root, &resolved.platform.binary)?
@@ -1319,14 +1486,15 @@ fn install_resolved_index_release(
         );
     }
     if let Some(binary_path) = installed_binary {
-        run_adapter_binary_installer(
+        run_adapter_binary_installer_with_output(
             binary_path.as_os_str(),
             &resolved.adapter.domain,
             install_root,
+            quiet,
         )?;
     }
     patch_adapter_argv_to_installed_binary(install_root, &resolved.platform.binary, home)?;
-    install_typed_harness_resources(&resource_plan)?;
+    install_typed_harness_resources(&resource_plan, quiet)?;
     write_file(
         &home
             .join(".ldgr/installed-adapters")
@@ -1342,9 +1510,32 @@ fn install_resolved_index_release(
         binary_path.as_deref(),
         &resource_targets,
     )?;
-    transaction.commit()?;
-    let _ = fs::remove_dir_all(&temp);
     Ok(())
+}
+
+fn read_release_update_receipt(
+    install_root: &Path,
+    adapter: &str,
+) -> anyhow::Result<Option<crate::release_index::InstallationReceipt>> {
+    if !install_root.exists() {
+        return Ok(None);
+    }
+    let path = install_root.join("installation-receipt.json");
+    let value: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(&path)
+            .with_context(|| format!("installed adapter `{adapter}` has no readable receipt"))?,
+    )
+    .context("installation receipt is invalid JSON")?;
+    let parsed = parse_adapter_installation_receipt(value)?;
+    let AdapterInstallationReceipt::Release(receipt) = parsed else {
+        bail!("refusing to replace local-source adapter `{adapter}` with a signed release");
+    };
+    anyhow::ensure!(
+        receipt.domain == adapter,
+        "release receipt domain `{}` does not match requested adapter `{adapter}`",
+        receipt.domain
+    );
+    Ok(Some(receipt))
 }
 
 fn configured_release_keyring(home: &Path) -> anyhow::Result<PathBuf> {
@@ -1372,13 +1563,19 @@ fn write_installation_receipt(
         .context("system clock is before Unix epoch")?
         .as_secs();
     let receipt = crate::release_index::InstallationReceipt {
-        schema_version: 1,
+        schema_version: if resolved.release.compatibility.is_some() {
+            2
+        } else {
+            1
+        },
         domain: resolved.adapter.domain.clone(),
         version: resolved.version.to_string(),
         source_url: resolved.platform.asset_url.clone(),
         sha256: resolved.platform.sha256.clone(),
         signing_key_id: resolved.platform.signing_key_id.clone(),
         core_compatibility: resolved.release.core_compatibility.clone(),
+        compatibility: resolved.release.compatibility.clone(),
+        compatibility_sha256: resolved.release.compatibility_sha256.clone(),
         platform: resolved.platform.platform.clone(),
         resource_manifest: resolved.platform.resource_manifest.clone(),
         installed_at_unix_seconds,
@@ -1466,96 +1663,6 @@ fn collect_digest_files(
     Ok(())
 }
 
-#[derive(Debug)]
-struct InstallSnapshot {
-    target: PathBuf,
-    backup: PathBuf,
-    existed: bool,
-    was_dir: bool,
-}
-
-struct InstallTransaction {
-    backup_root: PathBuf,
-    snapshots: Vec<InstallSnapshot>,
-    committed: bool,
-}
-
-impl InstallTransaction {
-    fn new(backup_root: PathBuf) -> anyhow::Result<Self> {
-        fs::create_dir_all(&backup_root)?;
-        Ok(Self {
-            backup_root,
-            snapshots: Vec::new(),
-            committed: false,
-        })
-    }
-
-    fn snapshot(&mut self, target: &Path) -> anyhow::Result<()> {
-        if self
-            .snapshots
-            .iter()
-            .any(|snapshot| snapshot.target == target)
-        {
-            return Ok(());
-        }
-        let backup = self.backup_root.join(self.snapshots.len().to_string());
-        let existed = target.exists();
-        let was_dir = target.is_dir();
-        if existed {
-            if was_dir {
-                copy_dir_recursive(target, &backup)?;
-            } else {
-                if let Some(parent) = backup.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                fs::copy(target, &backup)?;
-            }
-        }
-        self.snapshots.push(InstallSnapshot {
-            target: target.to_path_buf(),
-            backup,
-            existed,
-            was_dir,
-        });
-        Ok(())
-    }
-
-    fn commit(mut self) -> anyhow::Result<()> {
-        self.committed = true;
-        fs::remove_dir_all(&self.backup_root).or_else(|error| {
-            (error.kind() == io::ErrorKind::NotFound)
-                .then_some(())
-                .ok_or(error)
-        })?;
-        Ok(())
-    }
-
-    fn rollback(&self) -> anyhow::Result<()> {
-        for snapshot in self.snapshots.iter().rev() {
-            remove_path_if_exists(&snapshot.target)?;
-            if snapshot.existed {
-                if snapshot.was_dir {
-                    copy_dir_recursive(&snapshot.backup, &snapshot.target)?;
-                } else {
-                    if let Some(parent) = snapshot.target.parent() {
-                        fs::create_dir_all(parent)?;
-                    }
-                    fs::copy(&snapshot.backup, &snapshot.target)?;
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
-impl Drop for InstallTransaction {
-    fn drop(&mut self) {
-        if !self.committed {
-            let _ = self.rollback();
-        }
-    }
-}
-
 fn remove_path_if_exists(path: &Path) -> anyhow::Result<()> {
     if path.is_dir() {
         fs::remove_dir_all(path)?;
@@ -1589,7 +1696,7 @@ fn activate_bundle_atomically(extracted: &Path, install_root: &Path) -> anyhow::
     })
 }
 
-fn typed_harness_resource_plan(
+pub(crate) fn typed_harness_resource_plan(
     bundle: &Path,
     home: &Path,
     manifest_path: &str,
@@ -1645,7 +1752,7 @@ fn typed_harness_resource_plan(
     Ok(plan)
 }
 
-fn install_typed_harness_resources(plan: &[(PathBuf, PathBuf)]) -> anyhow::Result<()> {
+fn install_typed_harness_resources(plan: &[(PathBuf, PathBuf)], quiet: bool) -> anyhow::Result<()> {
     for (source, target) in plan {
         if source.is_dir() {
             copy_dir_recursive(source, target)?;
@@ -1655,7 +1762,9 @@ fn install_typed_harness_resources(plan: &[(PathBuf, PathBuf)]) -> anyhow::Resul
             }
             fs::copy(source, target)?;
         }
-        println!("├─ Harness resource {}", target.display());
+        if !quiet {
+            println!("├─ Harness resource {}", target.display());
+        }
     }
     Ok(())
 }
@@ -1908,15 +2017,6 @@ static AVAILABLE_ADAPTERS: &[AvailableAdapter] = &[
         git: None,
         release: Some(commercial_release("evidence", "ldgr-evidence")),
     },
-    AvailableAdapter {
-        slug: "recall",
-        title: "Recall adapter",
-        source: "",
-        install: "ldgr adapter install recall",
-        workspace_package: Some("ldgr-recall"),
-        git: None,
-        release: Some(commercial_release("recall", "ldgr-recall")),
-    },
 ];
 
 fn available_adapter_catalog() -> &'static [AvailableAdapter] {
@@ -2066,7 +2166,45 @@ fn install_adapter_from_source_root_with_package(
     install_root: &Path,
     home: &Path,
 ) -> anyhow::Result<()> {
+    let temp = std::env::temp_dir().join(format!(
+        "ldgr-adapter-source-install-{adapter}-{}",
+        std::process::id()
+    ));
+    remove_path_if_exists(&temp)?;
+    let mut transaction = InstallTransaction::new(temp.join("rollback"))?;
+    apply_source_adapter_update(
+        adapter,
+        package,
+        source_root,
+        install_root,
+        home,
+        None,
+        &mut transaction,
+        false,
+    )?;
+    transaction.commit()?;
+    remove_path_if_exists(&temp)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_source_adapter_update(
+    adapter: &str,
+    package: &str,
+    source_root: &Path,
+    install_root: &Path,
+    home: &Path,
+    expected_source_sha256: Option<&str>,
+    transaction: &mut InstallTransaction,
+    quiet: bool,
+) -> anyhow::Result<()> {
     let source = resolve_adapter_source_package(package, source_root)?;
+    if let Some(expected) = expected_source_sha256 {
+        let actual = digest_source_bundle(&source.bundle_root)?;
+        anyhow::ensure!(
+            actual == expected,
+            "local source changed after adapter update planning; inspect and plan again"
+        );
+    }
     let namespace = package.strip_prefix("ldgr-").unwrap_or(package);
     let namespace = namespace.strip_suffix("-adapter").unwrap_or(namespace);
     anyhow::ensure!(
@@ -2080,12 +2218,6 @@ fn install_adapter_from_source_root_with_package(
     );
     validate_adapter_bundle_contract(&source.bundle_root, namespace)?;
     let previous_receipt = prepare_source_reinstall(adapter, install_root, home)?;
-    let temp = std::env::temp_dir().join(format!(
-        "ldgr-adapter-source-install-{adapter}-{}",
-        std::process::id()
-    ));
-    remove_path_if_exists(&temp)?;
-    let mut transaction = InstallTransaction::new(temp.join("rollback"))?;
     transaction.snapshot(install_root)?;
     let marker = home.join(".ldgr/installed-adapters").join(adapter);
     transaction.snapshot(&marker)?;
@@ -2118,9 +2250,15 @@ fn install_adapter_from_source_root_with_package(
         }
         transaction.snapshot(&resource.target)?;
     }
-    println!("├─ Source checkout {}", source_root.display());
-    println!("├─ Adapter manifest {}", source.cargo_manifest.display());
-    let status = source_adapter_install_command(package, &source, install_root).status()?;
+    if !quiet {
+        println!("├─ Source checkout {}", source_root.display());
+        println!("├─ Adapter manifest {}", source.cargo_manifest.display());
+    }
+    let mut command = source_adapter_install_command(package, &source, install_root);
+    if quiet {
+        command.stdout(std::process::Stdio::null());
+    }
+    let status = command.status()?;
     if !status.success() {
         bail!("adapter installer failed for package `{package}` with status {status}");
     }
@@ -2136,6 +2274,7 @@ fn install_adapter_from_source_root_with_package(
         );
         transaction.snapshot(&resource.target)?;
     }
+    transaction.begin_activation()?;
     if let Some(previous) = &previous_receipt {
         for resource in &previous.owned_resources {
             let path = PathBuf::from(&resource.path);
@@ -2144,7 +2283,7 @@ fn install_adapter_from_source_root_with_package(
             }
         }
     }
-    install_source_harness_resources(&resource_plan)?;
+    install_source_harness_resources(&resource_plan, quiet)?;
     let normalized_install_root = absolute_path(install_root)?;
     write_file(
         &marker,
@@ -2161,19 +2300,17 @@ fn install_adapter_from_source_root_with_package(
         &marker,
         &resource_plan,
     )?;
-    transaction.commit()?;
-    remove_path_if_exists(&temp)?;
     Ok(())
 }
 
 #[derive(Debug)]
-struct SourceHarnessResource {
-    source: PathBuf,
-    target: PathBuf,
-    root: PathBuf,
+pub(crate) struct SourceHarnessResource {
+    pub(crate) source: PathBuf,
+    pub(crate) target: PathBuf,
+    pub(crate) root: PathBuf,
 }
 
-fn source_harness_resource_plan(
+pub(crate) fn source_harness_resource_plan(
     install_root: &Path,
     home: &Path,
 ) -> anyhow::Result<Vec<SourceHarnessResource>> {
@@ -2228,7 +2365,10 @@ fn append_source_resource_children(
     Ok(())
 }
 
-fn install_source_harness_resources(plan: &[SourceHarnessResource]) -> anyhow::Result<()> {
+fn install_source_harness_resources(
+    plan: &[SourceHarnessResource],
+    quiet: bool,
+) -> anyhow::Result<()> {
     for resource in plan {
         if resource.source.is_dir() {
             copy_dir_recursive(&resource.source, &resource.target)?;
@@ -2238,15 +2378,17 @@ fn install_source_harness_resources(plan: &[SourceHarnessResource]) -> anyhow::R
             }
             fs::copy(&resource.source, &resource.target)?;
         }
-        println!(
-            "\u{251c}\u{2500} Harness resource {}",
-            resource.target.display()
-        );
+        if !quiet {
+            println!(
+                "\u{251c}\u{2500} Harness resource {}",
+                resource.target.display()
+            );
+        }
     }
     Ok(())
 }
 
-fn source_allowed_resource_roots(home: &Path) -> anyhow::Result<Vec<PathBuf>> {
+pub(crate) fn source_allowed_resource_roots(home: &Path) -> anyhow::Result<Vec<PathBuf>> {
     let config = read_ldgr_harness_config(home);
     let mut roots = configured_prompt_dirs(home, &config);
     roots.extend(configured_skill_dirs(home, &config));
@@ -2511,7 +2653,30 @@ fn verify_source_identity_paths(
     Ok(())
 }
 
-fn validate_adapter_bundle_contract(bundle: &Path, adapter: &str) -> anyhow::Result<()> {
+pub(crate) fn validate_adapter_bundle_contract(bundle: &Path, adapter: &str) -> anyhow::Result<()> {
+    let v2_path = bundle.join("adapter-compatibility.json");
+    if v2_path.exists() {
+        let sidecar = crate::adapter_compatibility::parse_adapter_compatibility_v2(
+            &fs::read_to_string(&v2_path)
+                .with_context(|| format!("failed to read {}", v2_path.display()))?,
+        )
+        .map_err(anyhow::Error::new)
+        .with_context(|| format!("adapter {adapter} has invalid v2 compatibility metadata"))?;
+        anyhow::ensure!(
+            sidecar.adapter == adapter,
+            "adapter bundle identity {} does not match requested adapter {adapter}",
+            sidecar.adapter
+        );
+        return Ok(());
+    }
+
+    validate_legacy_adapter_bundle_contract(bundle, adapter)
+}
+
+pub(crate) fn validate_legacy_adapter_bundle_contract(
+    bundle: &Path,
+    adapter: &str,
+) -> anyhow::Result<()> {
     let manifest_path = bundle.join("adapter.toml");
     if manifest_path.is_file() {
         let manifest: toml::Value = toml::from_str(&fs::read_to_string(&manifest_path)?)
@@ -2570,14 +2735,27 @@ fn run_adapter_binary_installer(
     adapter: &str,
     install_root: &Path,
 ) -> anyhow::Result<()> {
+    run_adapter_binary_installer_with_output(binary, adapter, install_root, false)
+}
+
+fn run_adapter_binary_installer_with_output(
+    binary: impl AsRef<std::ffi::OsStr>,
+    adapter: &str,
+    install_root: &Path,
+    quiet: bool,
+) -> anyhow::Result<()> {
     let binary_ref = binary.as_ref();
-    let status = Command::new(binary_ref)
+    let mut command = Command::new(binary_ref);
+    command
         .arg("adapter")
         .arg("install")
         .arg("--install-root")
         .arg(install_root)
-        .arg("--print-path")
-        .status()?;
+        .arg("--print-path");
+    if quiet {
+        command.stdout(std::process::Stdio::null());
+    }
+    let status = command.status()?;
     if !status.success() {
         bail!(
             "adapter installer `{}` failed for `{adapter}` with status {status}",
@@ -2670,7 +2848,8 @@ fn install_adapter_from_release(
     }
     let _ = fs::remove_dir_all(install_root);
     copy_dir_recursive(&extracted, install_root)?;
-    let installed_binary = install_release_binary(install_root, home, release.binary, &platform)?;
+    let installed_binary =
+        install_release_binary(install_root, home, release.binary, &platform, false)?;
     if let Some(binary_path) = installed_binary {
         println!("├─ Running adapter installer from release binary");
         run_adapter_binary_installer(binary_path.as_os_str(), entry.slug, install_root)?;
@@ -2685,6 +2864,7 @@ fn install_release_binary(
     home: &Path,
     binary: &str,
     platform: &str,
+    quiet: bool,
 ) -> anyhow::Result<Option<PathBuf>> {
     let source = install_root.join(platform).join(binary);
     if !source.is_file() {
@@ -2701,11 +2881,16 @@ fn install_release_binary(
         perms.set_mode(0o755);
         fs::set_permissions(&dest, perms)?;
     }
-    println!("├─ Installed binary {}", dest.display());
+    if !quiet {
+        println!("├─ Installed binary {}", dest.display());
+    }
     Ok(Some(dest))
 }
 
-fn adapter_manifest_references_binary(install_root: &Path, binary: &str) -> anyhow::Result<bool> {
+pub(crate) fn adapter_manifest_references_binary(
+    install_root: &Path,
+    binary: &str,
+) -> anyhow::Result<bool> {
     let manifest_path = install_root.join("adapter.toml");
     if !manifest_path.is_file() {
         return Ok(false);
@@ -3061,57 +3246,27 @@ fn resolve_install_telemetry_consent_with_io(
             TelemetryInstallChoice::Enable => TelemetryConsentDecision::Enabled,
             TelemetryInstallChoice::Disable => TelemetryConsentDecision::Disabled,
         };
-        let consent = TelemetryConsent::current(decision);
+        let mut consent = existing;
+        consent.decision = decision;
         save_telemetry_consent(ldgr_home, &consent)?;
         return Ok(consent);
     }
-    if existing.decision != TelemetryConsentDecision::Undecided {
-        return Ok(existing);
-    }
-    if args.yes || !stdin_is_interactive {
-        bail!(
-            "telemetry choice required for the first non-interactive install; pass `--telemetry enable` or `--telemetry disable` (`--yes` is not telemetry consent)"
-        );
-    }
-
-    let decision = prompt_telemetry_consent(input, output)?;
-    let consent = TelemetryConsent::current(decision);
-    save_telemetry_consent(ldgr_home, &consent)?;
-    Ok(consent)
-}
-
-fn prompt_telemetry_consent(
-    input: &mut impl BufRead,
-    output: &mut impl Write,
-) -> anyhow::Result<TelemetryConsentDecision> {
-    print_telemetry_scope(output)?;
-    loop {
-        write!(output, "Share these sequences? Type Yes or No: ")?;
-        output.flush()?;
-        let mut answer = String::new();
-        if input.read_line(&mut answer)? == 0 {
-            bail!("telemetry choice required; enter Yes or No");
-        }
-        match answer.trim().to_ascii_lowercase().as_str() {
-            "yes" | "y" => return Ok(TelemetryConsentDecision::Enabled),
-            "no" | "n" => return Ok(TelemetryConsentDecision::Disabled),
-            _ => writeln!(output, "Please enter Yes or No. No option is preselected.")?,
-        }
-    }
+    let _ = (stdin_is_interactive, input, output);
+    Ok(existing)
 }
 
 fn print_telemetry_scope(output: &mut impl Write) -> anyhow::Result<()> {
     writeln!(
         output,
-        "LDGR can share numerical state-transition sequences for research."
+        "LDGR shares privacy-minimized anonymous construction telemetry by default."
     )?;
     writeln!(
         output,
-        "The sequence records state order and whether execution completed with a positive, negative, inconclusive, failed, or cancelled result."
+        "Finite command, execution, validation, artifact, and outcome classes are consolidated locally; rare constructions are suppressed before release."
     )?;
     writeln!(
         output,
-        "It does not include project data, names, labels, identifiers, timestamps, environment information, or linkable installation data."
+        "It does not include prompts, content, paths, commands, arguments, output, names, arbitrary labels, identifiers, exact timestamps, or linkable installation data. Disable with `ldgr telemetry disable`. Experience donation is separate and off by default."
     )?;
     Ok(())
 }
@@ -3512,12 +3667,6 @@ fn harness_skill_root(harness: HarnessKind, home: &Path) -> PathBuf {
     }
 }
 
-/// The cross-tool convention root. Several harnesses scan it, including some
-/// with no global root of their own, so it is always written.
-fn shared_skill_root(home: &Path) -> PathBuf {
-    home.join(".agents/skills")
-}
-
 /// Installing ldgr into a harness means one thing: writing the single skill.
 /// There are no extensions, slash commands, or per-harness guides — the skill
 /// routes the agent to the CLI, and the CLI describes itself.
@@ -3530,21 +3679,6 @@ fn install_harness_skill(harness: HarnessKind, home: &Path) -> anyhow::Result<se
         "harness": harness_name(harness),
         "skill_paths": [root],
         "skill_file": skill,
-    }))
-}
-
-/// Written on every install so harnesses that read the shared convention pick
-/// ldgr up without being named explicitly.
-fn install_shared_skill(home: &Path) -> anyhow::Result<serde_json::Value> {
-    let root = shared_skill_root(home);
-    let skill = root.join("ldgr/SKILL.md");
-    write_file(&skill, LDGR_SKILL)?;
-    println!("├─ Shared agent skill {}", skill.display());
-    Ok(serde_json::json!({
-        "harness": "agents",
-        "skill_paths": [root],
-        "skill_file": skill,
-        "note": "Cross-tool convention root scanned by several harnesses.",
     }))
 }
 
@@ -3626,7 +3760,7 @@ pub fn handle_config(args: ConfigArgs) -> anyhow::Result<()> {
     let legacy_config_path = home.join(".ldgr/config.json");
     match args.command {
         ConfigCommand::Show(show) => {
-            let depth = configured_interview_depth();
+            let config = read_ldgr_harness_config(&home).unwrap_or_default();
             if show.json {
                 println!(
                     "{}",
@@ -3634,7 +3768,14 @@ pub fn handle_config(args: ConfigArgs) -> anyhow::Result<()> {
                         "config_path": config_path,
                         "legacy_config_path": legacy_config_path,
                         "exists": config_path.is_file(),
-                        "interview_depth": depth.as_str(),
+                        "interview_depth": config.interview_depth.as_str(),
+                        "updates": {
+                            "check": config.updates.check.as_str(),
+                            "interval_hours": config.updates.interval_hours,
+                            "channel": config.updates.channel.as_str(),
+                            "include_adapters": config.updates.include_adapters,
+                            "notify": config.updates.notify,
+                        },
                     }))?
                 );
             } else {
@@ -3642,38 +3783,100 @@ pub fn handle_config(args: ConfigArgs) -> anyhow::Result<()> {
                 if !config_path.is_file() {
                     println!("status: not written yet; run `ldgr install`");
                 }
-                println!("interview_depth: {} — {}", depth.as_str(), depth.describe());
+                println!(
+                    "interview_depth: {} — {}",
+                    config.interview_depth.as_str(),
+                    config.interview_depth.describe()
+                );
+                println!("updates.check: {}", config.updates.check.as_str());
+                println!("updates.interval-hours: {}", config.updates.interval_hours);
+                println!("updates.channel: {}", config.updates.channel.as_str());
+                println!(
+                    "updates.include-adapters: {}",
+                    config.updates.include_adapters
+                );
+                println!("updates.notify: {}", config.updates.notify);
             }
             Ok(())
         }
         ConfigCommand::Set(set) => {
             let key = set.key.trim().to_ascii_lowercase().replace('_', "-");
-            if key != "interview-depth" {
-                anyhow::bail!("unknown config key `{}`; expected interview-depth", set.key);
-            }
-            let depth = InterviewDepth::parse(&set.value).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "unknown interview-depth `{}`; expected high, medium, low, or none",
-                    set.value
-                )
-            })?;
             // Preserve every known field and unknown extension while writing
             // canonical TOML plus the legacy JSON compatibility mirror.
-            let mut config = read_ldgr_harness_config(&home).unwrap_or_else(|| HarnessConfig {
-                schema_version: crate::harness_config::HARNESS_CONFIG_SCHEMA_VERSION,
-                default_harness: None,
-                interview_depth: InterviewDepth::default(),
-                selected_harnesses: Vec::new(),
-                installed: Vec::new(),
-                extensions: std::collections::BTreeMap::new(),
-            });
-            config.interview_depth = depth;
+            let mut config = read_ldgr_harness_config(&home).unwrap_or_default();
+            let rendered = set_harness_config_value(&mut config, &key, &set.value)?;
             let (config_path, legacy_config_path) = write_harness_config_files(&home, &config)?;
-            println!("interview_depth: {} — {}", depth.as_str(), depth.describe());
+            println!("{key}: {rendered}");
             println!("wrote {}", config_path.display());
             println!("wrote {}", legacy_config_path.display());
             Ok(())
         }
+    }
+}
+
+fn set_harness_config_value(
+    config: &mut HarnessConfig,
+    key: &str,
+    value: &str,
+) -> anyhow::Result<String> {
+    match key {
+        "interview-depth" => {
+            let depth = InterviewDepth::parse(value).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "unknown interview-depth `{value}`; expected high, medium, low, or none"
+                )
+            })?;
+            config.interview_depth = depth;
+            Ok(format!("{} — {}", depth.as_str(), depth.describe()))
+        }
+        "updates.check" => {
+            let check = UpdateCheck::parse(value).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "unknown updates.check `{value}`; expected startup or never"
+                )
+            })?;
+            config.updates.check = check;
+            Ok(check.as_str().to_owned())
+        }
+        "updates.interval-hours" => {
+            let interval = value.trim().parse::<u64>().map_err(|_| {
+                anyhow::anyhow!(
+                    "invalid updates.interval-hours `{value}`; expected a non-negative integer"
+                )
+            })?;
+            config.updates.interval_hours = interval;
+            Ok(interval.to_string())
+        }
+        "updates.channel" => {
+            let channel = UpdateChannel::parse(value).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "unknown updates.channel `{value}`; expected stable or prerelease"
+                )
+            })?;
+            config.updates.channel = channel;
+            Ok(channel.as_str().to_owned())
+        }
+        "updates.include-adapters" => {
+            let include_adapters = parse_config_bool(key, value)?;
+            config.updates.include_adapters = include_adapters;
+            Ok(include_adapters.to_string())
+        }
+        "updates.notify" => {
+            let notify = parse_config_bool(key, value)?;
+            config.updates.notify = notify;
+            Ok(notify.to_string())
+        }
+        _ => anyhow::bail!(
+            "unknown config key `{key}`; expected interview-depth, updates.check, updates.interval-hours, updates.channel, updates.include-adapters, or updates.notify"
+        ),
+    }
+}
+
+fn parse_config_bool(key: &str, value: &str) -> anyhow::Result<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => anyhow::bail!("invalid {key} `{value}`; expected true or false"),
     }
 }
 
@@ -3793,21 +3996,10 @@ pub fn handle_migrate(db: &Path, args: MigrateArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn print_migration_notice(migration: Option<&MigrationBackupInfo>) {
-    let Some(migration) = migration else {
-        return;
-    };
-    eprintln!(
-        "migration: LDGR Core upgraded schema v{} -> v{}; verified backup: {}",
-        migration.from_schema_version,
-        migration.to_schema_version,
-        migration.backup.display()
-    );
-}
-
 pub fn handle_status(
     connection: &rusqlite::Connection,
     _artifact_root: &Path,
+    alignment: &super::super::database_alignment::DatabaseAlignment,
     args: StatusArgs,
 ) -> anyhow::Result<()> {
     let context = read_context(connection)?;
@@ -3819,6 +4011,7 @@ pub fn handle_status(
         args.recent,
         args.width,
         args.full,
+        alignment.clone(),
     )?;
     emit(args.json, &status, print_status_summary)?;
     Ok(())
@@ -3827,19 +4020,30 @@ pub fn handle_status(
 pub fn handle_context(
     connection: &rusqlite::Connection,
     _artifact_root: &Path,
+    alignment: &super::super::database_alignment::DatabaseAlignment,
     args: ContextArgs,
 ) -> anyhow::Result<()> {
     let context = read_context(connection)?;
     if args.brief {
         let brief = brief_context(&context, brief_options(args.recent, args.width));
-        return emit(args.json, &brief, print_brief_context);
+        if args.json {
+            let mut value = serde_json::to_value(&brief)?;
+            value["database_alignment"] = serde_json::to_value(alignment)?;
+            println!("{}", serde_json::to_string_pretty(&value)?);
+        } else {
+            super::super::database_alignment::print_database_alignment(alignment);
+            print_brief_context(&brief);
+        }
+        return Ok(());
     }
     if args.json {
         let mut value = serde_json::to_value(&context)?;
+        value["database_alignment"] = serde_json::to_value(alignment)?;
         value["installed_adapter_namespaces"] =
             serde_json::to_value(AdapterRegistry::discover().installed_domains())?;
         println!("{}", serde_json::to_string_pretty(&value)?);
     } else {
+        super::super::database_alignment::print_database_alignment(alignment);
         print_context(&context);
         print_installed_adapter_summary();
     }
@@ -4287,44 +4491,7 @@ mod tests {
     }
 
     #[test]
-    fn telemetry_prompt_requires_an_explicit_yes_or_no() -> anyhow::Result<()> {
-        let mut input = std::io::Cursor::new(b"\nmaybe\nNo\n");
-        let mut output = Vec::new();
-        assert_eq!(
-            prompt_telemetry_consent(&mut input, &mut output)?,
-            TelemetryConsentDecision::Disabled
-        );
-        let output = String::from_utf8(output)?;
-        assert!(output.contains("positive, negative, inconclusive, failed, or cancelled"));
-        assert!(output.contains("Please enter Yes or No. No option is preselected."));
-        assert_eq!(output.matches("Share these sequences?").count(), 3);
-        Ok(())
-    }
-
-    #[test]
-    fn telemetry_prompt_can_enable_collection_explicitly() -> anyhow::Result<()> {
-        let mut input = std::io::Cursor::new(b"Yes\n");
-        let mut output = Vec::new();
-        assert_eq!(
-            prompt_telemetry_consent(&mut input, &mut output)?,
-            TelemetryConsentDecision::Enabled
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn telemetry_prompt_can_disable_collection_explicitly() -> anyhow::Result<()> {
-        let mut input = std::io::Cursor::new(b"No\n");
-        let mut output = Vec::new();
-        assert_eq!(
-            prompt_telemetry_consent(&mut input, &mut output)?,
-            TelemetryConsentDecision::Disabled
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn first_interactive_install_records_yes_and_skips_later_prompt() -> anyhow::Result<()> {
+    fn first_interactive_install_uses_anonymous_default_without_prompt() -> anyhow::Result<()> {
         let ldgr_home = tempfile::tempdir()?;
         let args = install_args_for_telemetry(false, None);
         let mut input = std::io::Cursor::new(b"Yes\n");
@@ -4339,12 +4506,9 @@ mod tests {
         )?;
 
         assert_eq!(consent.decision, TelemetryConsentDecision::Enabled);
-        assert_eq!(
-            load_telemetry_consent(ldgr_home.path())?.decision,
-            TelemetryConsentDecision::Enabled
-        );
         let output = String::from_utf8(output)?;
-        assert!(output.contains("Share these sequences? Type Yes or No: "));
+        assert!(output.is_empty());
+        assert!(!ldgr_home.path().join("telemetry-consent.json").exists());
 
         let mut later_input = std::io::Cursor::new(b"");
         let mut later_output = Vec::new();
@@ -4362,9 +4526,9 @@ mod tests {
     }
 
     #[test]
-    fn first_interactive_install_records_no_after_blank_reprompt() -> anyhow::Result<()> {
+    fn explicit_install_disable_overrides_anonymous_default() -> anyhow::Result<()> {
         let ldgr_home = tempfile::tempdir()?;
-        let args = install_args_for_telemetry(false, None);
+        let args = install_args_for_telemetry(false, Some(TelemetryInstallChoice::Disable));
         let mut input = std::io::Cursor::new(b"\nNo\n");
         let mut output = Vec::new();
 
@@ -4381,32 +4545,25 @@ mod tests {
             load_telemetry_consent(ldgr_home.path())?.decision,
             TelemetryConsentDecision::Disabled
         );
-        let output = String::from_utf8(output)?;
-        assert!(output.contains("Please enter Yes or No. No option is preselected."));
-        assert_eq!(output.matches("Share these sequences?").count(), 2);
+        assert!(String::from_utf8(output)?.is_empty());
         Ok(())
     }
 
     #[test]
-    fn non_interactive_install_requires_telemetry_flag_and_yes_is_not_consent() -> anyhow::Result<()>
-    {
+    fn non_interactive_install_uses_default_and_accepts_explicit_overrides() -> anyhow::Result<()> {
         let ldgr_home = tempfile::tempdir()?;
         let mut input = std::io::Cursor::new(b"Yes\n");
         let mut output = Vec::new();
         let yes_without_telemetry = install_args_for_telemetry(true, None);
 
-        let error = resolve_install_telemetry_consent_with_io(
+        let default = resolve_install_telemetry_consent_with_io(
             &yes_without_telemetry,
             ldgr_home.path(),
             false,
             &mut input,
             &mut output,
-        )
-        .expect_err("--yes must not provide telemetry consent");
-
-        let message = format!("{error:#}");
-        assert!(message.contains("telemetry choice required"));
-        assert!(message.contains("--yes` is not telemetry consent"));
+        )?;
+        assert_eq!(default.decision, TelemetryConsentDecision::Enabled);
         assert!(!ldgr_home.path().join("telemetry-consent.json").exists());
 
         let explicit_disable =
@@ -4517,6 +4674,8 @@ mod tests {
             ("security", "ldgr-security"),
             ("explore", "ldgr-explore"),
             ("bench", "ldgr-bench"),
+            ("conduct", "ldgr-conduct"),
+            ("evidence", "ldgr-evidence"),
         ] {
             let adapter = available_adapter_catalog()
                 .iter()
@@ -4727,7 +4886,7 @@ argv = ["ldgr-example-adapter", "manifest-summary"]
             &source.cargo_manifest,
         )?;
         let plan = source_harness_resource_plan(install_root.path(), home.path())?;
-        install_source_harness_resources(&plan)?;
+        install_source_harness_resources(&plan, false)?;
         let marker = home.path().join(".ldgr/installed-adapters/example");
         write_file(
             &marker,
@@ -4885,6 +5044,41 @@ argv = ["ldgr-example-adapter", "manifest-summary"]
             "fn main() { println!(); }\n",
         )?;
         assert_ne!(digest_source_bundle(source.path())?, original);
+        Ok(())
+    }
+
+    #[test]
+    fn source_update_rejects_content_changed_after_planning_before_mutation() -> anyhow::Result<()>
+    {
+        let source = tempfile::tempdir()?;
+        let home = tempfile::tempdir()?;
+        let install_root = home.path().join("installed-fixture");
+        std::fs::write(
+            source.path().join("Cargo.toml"),
+            "[package]\nname='ldgr-fixture-adapter'\nversion='0.0.0'\n",
+        )?;
+        std::fs::write(
+            source.path().join("adapter.toml"),
+            "[adapter]\nslug='fixture'\n",
+        )?;
+        let mut transaction = InstallTransaction::new(home.path().join("rollback"))?;
+
+        let error = apply_source_adapter_update(
+            "fixture",
+            "ldgr-fixture-adapter",
+            source.path(),
+            &install_root,
+            home.path(),
+            Some("stale-planned-digest"),
+            &mut transaction,
+            false,
+        )
+        .expect_err("source changed after planning must fail closed");
+
+        assert!(error
+            .to_string()
+            .contains("local source changed after adapter update planning"));
+        assert!(!install_root.exists());
         Ok(())
     }
 

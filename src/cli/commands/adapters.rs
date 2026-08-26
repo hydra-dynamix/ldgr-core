@@ -6,8 +6,8 @@ use super::super::args::{
     AdapterArgs, AdapterCommand, InstallAdapterArgs as CoreInstallAdapterArgs,
 };
 
-pub fn handle_adapter(args: AdapterArgs) -> anyhow::Result<()> {
-    let registry = AdapterRegistry::discover();
+pub fn handle_adapter(args: AdapterArgs, db_path: &std::path::Path) -> anyhow::Result<()> {
+    let registry = AdapterRegistry::discover_for_database(db_path);
     print_warnings(&registry);
     match args.command {
         AdapterCommand::Install(args) => match args.name {
@@ -46,13 +46,19 @@ pub fn handle_adapter(args: AdapterArgs) -> anyhow::Result<()> {
                         format!(" aliases={}", adapter.aliases.join(","))
                     };
                     println!(
-                        "adapter={} title={} core_version={}{} manifest={}",
+                        "adapter={} state={} title={} format={} core_version={}{} manifest={}",
                         adapter.slug,
+                        adapter.state,
                         adapter.title,
+                        adapter.format.as_deref().unwrap_or("unknown"),
                         adapter.core_version,
                         aliases,
                         adapter.manifest_path.display()
                     );
+                    print_compatibility_summary(adapter);
+                    if !adapter.state.permits_dispatch() {
+                        continue;
+                    }
                     for namespace in &adapter.command_namespaces {
                         println!(
                             "  namespace={} argv=\"{}\"{}",
@@ -90,6 +96,9 @@ pub fn handle_adapter(args: AdapterArgs) -> anyhow::Result<()> {
             } else {
                 println!("adapter: {}", adapter.slug);
                 println!("title: {}", adapter.title);
+                println!("state: {}", adapter.state);
+                println!("format: {}", adapter.format.as_deref().unwrap_or("unknown"));
+                print_compatibility_summary(adapter);
                 println!("core_version: {}", adapter.core_version);
                 if !adapter.aliases.is_empty() {
                     println!("aliases: {}", adapter.aliases.join(","));
@@ -125,6 +134,14 @@ pub fn handle_adapter(args: AdapterArgs) -> anyhow::Result<()> {
         AdapterCommand::Dispatch(args) => {
             let commands = registry.resolve_command(&args.command);
             if commands.is_empty() {
+                if let Some(adapter) = registry.adapters.iter().find(|adapter| {
+                    adapter
+                        .commands
+                        .iter()
+                        .any(|command| command.name == args.command)
+                }) {
+                    bail!("{}", blocked_dispatch_message(adapter));
+                }
                 bail!("adapter command `{}` was not discovered", args.command);
             }
             if args.json {
@@ -160,10 +177,43 @@ pub fn print_adapter_command_hint(command_name: &str) {
 fn print_warnings(registry: &AdapterRegistry) {
     for warning in &registry.warnings {
         eprintln!(
-            "warning: skipped adapter manifest {}: {}",
+            "warning: adapter manifest {}: {}",
             warning.manifest_path.display(),
             warning.message
         );
+    }
+}
+
+fn print_compatibility_summary(adapter: &crate::adapter_registry::DiscoveredAdapter) {
+    if let Some(reason) = adapter.reasons.first() {
+        println!(
+            "  reason={} subject={} required={} actual={} message={}",
+            reason.code, reason.subject, reason.required, reason.actual, reason.message
+        );
+    }
+    if adapter.repair.available {
+        println!("  repair={}", adapter.repair.command);
+    }
+}
+
+pub(crate) fn blocked_dispatch_message(
+    adapter: &crate::adapter_registry::DiscoveredAdapter,
+) -> String {
+    let reason = adapter
+        .reasons
+        .first()
+        .map(|reason| format!("{}: {}", reason.code, reason.message))
+        .unwrap_or_else(|| "compatibility could not be proved".to_owned());
+    if adapter.repair.available {
+        format!(
+            "adapter `{}` is {} and cannot dispatch: {reason}; repair with `{}`",
+            adapter.slug, adapter.state, adapter.repair.command
+        )
+    } else {
+        format!(
+            "adapter `{}` is {} and cannot dispatch: {reason}",
+            adapter.slug, adapter.state
+        )
     }
 }
 

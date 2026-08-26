@@ -31,6 +31,14 @@ become first-class errors only when they concern an already accepted operation,
 are explicitly recorded by an operator, or expose a failure in the execution
 boundary itself.
 
+The same boundary excludes routine working noise: shell quoting and path
+mistakes, read-only discovery probes, expected negative-test failures, and
+validation failures corrected safely within the active run. These may remain in
+ephemeral tool output or in a validation record; they MUST NOT require a
+first-class occurrence or disposition unless they reveal ambiguous durable
+effects, a safety/integrity risk, or a blocker that survives a reasonable
+correction attempt.
+
 ## Domain model
 
 ### Error aggregate
@@ -162,6 +170,13 @@ uses `--fingerprint-split` plus `--fingerprint-split-rationale`; Core stores the
 derived identity under `structured-v1+split-v1`, leaving the base aggregate
 unchanged. Reusing a digest with different recorded structured inputs fails
 closed and directs the caller to the split control.
+
+For agent and operator use, the preferred surface is `ldgr error <command>
+<type> <msg>`. It accepts a stable command label and one of `task`, `validation`,
+`infrastructure`, `interruption`, or `cancellation`; Core generates the UUIDv7
+identities, structured fingerprint, timestamp, default policy, and active
+run/work relations. The detailed `error record` surface remains available to
+integrations that own explicit occurrence metadata.
 
 ### Causal relations
 

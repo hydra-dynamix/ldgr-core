@@ -16,9 +16,8 @@ use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 #[test]
-fn init_status_and_context_migrate_every_supported_legacy_schema_to_the_error_schema(
-) -> anyhow::Result<()> {
-    for legacy_version in 1..=4 {
+fn init_status_and_context_align_every_supported_legacy_database() -> anyhow::Result<()> {
+    for legacy_version in 1..=5 {
         for entrypoint in [["status"], ["context"], ["init"]] {
             let project = TempDir::new()?;
             let db_path = project.path().join(".ldgr/ldgr.db");
@@ -52,6 +51,15 @@ fn init_status_and_context_migrate_every_supported_legacy_schema_to_the_error_sc
                 |row| row.get(0),
             )?;
             assert_eq!(version, 5);
+            let active_contract: String = connection.query_row(
+                "SELECT contract_hash FROM schema_component WHERE namespace = 'core'",
+                [],
+                |row| row.get(0),
+            )?;
+            assert_eq!(
+                active_contract,
+                ldgr_core::database_contract::DATABASE_CONTRACT_HASH
+            );
             let migrated_id: i64 = connection.query_row(
                 "SELECT id FROM work_item WHERE slug=?1",
                 [format!("preserved-v{legacy_version}")],
@@ -86,6 +94,84 @@ fn init_status_and_context_migrate_every_supported_legacy_schema_to_the_error_sc
                     .is_ok_and(|entry| entry.file_name().to_string_lossy().contains(&backup_marker))
             }));
         }
+    }
+    Ok(())
+}
+
+#[test]
+fn status_and_context_json_report_same_version_contract_alignment() -> anyhow::Result<()> {
+    for entrypoint in ["status", "context"] {
+        let project = TempDir::new()?;
+        let db_path = project.path().join(".ldgr/ldgr.db");
+        let artifact_root = project.path().join(".ldgr/artifacts");
+        run(project.path(), &db_path, &artifact_root, ["init"])?;
+        let connection = Connection::open(&db_path)?;
+        downgrade_cli_fixture(&connection, 5)?;
+        drop(connection);
+
+        let output = command(
+            project.path(),
+            &db_path,
+            &artifact_root,
+            [entrypoint, "--json"],
+        )?
+        .output()?;
+        assert!(
+            output.status.success(),
+            "{entrypoint} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+        let alignment = &value["database_alignment"];
+        assert_eq!(alignment["state"], "migrated");
+        assert_eq!(alignment["compatible"], true);
+        assert_eq!(alignment["active_schema_version"], 5);
+        assert_eq!(alignment["target_schema_version"], 5);
+        assert_eq!(alignment["issues"], serde_json::json!([]));
+        assert_eq!(alignment["migration"]["from_schema_version"], 5);
+        assert_eq!(alignment["migration"]["to_schema_version"], 5);
+        assert!(alignment["migration"]["verified_backup"]
+            .as_str()
+            .is_some_and(|path| path.contains("backup-schema-v5-to-v5")));
+    }
+    Ok(())
+}
+
+#[test]
+fn init_status_and_context_diagnose_unrecognized_database_without_mutation() -> anyhow::Result<()> {
+    for entrypoint in ["init", "status", "context"] {
+        let project = TempDir::new()?;
+        let db_path = project.path().join(".ldgr/ldgr.db");
+        let artifact_root = project.path().join(".ldgr/artifacts");
+        run(project.path(), &db_path, &artifact_root, ["init"])?;
+        let connection = Connection::open(&db_path)?;
+        connection.execute(
+            "UPDATE schema_component
+             SET contract_hash = 'sha256:unrecognized-contract'
+             WHERE namespace = 'core'",
+            [],
+        )?;
+        drop(connection);
+
+        command(project.path(), &db_path, &artifact_root, [entrypoint])?
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("database alignment failed"))
+            .stderr(predicate::str::contains(
+                "schema doctor: readable=true compatible=false active=5 target=5",
+            ))
+            .stderr(predicate::str::contains(
+                "schema component core contract hash does not match",
+            ))
+            .stderr(predicate::str::contains("schema doctor --json"));
+
+        let connection = Connection::open(&db_path)?;
+        let retained_hash: String = connection.query_row(
+            "SELECT contract_hash FROM schema_component WHERE namespace = 'core'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(retained_hash, "sha256:unrecognized-contract");
     }
     Ok(())
 }
@@ -324,18 +410,18 @@ fn adapter_install_list_reads_explicit_release_index_without_recompile() -> anyh
 }
 
 #[test]
-fn first_install_requires_explicit_telemetry_choice_and_remembers_no() -> anyhow::Result<()> {
+fn first_install_uses_anonymous_default_and_remembers_explicit_opt_out() -> anyhow::Result<()> {
     let project = TempDir::new()?;
     let home = project.path().join(".ldgr/test-empty-home");
     let consent_path = home.join(".ldgr/telemetry-consent.json");
 
-    let mut missing = isolated_command(project.path())?;
-    missing.args(["install", "--harness", "codex", "--yes", "--no-agentctl"]);
-    missing
+    let mut default = isolated_command(project.path())?;
+    default.args(["install", "--harness", "codex", "--yes", "--no-agentctl"]);
+    default
         .assert()
-        .failure()
-        .stderr(predicate::str::contains("telemetry choice required"))
-        .stderr(predicate::str::contains("--yes` is not telemetry consent"));
+        .success()
+        .stdout(predicate::str::contains("sequence collection: enabled"))
+        .stdout(predicate::str::contains("Share these sequences?").not());
     assert!(!consent_path.exists());
 
     let mut decline = isolated_command(project.path())?;
@@ -396,6 +482,25 @@ fn install_writes_canonical_toml_and_keeps_legacy_json_in_sync() -> anyhow::Resu
     assert_eq!(canonical["selected_harnesses"][1].as_str(), Some("claude"));
     assert_eq!(legacy["default_harness"], "codex");
     assert_eq!(legacy["selected_harnesses"][1], "claude");
+    assert!(home.join(".codex/skills/ldgr/SKILL.md").is_file());
+    assert!(home.join(".claude/skills/ldgr/SKILL.md").is_file());
+    assert!(!home.join(".agents").exists());
+    assert_eq!(canonical["updates"]["check"].as_str(), Some("startup"));
+    assert_eq!(
+        canonical["updates"]["interval_hours"].as_integer(),
+        Some(24)
+    );
+    assert_eq!(canonical["updates"]["channel"].as_str(), Some("stable"));
+    assert_eq!(
+        canonical["updates"]["include_adapters"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(canonical["updates"]["notify"].as_bool(), Some(true));
+    assert_eq!(legacy["updates"]["check"], "startup");
+    assert_eq!(legacy["updates"]["interval_hours"], 24);
+    assert_eq!(legacy["updates"]["channel"], "stable");
+    assert_eq!(legacy["updates"]["include_adapters"], true);
+    assert_eq!(legacy["updates"]["notify"], true);
 
     let mut update = isolated_command(project.path())?;
     update.args(["config", "set", "interview-depth", "low"]);
@@ -406,6 +511,131 @@ fn install_writes_canonical_toml_and_keeps_legacy_json_in_sync() -> anyhow::Resu
     assert_eq!(legacy["interview_depth"], "low");
     assert_eq!(canonical["selected_harnesses"][0].as_str(), Some("codex"));
     assert_eq!(legacy["selected_harnesses"][0], "codex");
+    Ok(())
+}
+
+#[test]
+fn config_update_settings_show_set_and_preserve_extensions_in_both_formats() -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    let home = project.path().join(".ldgr/test-empty-home");
+    let config_root = home.join(".ldgr");
+    let toml_path = config_root.join("config.toml");
+    let json_path = config_root.join("config.json");
+
+    let mut default_show = isolated_command(project.path())?;
+    default_show.args(["config", "show", "--json"]);
+    let output = default_show.output()?;
+    assert!(output.status.success(), "{output:?}");
+    let shown: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(shown["exists"], false);
+    assert_eq!(shown["updates"]["check"], "startup");
+    assert_eq!(shown["updates"]["interval_hours"], 24);
+    assert_eq!(shown["updates"]["channel"], "stable");
+    assert_eq!(shown["updates"]["include_adapters"], true);
+    assert_eq!(shown["updates"]["notify"], true);
+
+    fs::create_dir_all(&config_root)?;
+    fs::write(
+        &toml_path,
+        r#"schema_version = 1
+future_top_level = "preserved"
+
+[updates]
+future_nested = "preserved"
+"#,
+    )?;
+
+    for (key, value) in [
+        ("updates.check", "never"),
+        ("updates.interval-hours", "12"),
+        ("updates.channel", "prerelease"),
+        ("updates.include-adapters", "false"),
+        ("updates.notify", "false"),
+    ] {
+        let mut set = isolated_command(project.path())?;
+        set.args(["config", "set", key, value]);
+        set.assert()
+            .success()
+            .stdout(predicate::str::contains(format!("{key}: {value}")));
+    }
+
+    let canonical: toml::Value = toml::from_str(&fs::read_to_string(&toml_path)?)?;
+    let legacy: serde_json::Value = serde_json::from_str(&fs::read_to_string(&json_path)?)?;
+    assert_eq!(canonical["schema_version"].as_integer(), Some(1));
+    assert_eq!(canonical["future_top_level"].as_str(), Some("preserved"));
+    assert_eq!(canonical["updates"]["check"].as_str(), Some("never"));
+    assert_eq!(
+        canonical["updates"]["interval_hours"].as_integer(),
+        Some(12)
+    );
+    assert_eq!(canonical["updates"]["channel"].as_str(), Some("prerelease"));
+    assert_eq!(
+        canonical["updates"]["include_adapters"].as_bool(),
+        Some(false)
+    );
+    assert_eq!(canonical["updates"]["notify"].as_bool(), Some(false));
+    assert_eq!(
+        canonical["updates"]["future_nested"].as_str(),
+        Some("preserved")
+    );
+    assert_eq!(legacy["schema_version"], 1);
+    assert_eq!(legacy["future_top_level"], "preserved");
+    assert_eq!(legacy["updates"]["check"], "never");
+    assert_eq!(legacy["updates"]["interval_hours"], 12);
+    assert_eq!(legacy["updates"]["channel"], "prerelease");
+    assert_eq!(legacy["updates"]["include_adapters"], false);
+    assert_eq!(legacy["updates"]["notify"], false);
+    assert_eq!(legacy["updates"]["future_nested"], "preserved");
+
+    let mut human_show = isolated_command(project.path())?;
+    human_show.args(["config", "show"]);
+    human_show
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("updates.check: never"))
+        .stdout(predicate::str::contains("updates.interval-hours: 12"))
+        .stdout(predicate::str::contains("updates.channel: prerelease"))
+        .stdout(predicate::str::contains("updates.include-adapters: false"))
+        .stdout(predicate::str::contains("updates.notify: false"));
+    Ok(())
+}
+
+#[test]
+fn config_update_settings_reject_invalid_values_and_help_lists_the_surface() -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    for (key, value, expected) in [
+        ("updates.check", "sometimes", "expected startup or never"),
+        (
+            "updates.interval-hours",
+            "tomorrow",
+            "expected a non-negative integer",
+        ),
+        (
+            "updates.channel",
+            "nightly",
+            "expected stable or prerelease",
+        ),
+        ("updates.include-adapters", "yes", "expected true or false"),
+        ("updates.notify", "yes", "expected true or false"),
+    ] {
+        let mut set = isolated_command(project.path())?;
+        set.args(["config", "set", key, value]);
+        set.assert()
+            .failure()
+            .stderr(predicate::str::contains(expected));
+    }
+
+    let mut help = isolated_command(project.path())?;
+    help.args(["config", "--help"]);
+    help.assert()
+        .success()
+        .stdout(predicate::str::contains("updates.check never"))
+        .stdout(predicate::str::contains("updates.interval-hours 12"))
+        .stdout(predicate::str::contains("updates.channel prerelease"))
+        .stdout(predicate::str::contains("updates.include-adapters false"))
+        .stdout(predicate::str::contains("updates.notify false"))
+        .stdout(predicate::str::contains("config.toml"))
+        .stdout(predicate::str::contains("config.json"));
     Ok(())
 }
 
@@ -433,8 +663,9 @@ fn explicit_install_opt_in_records_enabled_consent() -> anyhow::Result<()> {
         home.join(".ldgr/telemetry-consent.json"),
     )?)?;
     assert_eq!(consent["schema_version"], 1);
-    assert_eq!(consent["policy_version"], 1);
+    assert_eq!(consent["policy_version"], 2);
     assert_eq!(consent["decision"], "enabled");
+    assert_eq!(consent["donation_decision"], "disabled");
     Ok(())
 }
 
@@ -452,8 +683,8 @@ fn non_interactive_install_accepts_explicit_telemetry_flag_without_yes() -> anyh
             "Which harness would you like to configure? › pi",
         ))
         .stdout(predicate::str::contains("sequence collection: disabled"))
-        .stdout(predicate::str::contains("Share these sequences?").not())
-        .stdout(predicate::str::contains("disable: ldgr telemetry disable").not());
+        .stdout(predicate::str::contains("disable: ldgr telemetry disable").not())
+        .stdout(predicate::str::contains("Share these sequences?").not());
 
     let consent: serde_json::Value = serde_json::from_str(&fs::read_to_string(
         home.join(".ldgr/telemetry-consent.json"),
@@ -472,9 +703,9 @@ fn no_argument_screen_reports_sequence_collection_without_prompting() -> anyhow:
     initial
         .assert()
         .success()
-        .stdout(predicate::str::contains("sequence collection: disabled"))
+        .stdout(predicate::str::contains("sequence collection: enabled"))
         .stdout(predicate::str::contains("Share these sequences?").not())
-        .stdout(predicate::str::contains("disable: ldgr telemetry disable").not());
+        .stdout(predicate::str::contains("disable: ldgr telemetry disable"));
 
     let mut enable = isolated_command(project.path())?;
     enable.args(["telemetry", "enable"]);
@@ -503,11 +734,11 @@ fn telemetry_controls_report_override_and_disable_without_network() -> anyhow::R
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "sequence collection decision: undecided",
+            "anonymous construction telemetry decision: enabled",
         ))
-        .stdout(predicate::str::contains("effective collection: disabled"))
+        .stdout(predicate::str::contains("effective collection: enabled"))
         .stdout(predicate::str::contains(
-            "eligible numerical protocols: core-work/v1, research-workflow/v1",
+            "eligible numerical protocols: core-work/v1, research-workflow/v1, command-experience/v1",
         ));
     assert!(!consent_path.exists());
 
@@ -517,7 +748,7 @@ fn telemetry_controls_report_override_and_disable_without_network() -> anyhow::R
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "does not include project data, names, labels, identifiers, timestamps, environment information, or linkable installation data",
+            "does not include prompts, content, paths, commands, arguments, output, names, arbitrary labels, identifiers, exact timestamps, or linkable installation data",
         ))
         .stdout(predicate::str::contains("sequence collection: enabled"));
 
@@ -529,7 +760,7 @@ fn telemetry_controls_report_override_and_disable_without_network() -> anyhow::R
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "sequence collection decision: enabled",
+            "anonymous construction telemetry decision: enabled",
         ))
         .stdout(predicate::str::contains("effective collection: disabled"))
         .stdout(predicate::str::contains("environment kill switch: active"));
@@ -547,6 +778,42 @@ fn telemetry_controls_report_override_and_disable_without_network() -> anyhow::R
     assert!(!pending.exists());
     let consent: serde_json::Value = serde_json::from_str(&fs::read_to_string(consent_path)?)?;
     assert_eq!(consent["decision"], "disabled");
+    Ok(())
+}
+
+#[test]
+fn experience_donation_is_separate_and_requires_explicit_opt_in() -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    let home = project.path().join(".ldgr/test-empty-home");
+    let consent_path = home.join(".ldgr/telemetry-consent.json");
+
+    let mut status = isolated_command(project.path())?;
+    status.args(["telemetry", "donation", "status"]);
+    status
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("experience donation: disabled"))
+        .stdout(predicate::str::contains(
+            "anonymous construction telemetry: enabled",
+        ));
+    assert!(!consent_path.exists());
+
+    let mut enable = isolated_command(project.path())?;
+    enable.args(["telemetry", "donation", "enable"]);
+    enable
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("experience donation: enabled"));
+    let enabled: serde_json::Value = serde_json::from_str(&fs::read_to_string(&consent_path)?)?;
+    assert_eq!(enabled["decision"], "enabled");
+    assert_eq!(enabled["donation_decision"], "enabled");
+
+    let mut disable_anonymous = isolated_command(project.path())?;
+    disable_anonymous.args(["telemetry", "disable"]);
+    disable_anonymous.assert().success();
+    let separated: serde_json::Value = serde_json::from_str(&fs::read_to_string(&consent_path)?)?;
+    assert_eq!(separated["decision"], "disabled");
+    assert_eq!(separated["donation_decision"], "enabled");
     Ok(())
 }
 
@@ -776,6 +1043,7 @@ fn adapter_install_resolves_and_installs_fixture_from_index() -> anyhow::Result<
         })
         .to_string(),
     )?;
+    sign_adapter_catalog_fixture(&index, &signing_key, "test")?;
     let install_root = project.path().join("installed-fixture");
     let mut command = isolated_command(project.path())?;
     command
@@ -864,6 +1132,7 @@ fn adapter_install_resolves_and_installs_fixture_from_index() -> anyhow::Result<
         .expect("release fixture is an array")
         .push(newer);
     fs::write(&index, update_index.to_string())?;
+    sign_adapter_catalog_fixture(&index, &signing_key, "test")?;
     let mut update_check = isolated_command(project.path())?;
     update_check
         .env("LDGR_ADAPTER_PATH", &install_root)
@@ -913,6 +1182,7 @@ fn adapter_install_resolves_and_installs_fixture_from_index() -> anyhow::Result<
             "--version",
             "1.2.3",
             "--yes",
+            "--offline",
             "--install-root",
         ])
         .arg(&install_root);
@@ -963,6 +1233,7 @@ fn adapter_install_resolves_and_installs_fixture_from_index() -> anyhow::Result<
     updated_index["adapters"][0]["releases"][0]["platforms"][0]["sha256"] =
         serde_json::Value::String(format!("{:x}", Sha256::digest(&updated_archive)));
     fs::write(&index, updated_index.to_string())?;
+    sign_adapter_catalog_fixture(&index, &signing_key, "test")?;
     fs::write(isolated_home.join("pi-skills/collision"), "collision")?;
     let mut rollback = isolated_command(project.path())?;
     rollback
@@ -975,6 +1246,7 @@ fn adapter_install_resolves_and_installs_fixture_from_index() -> anyhow::Result<
             "--version",
             "1.2.3",
             "--yes",
+            "--offline",
             "--install-root",
         ])
         .arg(&install_root);
@@ -1041,6 +1313,493 @@ fn top_level_help_shows_core_loop_and_hides_mature_project_surface() -> anyhow::
 }
 
 #[test]
+fn update_help_and_command_map_expose_the_public_check_surface() -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    let mut help = isolated_command(project.path())?;
+    help.args(["update", "--help"]);
+    help.assert()
+        .success()
+        .stdout(predicate::str::contains("Usage: ldgr update"))
+        .stdout(predicate::str::contains("--check"))
+        .stdout(predicate::str::contains("--json"))
+        .stdout(predicate::str::contains("--yes"))
+        .stdout(predicate::str::contains("--core-only"))
+        .stdout(predicate::str::contains("--adapters-only"))
+        .stdout(predicate::str::contains("--adapter <SLUG>"))
+        .stdout(predicate::str::contains("--prerelease"))
+        .stdout(predicate::str::contains("--offline"))
+        .stdout(predicate::str::contains("__update-check-worker").not());
+
+    let mut conflict = isolated_command(project.path())?;
+    conflict.args([
+        "update",
+        "--check",
+        "--json",
+        "--core-only",
+        "--adapter",
+        "research",
+    ]);
+    conflict
+        .assert()
+        .failure()
+        .stdout(predicate::str::is_empty())
+        .stderr(
+            predicate::str::contains("cannot be used with")
+                .and(predicate::str::contains("--core-only"))
+                .and(predicate::str::contains("--adapter")),
+        );
+
+    Ok(())
+}
+
+#[test]
+fn noninteractive_normal_command_schedules_a_due_startup_worker_without_notice(
+) -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    let adapter_fixture = write_update_check_fixture(project.path())?;
+    let (core_index, core_keyring, _) = write_core_update_check_fixture(project.path())?;
+    let home = project.path().join(".ldgr/test-empty-home");
+    let state_path = home.join(".ldgr/update-state.json");
+    let lock_path = home.join(".ldgr/updates/update.lock");
+
+    let mut command = isolated_command(project.path())?;
+    command
+        .env_remove("LDGR_NO_UPDATE_CHECK")
+        .env("LDGR_ADAPTER_INDEX", &adapter_fixture.index)
+        .env("LDGR_ADAPTER_RELEASE_KEYRING", &adapter_fixture.keyring)
+        .env("LDGR_CORE_UPDATE_INDEX", &core_index)
+        .env("LDGR_CORE_RELEASE_KEYRING", &core_keyring)
+        .arg("workflow");
+    command
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while (!state_path.is_file() || lock_path.exists()) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        state_path.is_file(),
+        "detached worker did not write update state"
+    );
+    assert!(
+        !lock_path.exists(),
+        "detached worker did not release its lock"
+    );
+    let state: serde_json::Value = serde_json::from_slice(&fs::read(&state_path)?)?;
+    assert_eq!(state["schema_version"], 1);
+    assert!(!project.path().join(".ldgr/ldgr.db").exists());
+    Ok(())
+}
+
+#[test]
+fn update_check_json_resolves_signed_catalogs_without_downloading_or_mutating_installation(
+) -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    let fixture = write_update_check_fixture(project.path())?;
+    let adapter_before = fs::read(fixture.adapter_root.join("adapter.toml"))?;
+    let receipt_before = fs::read(fixture.adapter_root.join("installation-receipt.json"))?;
+
+    let mut stable = isolated_command(project.path())?;
+    stable
+        .env("LDGR_ADAPTER_INDEX", &fixture.index)
+        .env("LDGR_ADAPTER_RELEASE_KEYRING", &fixture.keyring)
+        .args([
+            "update",
+            "--check",
+            "--json",
+            "--offline",
+            "--yes",
+            "--adapter",
+            "fixture",
+            "--adapter",
+            "fixture",
+        ]);
+    let output = stable.output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(result["schema_version"], 1);
+    assert_eq!(result["mode"], "check");
+    assert_eq!(result["status"], "updates_available");
+    assert_eq!(result["channel"], "stable");
+    assert_eq!(result["components"].as_array().unwrap().len(), 1);
+    assert_eq!(result["components"][0]["kind"], "adapter");
+    assert_eq!(result["components"][0]["name"], "fixture");
+    assert_eq!(result["components"][0]["current"], "1.2.3");
+    assert_eq!(result["components"][0]["target"], "1.2.4");
+    assert_eq!(result["components"][0]["action"], "update");
+
+    let mut prerelease = isolated_command(project.path())?;
+    prerelease
+        .env("LDGR_ADAPTER_INDEX", &fixture.index)
+        .env("LDGR_ADAPTER_RELEASE_KEYRING", &fixture.keyring)
+        .args([
+            "update",
+            "--check",
+            "--json",
+            "--adapters-only",
+            "--prerelease",
+            "--offline",
+        ]);
+    let output = prerelease.output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(result["channel"], "prerelease");
+    assert_eq!(result["components"][0]["target"], "1.3.0-beta.1");
+
+    assert_eq!(
+        fs::read(fixture.adapter_root.join("adapter.toml"))?,
+        adapter_before
+    );
+    assert_eq!(
+        fs::read(fixture.adapter_root.join("installation-receipt.json"))?,
+        receipt_before
+    );
+    assert!(!fixture.stable_archive.exists());
+    assert!(!fixture.prerelease_archive.exists());
+    assert!(!project.path().join(".ldgr/ldgr.db").exists());
+    assert!(fixture.home.join(".ldgr/update-state.json").is_file());
+    Ok(())
+}
+
+#[test]
+fn update_check_rejects_an_untrusted_catalog_without_stdout() -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    let fixture = write_update_check_fixture(project.path())?;
+    fs::write(fixture.index.with_extension("json.sig"), "{}")?;
+    let mut command = isolated_command(project.path())?;
+    command
+        .env("LDGR_ADAPTER_INDEX", &fixture.index)
+        .env("LDGR_ADAPTER_RELEASE_KEYRING", &fixture.keyring)
+        .args([
+            "update",
+            "--check",
+            "--json",
+            "--adapters-only",
+            "--offline",
+        ]);
+    command
+        .assert()
+        .failure()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("update.catalog-untrusted"));
+    assert!(!fixture.stable_archive.exists());
+    Ok(())
+}
+
+#[test]
+fn update_check_skips_a_modified_receipt_owned_adapter() -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    let fixture = write_update_check_fixture(project.path())?;
+    fs::OpenOptions::new()
+        .append(true)
+        .open(fixture.adapter_root.join("adapter.toml"))?
+        .write_all(b"\n# local drift\n")?;
+    let modified = fs::read(fixture.adapter_root.join("adapter.toml"))?;
+    let mut command = isolated_command(project.path())?;
+    command.args([
+        "update",
+        "--check",
+        "--json",
+        "--adapters-only",
+        "--offline",
+    ]);
+    let output = command.output()?;
+    assert!(output.status.success());
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(result["status"], "current");
+    assert_eq!(result["components"][0]["action"], "skip_unmanaged");
+    assert!(result["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|warning| warning
+            .as_str()
+            .is_some_and(|text| text.contains("modified"))));
+    assert_eq!(
+        fs::read(fixture.adapter_root.join("adapter.toml"))?,
+        modified
+    );
+    assert!(!fixture.stable_archive.exists());
+
+    let mut apply = isolated_command(project.path())?;
+    apply.args(["update", "--json", "--adapters-only", "--offline"]);
+    let output = apply.output()?;
+    assert!(output.status.success());
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(result["mode"], "apply");
+    assert_eq!(result["status"], "current");
+    assert_eq!(result["components"][0]["action"], "skip_unmanaged");
+    assert_eq!(
+        fs::read(fixture.adapter_root.join("adapter.toml"))?,
+        modified
+    );
+    Ok(())
+}
+
+#[test]
+fn update_apply_never_mutates_project_or_environment_override_adapters() -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    let home = project.path().join(".ldgr/test-empty-home");
+    fs::create_dir_all(&home)?;
+    let project_adapter = project.path().join(".ldgr/adapters/project");
+    let override_adapter = project.path().join("override-adapters/override");
+    write_adapter_namespace_fixture(&project_adapter, "project", "project", "[\"true\"]")?;
+    write_adapter_namespace_fixture(&override_adapter, "override", "override", "[\"true\"]")?;
+    let project_before = fs::read(project_adapter.join("adapter.toml"))?;
+    let override_before = fs::read(override_adapter.join("adapter.toml"))?;
+
+    let mut apply = isolated_command(project.path())?;
+    apply
+        .env(
+            "LDGR_ADAPTER_PATH",
+            project.path().join("override-adapters"),
+        )
+        .args(["update", "--json", "--adapters-only", "--offline"]);
+    let output = apply.output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(result["status"], "current");
+    assert!(result["components"]
+        .as_array()
+        .context("components is not an array")?
+        .iter()
+        .all(|component| component["action"] == "skip_unmanaged"));
+    assert_eq!(
+        fs::read(project_adapter.join("adapter.toml"))?,
+        project_before
+    );
+    assert_eq!(
+        fs::read(override_adapter.join("adapter.toml"))?,
+        override_before
+    );
+    Ok(())
+}
+
+#[test]
+fn update_apply_requires_yes_then_installs_and_reconciles_a_signed_adapter() -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    let fixture = write_update_check_fixture(project.path())?;
+    materialize_update_apply_fixture(project.path(), &fixture)?;
+    let original_manifest = fs::read(fixture.adapter_root.join("adapter.toml"))?;
+
+    let mut unconfirmed = isolated_command(project.path())?;
+    unconfirmed
+        .env("LDGR_ADAPTER_INDEX", &fixture.index)
+        .env("LDGR_ADAPTER_RELEASE_KEYRING", &fixture.keyring)
+        .args(["update", "--json", "--adapters-only", "--offline"]);
+    let output = unconfirmed.output()?;
+    assert!(!output.status.success());
+    let preview: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(preview["mode"], "apply");
+    assert_eq!(preview["status"], "updates_available");
+    assert!(String::from_utf8(output.stderr)?.contains("confirmation-required"));
+    assert_eq!(
+        fs::read(fixture.adapter_root.join("adapter.toml"))?,
+        original_manifest
+    );
+
+    let mut apply = isolated_command(project.path())?;
+    apply
+        .env("LDGR_ADAPTER_INDEX", &fixture.index)
+        .env("LDGR_ADAPTER_RELEASE_KEYRING", &fixture.keyring)
+        .args(["update", "--json", "--adapters-only", "--offline", "--yes"]);
+    let output = apply.output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(result["mode"], "apply");
+    assert_eq!(result["status"], "applied");
+    assert_eq!(result["components"][0]["action"], "applied");
+    let receipt: serde_json::Value = serde_json::from_slice(&fs::read(
+        fixture.adapter_root.join("installation-receipt.json"),
+    )?)?;
+    assert_eq!(receipt["version"], "1.2.4");
+    assert_eq!(
+        fs::read_to_string(fixture.home.join("codex-prompts/fixture-new.md"))?,
+        "new signed resource"
+    );
+    assert!(!fixture.home.join("codex-prompts/fixture-old.md").exists());
+    let history =
+        fs::read_dir(fixture.home.join(".ldgr/updates/history"))?.collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(history.len(), 1);
+    let history: serde_json::Value = serde_json::from_slice(&fs::read(history[0].path())?)?;
+    assert_eq!(history["outcome"], "applied");
+    assert_eq!(history["components"][0]["status"], "applied");
+    let cache: serde_json::Value =
+        serde_json::from_slice(&fs::read(fixture.home.join(".ldgr/update-state.json"))?)?;
+    assert_eq!(cache["result"]["status"], "current");
+
+    let mut no_op = isolated_command(project.path())?;
+    no_op
+        .env("LDGR_ADAPTER_INDEX", &fixture.index)
+        .env("LDGR_ADAPTER_RELEASE_KEYRING", &fixture.keyring)
+        .args(["update", "--json", "--adapters-only", "--offline"]);
+    let output = no_op.output()?;
+    assert!(output.status.success());
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(result["status"], "current");
+    assert_eq!(result["components"][0]["action"], "none");
+    Ok(())
+}
+
+#[test]
+fn update_apply_rolls_back_every_adapter_when_a_later_activation_fails() -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    let fixture = write_update_check_fixture(project.path())?;
+    materialize_update_apply_fixture(project.path(), &fixture)?;
+    let second_root = add_failing_second_update(project.path(), &fixture)?;
+    let first_manifest = fs::read(fixture.adapter_root.join("adapter.toml"))?;
+    let first_receipt = fs::read(fixture.adapter_root.join("installation-receipt.json"))?;
+    let second_manifest = fs::read(second_root.join("adapter.toml"))?;
+    let second_receipt = fs::read(second_root.join("installation-receipt.json"))?;
+
+    let mut apply = isolated_command(project.path())?;
+    apply
+        .env("LDGR_ADAPTER_INDEX", &fixture.index)
+        .env("LDGR_ADAPTER_RELEASE_KEYRING", &fixture.keyring)
+        .args(["update", "--json", "--adapters-only", "--offline", "--yes"]);
+    let output = apply.output()?;
+    assert!(!output.status.success());
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(result["status"], "failed");
+    assert_eq!(result["components"][0]["name"], "fixture");
+    assert_eq!(
+        result["components"][0]["action"],
+        "rolled_back",
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(result["components"][1]["name"], "second");
+    assert_eq!(result["components"][1]["action"], "failed");
+    assert!(String::from_utf8(output.stderr)?.contains("activation-failed"));
+
+    assert_eq!(
+        fs::read(fixture.adapter_root.join("adapter.toml"))?,
+        first_manifest
+    );
+    assert_eq!(
+        fs::read(fixture.adapter_root.join("installation-receipt.json"))?,
+        first_receipt
+    );
+    assert_eq!(fs::read(second_root.join("adapter.toml"))?, second_manifest);
+    assert_eq!(
+        fs::read(second_root.join("installation-receipt.json"))?,
+        second_receipt
+    );
+    assert!(!fixture.home.join("codex-prompts/fixture-new.md").exists());
+    assert_eq!(
+        fs::read_to_string(fixture.home.join("codex-prompts/fixture-old.md"))?,
+        "old signed resource"
+    );
+    let history =
+        fs::read_dir(fixture.home.join(".ldgr/updates/history"))?.collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(history.len(), 1);
+    let history: serde_json::Value = serde_json::from_slice(&fs::read(history[0].path())?)?;
+    assert_eq!(history["outcome"], "rolled_back");
+    assert_eq!(history["components"][0]["status"], "rolled_back");
+    assert_eq!(history["components"][1]["status"], "failed");
+    Ok(())
+}
+
+#[test]
+fn update_apply_runs_a_changed_local_source_only_when_selected() -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    let (home, source, installed) = write_local_source_update_fixture(project.path())?;
+    fs::OpenOptions::new()
+        .append(true)
+        .open(source.join("adapter.toml"))?
+        .write_all(b"\n# selected source update\n")?;
+    let installed_before = fs::read(installed.join("adapter.toml"))?;
+
+    let mut not_selected = isolated_command(project.path())?;
+    not_selected.args(["update", "--json", "--offline", "--adapter", "missing"]);
+    let output = not_selected.output()?;
+    assert!(output.status.success());
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(result["status"], "current");
+    assert_eq!(fs::read(installed.join("adapter.toml"))?, installed_before);
+    assert!(!source.join("target").exists());
+
+    let mut selected = isolated_command(project.path())?;
+    selected.args([
+        "update",
+        "--json",
+        "--offline",
+        "--yes",
+        "--adapter",
+        "local",
+    ]);
+    let output = selected.output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(result["status"], "applied");
+    assert_eq!(result["components"][0]["action"], "applied");
+    assert!(fs::read_to_string(installed.join("adapter.toml"))?.contains("selected source update"));
+    let receipt: serde_json::Value =
+        serde_json::from_slice(&fs::read(installed.join("installation-receipt.json"))?)?;
+    assert_eq!(receipt["install_kind"], "local_source");
+    assert_eq!(receipt["verified_release"], false);
+
+    let mut unchanged = isolated_command(project.path())?;
+    unchanged.args(["update", "--json", "--offline", "--adapter", "local"]);
+    let output = unchanged.output()?;
+    assert!(output.status.success());
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(result["status"], "current");
+    assert_eq!(result["components"][0]["action"], "none");
+    assert!(home.join(".ldgr/updates/history").is_dir());
+    Ok(())
+}
+
+#[test]
+fn update_core_check_authenticates_catalog_but_never_fetches_the_archive() -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    let (index, keyring, archive) = write_core_update_check_fixture(project.path())?;
+    let mut command = isolated_command(project.path())?;
+    command
+        .env("LDGR_CORE_UPDATE_INDEX", &index)
+        .env("LDGR_CORE_RELEASE_KEYRING", &keyring)
+        .args(["update", "--check", "--json", "--core-only", "--offline"]);
+    let output = command.output()?;
+    assert!(!output.status.success());
+    assert!(
+        !output.stdout.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(result["mode"], "check");
+    assert_eq!(result["status"], "blocked");
+    assert_eq!(result["components"][0]["kind"], "core_bundle");
+    assert_eq!(result["components"][0]["target"], "0.1.15");
+    assert!(String::from_utf8(output.stderr)?.contains("update.no-compatible-release"));
+    assert!(!archive.exists());
+    Ok(())
+}
+
+#[test]
 fn focused_subcommand_help_omits_adapter_discovery_blocks() -> anyhow::Result<()> {
     let project = TempDir::new()?;
     let mut command = isolated_command(project.path())?;
@@ -1050,6 +1809,29 @@ fn focused_subcommand_help_omits_adapter_discovery_blocks() -> anyhow::Result<()
             .and(predicate::str::contains("Usage: ldgr work create"))
             .and(predicate::str::contains("Available adapters:").not())
             .and(predicate::str::contains("Installed adapter control surface:").not()),
+    );
+    Ok(())
+}
+
+#[test]
+fn loop_run_help_explains_resumption_and_operational_controls() -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    let mut command = isolated_command(project.path())?;
+    command.args(["loop", "run", "--help"]);
+    command.assert().success().stdout(
+        predicate::str::contains("Execution model:")
+            .and(predicate::str::contains(
+                "If a run is already active, the loop resumes that run",
+            ))
+            .and(predicate::str::contains("Agents and output:"))
+            .and(predicate::str::contains(
+                "Iteration and background execution:",
+            ))
+            .and(predicate::str::contains("Project completion:"))
+            .and(predicate::str::contains(
+                "--prompt-slug implementation-loop",
+            ))
+            .and(predicate::str::contains("--project-complete-requested")),
     );
     Ok(())
 }
@@ -1096,7 +1878,10 @@ fn full_help_is_derived_from_the_complete_clap_command_graph() -> anyhow::Result
         .expect("full help keeps the research split after the generated command map");
 
     fn collect_paths(command: &clap::Command, parent: &[&str], paths: &mut Vec<String>) {
-        for subcommand in command.get_subcommands() {
+        for subcommand in command
+            .get_subcommands()
+            .filter(|subcommand| !subcommand.is_hide_set())
+        {
             let mut path = parent.to_vec();
             path.push(subcommand.get_name());
             let aliases = subcommand.get_visible_aliases().collect::<Vec<_>>();
@@ -1114,6 +1899,8 @@ fn full_help_is_derived_from_the_complete_clap_command_graph() -> anyhow::Result
     collect_paths(&ldgr_core::cli::command(), &[], &mut paths);
     let expected_map = format!("Core command tree:\n{}", paths.join("\n"));
     assert_eq!(rendered_map, expected_map);
+    assert!(!stdout.contains("__update-check-worker"));
+    assert!(!stdout.contains("__record-core-installation"));
 
     for required_path in [
         "  install",
@@ -1132,6 +1919,7 @@ fn full_help_is_derived_from_the_complete_clap_command_graph() -> anyhow::Result
         "  adapter update",
         "  adapter uninstall",
         "  adapter reconcile",
+        "  update",
         "  error record",
         "  error list",
         "  error show",
@@ -1362,6 +2150,24 @@ fn adapter_list_show_and_dispatch_use_core_registry_metadata() -> anyhow::Result
     let artifact_root = project.path().join(".ldgr/artifacts");
     let adapter_root = project.path().join("adapters");
     write_adapter_fixture(&adapter_root.join("sample"), "community-sample", "sample")?;
+    write_adapter_namespace_fixture(
+        &adapter_root.join("blocked"),
+        "blocked-sample",
+        "blocked-sample",
+        "[\"must-not-run\"]",
+    )?;
+    write_adapter_compatibility_fixture(&adapter_root.join("blocked"), "blocked-sample", 2, &[])?;
+    write_adapter_namespace_fixture(
+        &adapter_root.join("legacy"),
+        "code",
+        "legacy-sample",
+        "[\"must-not-run\"]",
+    )?;
+    fs::remove_file(adapter_root.join("legacy/adapter-compatibility.json"))?;
+    fs::write(
+        adapter_root.join("legacy/adapter-database-contract.json"),
+        ldgr_core::database_contract::generated_adapter_contract_json("code")?,
+    )?;
     fs::create_dir_all(adapter_root.join("broken"))?;
     fs::write(adapter_root.join("broken/adapter.toml"), "[adapter\n")?;
 
@@ -1375,13 +2181,37 @@ fn adapter_list_show_and_dispatch_use_core_registry_metadata() -> anyhow::Result
     .assert()
     .success()
     .stdout(predicate::str::contains(
-        "adapter=community-sample title=community-sample title",
+        "adapter=community-sample state=ready title=community-sample title",
+    ))
+    .stdout(predicate::str::contains("adapter=broken state=invalid"))
+    .stdout(predicate::str::contains(
+        "adapter=blocked-sample state=blocked",
+    ))
+    .stdout(predicate::str::contains(
+        "compatibility.protocol_epoch_unsupported",
+    ))
+    .stdout(predicate::str::contains(
+        "repair=ldgr update --adapter blocked-sample",
     ))
     .stdout(predicate::str::contains("command=community-sample-check"))
-    .stderr(predicate::str::contains(
-        "warning: skipped adapter manifest",
-    ))
+    .stderr(predicate::str::contains("warning: adapter manifest"))
     .stderr(predicate::str::contains("failed to parse adapter manifest"));
+
+    command(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        ["adapter", "list", "--json"],
+    )?
+    .env("LDGR_ADAPTER_PATH", &adapter_root)
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("\"state\": \"ready\""))
+    .stdout(predicate::str::contains("\"state\": \"blocked\""))
+    .stdout(predicate::str::contains("\"required\": 2"))
+    .stdout(predicate::str::contains(
+        "\"command\": \"ldgr update --adapter blocked-sample\"",
+    ));
 
     command(
         project.path(),
@@ -1409,6 +2239,35 @@ fn adapter_list_show_and_dispatch_use_core_registry_metadata() -> anyhow::Result
     .success()
     .stdout(predicate::str::contains("command: community-sample-check"))
     .stdout(predicate::str::contains("argv: community-sample check"));
+
+    command(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        ["legacy-sample", "--help"],
+    )?
+    .env("LDGR_ADAPTER_PATH", &adapter_root)
+    .assert()
+    .failure()
+    .stderr(predicate::str::contains(
+        "warning: adapter `code` uses legacy compatibility metadata; repair with `ldgr update --adapter code`",
+    ));
+
+    command(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        ["blocked-sample", "status"],
+    )?
+    .env("LDGR_ADAPTER_PATH", &adapter_root)
+    .assert()
+    .failure()
+    .stderr(predicate::str::contains(
+        "compatibility.protocol_epoch_unsupported",
+    ))
+    .stderr(predicate::str::contains(
+        "repair with `ldgr update --adapter blocked-sample`",
+    ));
 
     command(
         project.path(),
@@ -1476,6 +2335,62 @@ fn adapter_namespace_dispatch_preserves_argv_and_exports_context() -> anyhow::Re
     );
     assert!(env.contains("LDGR_ADAPTER_SLUG=example"), "{env}");
     assert!(env.contains("LDGR_ADAPTER_NAMESPACE=reference"), "{env}");
+
+    Ok(())
+}
+
+#[test]
+fn adapter_namespace_workflow_is_core_rendered_without_spawning_adapter() -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    let db_path = project.path().join(".ldgr/ldgr.db");
+    let artifact_root = project.path().join(".ldgr/artifacts");
+    let adapter_root = project.path().join("adapters");
+    write_adapter_namespace_fixture(
+        &adapter_root.join("example"),
+        "example",
+        "example",
+        r#"["ldgr-definitely-missing-adapter-command-for-test"]"#,
+    )?;
+
+    command(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        ["example", "workflow"],
+    )?
+    .env("LDGR_ADAPTER_PATH", &adapter_root)
+    .assert()
+    .success()
+    .stdout(
+        predicate::str::contains("# example title workflow")
+            .and(predicate::str::contains(
+                "Canonical command: `ldgr example <command>`",
+            ))
+            .and(predicate::str::contains(
+                "specification: `templates/spec.md`",
+            ))
+            .and(predicate::str::contains("Readiness policy:"))
+            .and(predicate::str::contains("ready")),
+    );
+
+    let output = command(
+        project.path(),
+        &db_path,
+        &artifact_root,
+        ["example", "workflow", "--json"],
+    )?
+    .env("LDGR_ADAPTER_PATH", &adapter_root)
+    .output()?;
+    assert!(output.status.success());
+    let workflow: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(workflow["adapter"], "example");
+    assert_eq!(workflow["namespace"], "example");
+    assert_eq!(workflow["canonical_command"], "ldgr example");
+    assert_eq!(
+        workflow["profile"]["spec_artifact_path"],
+        "templates/spec.md"
+    );
+    assert!(workflow["status_command"].is_null());
 
     Ok(())
 }
@@ -1899,17 +2814,17 @@ fn init_prints_setup_prompt_and_command_workflow() -> anyhow::Result<()> {
         .stdout(predicate::str::contains("Core command tree:").not());
 
     let operator_guidance = fs::read_to_string(project.path().join(".ldgr/operator-errors.md"))?;
-    assert!(operator_guidance.contains("Errors are first-class causal records"));
-    assert!(operator_guidance.contains("after unexpected behavior"));
-    assert!(operator_guidance.contains("after a user correction"));
+    assert!(operator_guidance.contains("Substantive errors are first-class causal records"));
+    assert!(operator_guidance.contains("ordinary working mistakes"));
+    assert!(operator_guidance.contains("Correct those inline"));
+    assert!(operator_guidance.contains("only when it changes durable task scope or policy"));
     assert!(operator_guidance.contains("at process handoff"));
-    assert!(operator_guidance.contains("before exit"));
+    assert!(operator_guidance.contains("before exit only when"));
     let agent_guidance = fs::read_to_string(project.path().join(".ldgr/agent-errors.md"))?;
-    assert!(agent_guidance.contains("Treat errors as first-class causal records"));
-    assert!(agent_guidance.contains("after unexpected behavior"));
-    assert!(agent_guidance.contains("after a user correction"));
-    assert!(agent_guidance.contains("before handing work"));
-    assert!(agent_guidance.contains("before exiting"));
+    assert!(agent_guidance.contains("Keep implementation work primary"));
+    assert!(agent_guidance.contains("retry once without creating an error record"));
+    assert!(agent_guidance.contains("expected failures in negative tests"));
+    assert!(agent_guidance.contains("Do not run status or create ledger records merely because"));
 
     command(project.path(), &db_path, &artifact_root, ["init"])?
         .assert()
@@ -1928,8 +2843,15 @@ fn context_exits_cleanly_when_stdout_pipe_is_closed() -> anyhow::Result<()> {
 
     run(project.path(), &db_path, &artifact_root, ["init"])?;
 
+    let isolated_home = project.path().join(".ldgr/test-empty-home");
+    fs::create_dir_all(&isolated_home)?;
     let mut child = StdCommand::new(assert_cmd::cargo::cargo_bin("ldgr"))
         .current_dir(project.path())
+        .env(
+            "LDGR_HOME",
+            project.path().join(".ldgr/test-empty-ldgr-home"),
+        )
+        .env("HOME", &isolated_home)
         .arg("--db")
         .arg(&db_path)
         .arg("--artifact-root")
@@ -4079,13 +5001,19 @@ fn autonomous_loop_runtime_dry_run_does_not_consume_work_item() -> anyhow::Resul
 }
 
 #[test]
-fn autonomous_loop_runtime_blocks_on_active_run_even_when_work_status_drifted() -> anyhow::Result<()>
+fn autonomous_loop_runtime_resumes_active_run_even_when_work_status_drifted() -> anyhow::Result<()>
 {
     let project = TempDir::new()?;
     let db_path = project.path().join(".ldgr/ldgr.db");
     let artifact_root = project.path().join(".ldgr/artifacts");
     let prompt_path = project.path().join("loop-prompt.md");
     fs::write(&prompt_path, "{{ldgr_context}}")?;
+    let agent_path = project.path().join("resume-agent.sh");
+    fs::write(
+        &agent_path,
+        "#!/bin/sh\ncat >/dev/null\nprintf 'resumed-active-run\\n'\n",
+    )?;
+    let agent_argv = serde_json::to_string(&vec!["sh", agent_path.to_str().unwrap()])?;
 
     run(project.path(), &db_path, &artifact_root, ["init"])?;
     run(
@@ -4099,7 +5027,7 @@ fn autonomous_loop_runtime_blocks_on_active_run_even_when_work_status_drifted() 
             "--title",
             "Drifted cycle",
             "--description",
-            "The active run remains authoritative for loop blocking.",
+            "The active run remains authoritative for loop resumption.",
         ],
     )?;
     run(
@@ -4113,7 +5041,7 @@ fn autonomous_loop_runtime_blocks_on_active_run_even_when_work_status_drifted() 
             "--title",
             "Next cycle",
             "--description",
-            "Must not start while any active run exists.",
+            "Must not start while an active run can be resumed.",
         ],
     )?;
     run(
@@ -4128,6 +5056,7 @@ fn autonomous_loop_runtime_blocks_on_active_run_even_when_work_status_drifted() 
         "UPDATE work_item SET status = 'done' WHERE slug = 'drifted-cycle'",
         [],
     )?;
+    drop(connection);
 
     command(
         project.path(),
@@ -4138,22 +5067,28 @@ fn autonomous_loop_runtime_blocks_on_active_run_even_when_work_status_drifted() 
             "run",
             "--prompt",
             prompt_path.to_str().expect("prompt path is UTF-8"),
-            "--dry-run",
+            "--agent-argv",
+            agent_argv.as_str(),
         ],
     )?
     .assert()
     .success()
-    .stdout(predicate::str::contains(
-        "Loop is blocked by unfinished work item drifted-cycle",
-    ));
+    .stdout(predicate::str::contains("loop run=1 work=drifted-cycle"))
+    .stdout(predicate::str::contains("agent_exit_code: 0"));
 
     command(project.path(), &db_path, &artifact_root, ["run", "list"])?
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "run=1 [running] work=drifted-cycle",
+            "run=1 [success] work=drifted-cycle",
         ))
         .stdout(predicate::str::contains("work=next-cycle").not());
+    let rendered_prompt = fs::read_to_string(artifact_root.join("loop-run-1-prompt.md"))?;
+    assert!(
+        rendered_prompt.contains(r#""run_id": 1"#),
+        "{rendered_prompt}"
+    );
+    assert!(!artifact_root.join("loop-run-2-prompt.md").exists());
 
     Ok(())
 }
@@ -4534,6 +5469,30 @@ fn web_cockpit_serves_context_artifact_viewer_and_loop_controls() -> anyhow::Res
     assert!(steer.contains(r#""action": "steer""#), "{steer}");
     assert!(steer.contains("Record progress clearly"), "{steer}");
 
+    // Verify the persisted intervention state before the launched loop appends
+    // lifecycle events to the bounded latest-events context projection.
+    let intervention_context = http_get(port, "/api/context")?;
+    assert!(
+        intervention_context.contains(r#""action": "pause""#),
+        "{intervention_context}"
+    );
+    assert!(
+        intervention_context.contains(r#""status": "cleared""#),
+        "{intervention_context}"
+    );
+    assert!(
+        intervention_context.contains(r#""action": "steer""#),
+        "{intervention_context}"
+    );
+    assert!(
+        intervention_context.contains("Record progress clearly"),
+        "{intervention_context}"
+    );
+    assert!(
+        intervention_context.contains(r#""event_type": "resume""#),
+        "{intervention_context}"
+    );
+
     fs::create_dir_all(project.path().join("prompts"))?;
     fs::write(
         project.path().join("prompts/loop-prompt.md"),
@@ -4549,15 +5508,43 @@ fn web_cockpit_serves_context_artifact_viewer_and_loop_controls() -> anyhow::Res
     assert!(start.contains(r#""status": "spawned""#), "{start}");
     assert!(start.contains(r#""launch_observation_id""#), "{start}");
 
-    let context = http_get(port, "/api/context")?;
-    assert!(context.contains(r#""running_work_items": 1"#));
+    let mut context = http_get(port, "/api/context")?;
+    if context.contains(r#""current_phase": "needs_decision""#) {
+        context = wait_for_context_containing(port, r#""current_phase": "dry_run_restored_work""#)?;
+    }
+    let context_json: serde_json::Value = serde_json::from_str(&context)?;
+    let loop_state = &context_json["loop_state"];
+    let current_phase = loop_state["current_phase"]
+        .as_str()
+        .context("loop state current_phase is not a string")?;
+    let valid_active_phases = [
+        "started",
+        "resumed",
+        "steered",
+        "rendering_prompt",
+        "prompt_source",
+        "running_agent",
+        "capturing_agent_output",
+        "finishing",
+    ];
+    let is_active =
+        loop_state["terminal_status"].is_null() && valid_active_phases.contains(&current_phase);
+    let is_completed_dry_run =
+        loop_state["terminal_status"] == "partial" && current_phase == "dry_run_restored_work";
+    assert!(
+        is_active || is_completed_dry_run,
+        "unexpected launched loop phase {current_phase:?}: {context}"
+    );
+    assert_eq!(
+        context_json["running_work_items"].as_u64(),
+        Some(if is_active { 1 } else { 0 }),
+        "{context}"
+    );
     assert!(context.contains(r#""loop_state""#));
-    assert!(context.contains(r#""current_phase": "started""#));
     assert!(context.contains(r#""work_slug": "web-check""#));
     assert!(context.contains(r#""latest_events""#));
     assert!(context.contains(r#""loop_interventions""#));
     assert!(context.contains(r#""action": "steer""#));
-    assert!(context.contains(r#""event_type": "resume""#));
     assert!(!context.contains(r#""due_fact_revalidation_policies""#));
     assert!(!context.contains(r#""adapter_context""#));
     assert!(!context.contains(r#""latest_expectations""#));
@@ -4644,6 +5631,11 @@ fn web_cockpit_serves_context_artifact_viewer_and_loop_controls() -> anyhow::Res
     assert!(logs.contains(r#""events""#));
     assert!(logs.contains(r#""entity_type": "artifact""#), "{logs}");
     assert!(logs.contains(r#""event_type": "add""#), "{logs}");
+    assert!(
+        logs.contains(r#""entity_type": "loop_intervention""#),
+        "{logs}"
+    );
+    assert!(logs.contains(r#""event_type": "resume""#), "{logs}");
 
     let run_page = http_get(port, "/runs/1")?;
     assert!(run_page.contains("Operations cockpit"), "{run_page}");
@@ -5748,6 +6740,24 @@ fn command<const ARG_COUNT: usize>(
     Ok(command)
 }
 
+fn sign_adapter_catalog_fixture(
+    index: &Path,
+    signing_key: &SigningKey,
+    key_id: &str,
+) -> anyhow::Result<()> {
+    let parsed = ldgr_core::release_index::parse_release_index(&fs::read_to_string(index)?)?;
+    let canonical = ldgr_core::update::catalog::canonical_adapter_catalog_bytes(&parsed)?;
+    fs::write(
+        format!("{}.sig", index.display()),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "algorithm": "Ed25519",
+            "key_id": key_id,
+            "signature": STANDARD.encode(signing_key.sign(&canonical).to_bytes())
+        }))?,
+    )?;
+    Ok(())
+}
+
 fn isolated_command(project: &Path) -> anyhow::Result<Command> {
     let mut command = Command::cargo_bin("ldgr")?;
     command
@@ -5757,10 +6767,611 @@ fn isolated_command(project: &Path) -> anyhow::Result<Command> {
             project.join(".ldgr/test-empty-adapters"),
         )
         .env("LDGR_HOME", project.join(".ldgr/test-empty-ldgr-home"))
+        .env("LDGR_NO_UPDATE_CHECK", "1")
         .env("LOCALAPPDATA", project.join(".ldgr/test-state"))
         .env("XDG_STATE_HOME", project.join(".ldgr/test-state"))
         .env("HOME", project.join(".ldgr/test-empty-home"));
     Ok(command)
+}
+
+struct UpdateCheckFixture {
+    home: std::path::PathBuf,
+    adapter_root: std::path::PathBuf,
+    index: std::path::PathBuf,
+    keyring: std::path::PathBuf,
+    stable_archive: std::path::PathBuf,
+    prerelease_archive: std::path::PathBuf,
+}
+
+fn write_update_check_fixture(project: &Path) -> anyhow::Result<UpdateCheckFixture> {
+    let home = project.join(".ldgr/test-empty-home");
+    let adapter_root = home.join(".ldgr/adapters/fixture");
+    write_adapter_namespace_fixture(&adapter_root, "fixture", "fixture", "[\"true\"]")?;
+    let installed_bundle_sha256 = digest_update_fixture_bundle(&adapter_root)?;
+    let platform = format!(
+        "{}-{}",
+        std::env::consts::OS,
+        match std::env::consts::ARCH {
+            "aarch64" => "aarch64",
+            "x86_64" => "x86_64",
+            other => other,
+        }
+    );
+    fs::write(
+        adapter_root.join("installation-receipt.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "domain": "fixture",
+            "version": "1.2.3",
+            "source_url": "file://installed-fixture.tar.gz",
+            "sha256": "00".repeat(32),
+            "signing_key_id": "fixture-update-key",
+            "core_compatibility": ">=0.1.0, <0.2.0",
+            "platform": platform,
+            "resource_manifest": "adapter-resources.json",
+            "installed_at_unix_seconds": 1,
+            "bundle_sha256": installed_bundle_sha256,
+            "binary_path": null,
+            "binary_sha256": null,
+            "owned_resources": []
+        }))?,
+    )?;
+    let stable_archive = project.join("must-not-download-stable.tar.gz");
+    let prerelease_archive = project.join("must-not-download-prerelease.tar.gz");
+    let release = |version: &str, channel: &str, archive: &Path| {
+        serde_json::json!({
+            "version": version,
+            "channel": channel,
+            "core_compatibility": ">=0.1.0, <0.2.0",
+            "platforms": [{
+                "platform": platform,
+                "asset_url": format!("file://{}", archive.display()),
+                "archive_root": format!("fixture-{version}"),
+                "binary": "ldgr-fixture",
+                "sha256": "22".repeat(32),
+                "signature_url": format!("file://{}.sig", archive.display()),
+                "signing_key_id": "fixture-update-key",
+                "resource_manifest": "adapter-resources.json"
+            }]
+        })
+    };
+    let index_value = serde_json::json!({
+        "schema_version": 1,
+        "adapters": [{
+            "domain": "fixture",
+            "primary_namespace": "fixture",
+            "title": "Fixture adapter",
+            "classification": "open_source",
+            "releases": [
+                release("1.2.4", "stable", &stable_archive),
+                release("1.3.0-beta.1", "prerelease", &prerelease_archive)
+            ]
+        }]
+    });
+    let index = project.join("update-index.json");
+    let index_text = serde_json::to_string_pretty(&index_value)?;
+    fs::write(&index, &index_text)?;
+    let catalog = ldgr_core::release_index::parse_release_index(&index_text)?;
+    let signing_key = SigningKey::from_bytes(&[73; 32]);
+    fs::write(
+        format!("{}.sig", index.display()),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "algorithm": "Ed25519",
+            "key_id": "fixture-update-key",
+            "signature": STANDARD.encode(
+                signing_key
+                    .sign(&ldgr_core::update::catalog::canonical_adapter_catalog_bytes(&catalog)?)
+                    .to_bytes()
+            )
+        }))?,
+    )?;
+    let keyring = project.join("update-keyring.json");
+    fs::write(
+        &keyring,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "keys": [{
+                "key_id": "fixture-update-key",
+                "public_key": STANDARD.encode(signing_key.verifying_key().to_bytes())
+            }]
+        }))?,
+    )?;
+    Ok(UpdateCheckFixture {
+        home,
+        adapter_root,
+        index,
+        keyring,
+        stable_archive,
+        prerelease_archive,
+    })
+}
+
+fn materialize_update_apply_fixture(
+    project: &Path,
+    fixture: &UpdateCheckFixture,
+) -> anyhow::Result<()> {
+    let bundle = project.join("fixture-1.2.4");
+    write_adapter_namespace_fixture(&bundle, "fixture", "fixture", "[\"true\"]")?;
+    fs::create_dir_all(bundle.join("prompts"))?;
+    fs::write(bundle.join("prompts/new.md"), "new signed resource")?;
+    fs::write(
+        bundle.join("adapter-resources.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "resources": [{
+                "kind": "prompt",
+                "harnesses": ["codex"],
+                "source": "prompts/new.md",
+                "destination": "fixture-new.md"
+            }]
+        }))?,
+    )?;
+    fs::create_dir_all(fixture.home.join(".ldgr"))?;
+    fs::write(
+        fixture.home.join(".ldgr/config.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "selected_harnesses": ["codex"],
+            "installed": [{
+                "harness": "codex",
+                "prompt_paths": [fixture.home.join("codex-prompts")],
+                "skill_paths": [fixture.home.join("codex-skills")]
+            }]
+        }))?,
+    )?;
+    let old_resource = fixture.home.join("codex-prompts/fixture-old.md");
+    fs::create_dir_all(old_resource.parent().context("resource has no parent")?)?;
+    fs::write(&old_resource, "old signed resource")?;
+    let mut installed_receipt: serde_json::Value = serde_json::from_slice(&fs::read(
+        fixture.adapter_root.join("installation-receipt.json"),
+    )?)?;
+    installed_receipt["owned_resources"] = serde_json::json!([{
+        "path": old_resource.display().to_string(),
+        "sha256": format!("{:x}", Sha256::digest(fs::read(&old_resource)?))
+    }]);
+    fs::write(
+        fixture.adapter_root.join("installation-receipt.json"),
+        serde_json::to_vec_pretty(&installed_receipt)?,
+    )?;
+    let status = StdCommand::new("tar")
+        .args(["-czf"])
+        .arg(&fixture.stable_archive)
+        .arg("-C")
+        .arg(project)
+        .arg("fixture-1.2.4")
+        .status()?;
+    assert!(status.success());
+    let archive_bytes = fs::read(&fixture.stable_archive)?;
+    let signing_key = SigningKey::from_bytes(&[73; 32]);
+    fs::write(
+        format!("{}.sig", fixture.stable_archive.display()),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "algorithm": "Ed25519",
+            "key_id": "fixture-update-key",
+            "signature": STANDARD.encode(signing_key.sign(&archive_bytes).to_bytes())
+        }))?,
+    )?;
+    let mut index_value: serde_json::Value = serde_json::from_slice(&fs::read(&fixture.index)?)?;
+    index_value["adapters"][0]["releases"][0]["platforms"][0]["sha256"] =
+        serde_json::Value::String(format!("{:x}", Sha256::digest(&archive_bytes)));
+    let index_text = serde_json::to_string_pretty(&index_value)?;
+    fs::write(&fixture.index, &index_text)?;
+    let catalog = ldgr_core::release_index::parse_release_index(&index_text)?;
+    fs::write(
+        fixture.index.with_extension("json.sig"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "algorithm": "Ed25519",
+            "key_id": "fixture-update-key",
+            "signature": STANDARD.encode(
+                signing_key
+                    .sign(&ldgr_core::update::catalog::canonical_adapter_catalog_bytes(&catalog)?)
+                    .to_bytes()
+            )
+        }))?,
+    )?;
+    Ok(())
+}
+
+fn add_failing_second_update(
+    project: &Path,
+    fixture: &UpdateCheckFixture,
+) -> anyhow::Result<std::path::PathBuf> {
+    let platform = format!(
+        "{}-{}",
+        std::env::consts::OS,
+        match std::env::consts::ARCH {
+            "aarch64" => "aarch64",
+            "x86_64" => "x86_64",
+            other => other,
+        }
+    );
+    let installed = fixture.home.join(".ldgr/adapters/second");
+    write_adapter_namespace_fixture(&installed, "second", "second", "[\"true\"]")?;
+    let installed_digest = digest_update_fixture_bundle(&installed)?;
+    fs::write(
+        installed.join("installation-receipt.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "domain": "second",
+            "version": "1.2.3",
+            "source_url": "file://installed-second.tar.gz",
+            "sha256": "00".repeat(32),
+            "signing_key_id": "fixture-update-key",
+            "core_compatibility": ">=0.1.0, <0.2.0",
+            "platform": platform,
+            "resource_manifest": "adapter-resources.json",
+            "installed_at_unix_seconds": 1,
+            "bundle_sha256": installed_digest,
+            "binary_path": null,
+            "binary_sha256": null,
+            "owned_resources": []
+        }))?,
+    )?;
+
+    let binary_name = if cfg!(windows) {
+        "ldgr-second.cmd"
+    } else {
+        "ldgr-second"
+    };
+    let bundle = project.join("second-1.2.4");
+    write_adapter_namespace_fixture(&bundle, "second", "second", &format!("[\"{binary_name}\"]"))?;
+    let staged_binary = bundle.join(&platform).join(binary_name);
+    fs::create_dir_all(staged_binary.parent().context("binary has no parent")?)?;
+    fs::write(
+        &staged_binary,
+        if cfg!(windows) {
+            "@exit /b 7\r\n"
+        } else {
+            "#!/bin/sh\nexit 7\n"
+        },
+    )?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&staged_binary, fs::Permissions::from_mode(0o755))?;
+    }
+    fs::create_dir_all(bundle.join("prompts"))?;
+    fs::write(bundle.join("prompts/new.md"), "second resource")?;
+    fs::write(
+        bundle.join("adapter-resources.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "resources": [{
+                "kind": "prompt",
+                "harnesses": ["codex"],
+                "source": "prompts/new.md",
+                "destination": "second-new.md"
+            }]
+        }))?,
+    )?;
+    let archive = project.join("second-1.2.4.tar.gz");
+    let status = StdCommand::new("tar")
+        .args(["-czf"])
+        .arg(&archive)
+        .arg("-C")
+        .arg(project)
+        .arg("second-1.2.4")
+        .status()?;
+    assert!(status.success());
+    let archive_bytes = fs::read(&archive)?;
+    let signing_key = SigningKey::from_bytes(&[73; 32]);
+    let signature = project.join("second-1.2.4.tar.gz.sig");
+    fs::write(
+        &signature,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "algorithm": "Ed25519",
+            "key_id": "fixture-update-key",
+            "signature": STANDARD.encode(signing_key.sign(&archive_bytes).to_bytes())
+        }))?,
+    )?;
+    let mut index_value: serde_json::Value = serde_json::from_slice(&fs::read(&fixture.index)?)?;
+    index_value["adapters"]
+        .as_array_mut()
+        .context("adapter fixture catalog is not an array")?
+        .push(serde_json::json!({
+            "domain": "second",
+            "primary_namespace": "second",
+            "title": "Second fixture adapter",
+            "classification": "open_source",
+            "releases": [{
+                "version": "1.2.4",
+                "channel": "stable",
+                "core_compatibility": ">=0.1.0, <0.2.0",
+                "platforms": [{
+                    "platform": platform,
+                    "asset_url": format!("file://{}", archive.display()),
+                    "archive_root": "second-1.2.4",
+                    "binary": binary_name,
+                    "sha256": format!("{:x}", Sha256::digest(&archive_bytes)),
+                    "signature_url": format!("file://{}", signature.display()),
+                    "signing_key_id": "fixture-update-key",
+                    "resource_manifest": "adapter-resources.json"
+                }]
+            }]
+        }));
+    let index_text = serde_json::to_string_pretty(&index_value)?;
+    fs::write(&fixture.index, &index_text)?;
+    let catalog = ldgr_core::release_index::parse_release_index(&index_text)?;
+    fs::write(
+        fixture.index.with_extension("json.sig"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "algorithm": "Ed25519",
+            "key_id": "fixture-update-key",
+            "signature": STANDARD.encode(
+                signing_key
+                    .sign(&ldgr_core::update::catalog::canonical_adapter_catalog_bytes(&catalog)?)
+                    .to_bytes()
+            )
+        }))?,
+    )?;
+    Ok(installed)
+}
+
+fn write_local_source_update_fixture(
+    project: &Path,
+) -> anyhow::Result<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)> {
+    let home = project.join(".ldgr/test-empty-home");
+    let source = project.join("local-source");
+    let installed = home.join(".ldgr/adapters/local");
+    write_adapter_namespace_fixture(&source, "local", "local", "[\"true\"]")?;
+    write_adapter_namespace_fixture(&installed, "local", "local", "[\"true\"]")?;
+    fs::create_dir_all(source.join("src"))?;
+    fs::write(
+        source.join("Cargo.toml"),
+        "[package]\nname='ldgr-local-adapter'\nversion='0.0.0'\nedition='2021'\n",
+    )?;
+    fs::write(
+        source.join("src/main.rs"),
+        r#"use std::{env, fs, path::{Path, PathBuf}};
+
+fn copy_tree(source: &Path, target: &Path) {
+    fs::create_dir_all(target).unwrap();
+    for entry in fs::read_dir(source).unwrap() {
+        let entry = entry.unwrap();
+        let destination = target.join(entry.file_name());
+        if entry.path().is_dir() {
+            copy_tree(&entry.path(), &destination);
+        } else {
+            fs::copy(entry.path(), destination).unwrap();
+        }
+    }
+}
+
+fn main() {
+    let args = env::args().collect::<Vec<_>>();
+    let index = args.iter().position(|arg| arg == "--install-root").unwrap();
+    let install_root = PathBuf::from(&args[index + 1]);
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    fs::create_dir_all(&install_root).unwrap();
+    fs::copy(source.join("adapter.toml"), install_root.join("adapter.toml")).unwrap();
+    copy_tree(&source.join("prompts"), &install_root.join("prompts"));
+    copy_tree(&source.join("templates"), &install_root.join("templates"));
+}
+"#,
+    )?;
+    let source_digest = digest_local_source_fixture(&source)?;
+    let installed_files = owned_fixture_files(&installed)?;
+    let marker = home.join(".ldgr/installed-adapters/local");
+    fs::create_dir_all(marker.parent().context("marker has no parent")?)?;
+    fs::write(
+        &marker,
+        format!(
+            "install_root={}\ninstall_kind=local_source\n",
+            installed.display()
+        ),
+    )?;
+    let file_digest = |path: &Path| -> anyhow::Result<String> {
+        Ok(format!("{:x}", Sha256::digest(fs::read(path)?)))
+    };
+    fs::write(
+        installed.join("installation-receipt.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "install_kind": "local_source",
+            "domain": "local",
+            "installed_at_unix_seconds": 1,
+            "source": {
+                "package": "ldgr-local-adapter",
+                "bundle_root": source.display().to_string(),
+                "cargo_manifest": source.join("Cargo.toml").display().to_string(),
+                "bundle_sha256": source_digest
+            },
+            "manifest_digests": {
+                "source_adapter_manifest_sha256": file_digest(&source.join("adapter.toml"))?,
+                "source_cargo_manifest_sha256": file_digest(&source.join("Cargo.toml"))?,
+                "installed_adapter_manifest_sha256": file_digest(&installed.join("adapter.toml"))?,
+                "source_resource_manifest_sha256": null,
+                "installed_resource_manifest_sha256": null
+            },
+            "installer_invocation": [],
+            "executable_invocations": [],
+            "installed_files": installed_files,
+            "owned_resources": [],
+            "ownership": {
+                "install_root": installed.display().to_string(),
+                "marker_path": marker.display().to_string(),
+                "source_checkout_owned": false,
+                "generated_paths": ["source-target"],
+                "external_resource_roots": []
+            },
+            "verified_release": false
+        }))?,
+    )?;
+    Ok((home, source, installed))
+}
+
+fn owned_fixture_files(root: &Path) -> anyhow::Result<Vec<serde_json::Value>> {
+    fn collect(
+        root: &Path,
+        current: &Path,
+        result: &mut Vec<serde_json::Value>,
+    ) -> anyhow::Result<()> {
+        for entry in fs::read_dir(current)? {
+            let path = entry?.path();
+            if path.is_dir() {
+                collect(root, &path, result)?;
+            } else if path.is_file() {
+                result.push(serde_json::json!({
+                    "path": path.strip_prefix(root)?.to_string_lossy().replace('\\', "/"),
+                    "sha256": format!("{:x}", Sha256::digest(fs::read(&path)?))
+                }));
+            }
+        }
+        Ok(())
+    }
+    let mut result = Vec::new();
+    collect(root, root, &mut result)?;
+    result.sort_by(|left, right| left["path"].as_str().cmp(&right["path"].as_str()));
+    Ok(result)
+}
+
+fn digest_local_source_fixture(root: &Path) -> anyhow::Result<String> {
+    fn collect(
+        root: &Path,
+        current: &Path,
+        files: &mut Vec<(String, Vec<u8>)>,
+    ) -> anyhow::Result<()> {
+        for entry in fs::read_dir(current)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir()
+                && matches!(
+                    entry.file_name().to_str(),
+                    Some("target" | "source-target" | ".git")
+                )
+            {
+                continue;
+            }
+            if path.is_dir() {
+                collect(root, &path, files)?;
+            } else if path.is_file() {
+                files.push((
+                    path.strip_prefix(root)?
+                        .to_string_lossy()
+                        .replace('\\', "/"),
+                    fs::read(path)?,
+                ));
+            }
+        }
+        Ok(())
+    }
+    let mut files = Vec::new();
+    collect(root, root, &mut files)?;
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut hasher = Sha256::new();
+    for (relative, bytes) in files {
+        hasher.update(relative.as_bytes());
+        hasher.update([0]);
+        hasher.update(bytes);
+        hasher.update([0]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn digest_update_fixture_bundle(root: &Path) -> anyhow::Result<String> {
+    fn collect(
+        root: &Path,
+        current: &Path,
+        files: &mut Vec<(String, Vec<u8>)>,
+    ) -> anyhow::Result<()> {
+        for entry in fs::read_dir(current)? {
+            let path = entry?.path();
+            if path.is_dir() {
+                collect(root, &path, files)?;
+            } else if path.is_file() {
+                files.push((
+                    path.strip_prefix(root)?
+                        .to_string_lossy()
+                        .replace('\\', "/"),
+                    fs::read(path)?,
+                ));
+            }
+        }
+        Ok(())
+    }
+    let mut files = Vec::new();
+    collect(root, root, &mut files)?;
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut hasher = Sha256::new();
+    for (relative, bytes) in files {
+        hasher.update(relative.as_bytes());
+        hasher.update([0]);
+        hasher.update(bytes);
+        hasher.update([0]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn write_core_update_check_fixture(
+    project: &Path,
+) -> anyhow::Result<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)> {
+    fs::create_dir_all(project.join(".ldgr/test-empty-home"))?;
+    let platform = format!(
+        "{}-{}",
+        std::env::consts::OS,
+        match std::env::consts::ARCH {
+            "aarch64" => "aarch64",
+            "x86_64" => "x86_64",
+            other => other,
+        }
+    );
+    let archive = project.join("must-not-download-core.tar.gz");
+    let catalog_value = serde_json::json!({
+        "schema_version": 1,
+        "release_keys": [],
+        "releases": [{
+            "version": "0.1.15",
+            "channel": "stable",
+            "minimum_updater_version": "0.1.14",
+            "core_commit": "1111111111111111111111111111111111111111",
+            "source_repository": "hydra-dynamix/ldgr-core",
+            "agentctl": {
+                "version": "0.1.3",
+                "repository": "hydra-dynamix/agentctl",
+                "commit": "2222222222222222222222222222222222222222"
+            },
+            "compatibility": {
+                "launcher_compatibility_schema": "ldgr.launcher-compatibility.v1",
+                "error_recovery_schema": 1,
+                "release_metadata_schema": 1
+            },
+            "platforms": [{
+                "platform": platform,
+                "archive_url": format!("file://{}", archive.display()),
+                "archive_root": "ldgr-core-0.1.15",
+                "sha256": "33".repeat(32),
+                "signature_url": format!("file://{}.sig", archive.display()),
+                "signing_key_id": "fixture-core-key"
+            }]
+        }]
+    });
+    let catalog_text = serde_json::to_string_pretty(&catalog_value)?;
+    let catalog = ldgr_core::update::catalog::parse_core_update_catalog(&catalog_text)?;
+    let signing_key = SigningKey::from_bytes(&[91; 32]);
+    let index = project.join("core-update-index.json");
+    fs::write(&index, &catalog_text)?;
+    fs::write(
+        format!("{}.sig", index.display()),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "algorithm": "Ed25519",
+            "key_id": "fixture-core-key",
+            "signature": STANDARD.encode(
+                signing_key
+                    .sign(&ldgr_core::update::catalog::canonical_catalog_bytes(&catalog)?)
+                    .to_bytes()
+            )
+        }))?,
+    )?;
+    let keyring = project.join("core-update-keyring.json");
+    fs::write(
+        &keyring,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "keys": [{
+                "key_id": "fixture-core-key",
+                "public_key": STANDARD.encode(signing_key.verifying_key().to_bytes())
+            }]
+        }))?,
+    )?;
+    Ok((index, keyring, archive))
 }
 
 fn write_startup_recovery_fixture(
@@ -5906,6 +7517,13 @@ fn downgrade_cli_fixture(connection: &Connection, legacy_version: i64) -> anyhow
             UPDATE schema_version SET version = 4 WHERE id = 1;
             "#,
         )?,
+        5 => connection.execute_batch(
+            r#"
+            UPDATE schema_component
+               SET contract_hash = 'sha256:39beaf2a23ce5b9099adc6dd9458887fde58b9a101fbc70da0b0690c10482158'
+             WHERE namespace = 'core';
+            "#,
+        )?,
         other => anyhow::bail!("unsupported legacy fixture version {other}"),
     }
     Ok(())
@@ -5945,7 +7563,7 @@ description = "Run a check."
 "#
         ),
     )?;
-    Ok(())
+    write_adapter_compatibility_fixture(dir, slug, 1, &[])
 }
 
 fn write_adapter_namespace_fixture(
@@ -5983,6 +7601,29 @@ usage = "ldgr {namespace} <args...>"
 summary = "Run {namespace} adapter commands."
 "#
         ),
+    )?;
+    write_adapter_compatibility_fixture(dir, slug, 1, &[])
+}
+
+fn write_adapter_compatibility_fixture(
+    dir: &Path,
+    slug: &str,
+    protocol: i32,
+    required_capabilities: &[&str],
+) -> anyhow::Result<()> {
+    fs::write(
+        dir.join("adapter-compatibility.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "adapter": slug,
+            "compatibility": {
+                "adapter_protocol_epoch": protocol,
+                "central_components": [],
+                "minimum_core_schema": 5,
+                "required_core_capabilities": required_capabilities,
+            },
+            "format": "ldgr.adapter-compatibility.v2",
+            "local_stores": [],
+        }))?,
     )?;
     Ok(())
 }

@@ -33,15 +33,19 @@ On native Windows, run this from PowerShell:
 irm https://raw.githubusercontent.com/hydra-dynamix/ldgr-core/main/scripts/install.ps1 | iex
 ```
 
-The installer detects the current OS/CPU, downloads the matching release archive,
-verifies its SHA-256 checksum when checksum tooling is available, and installs
-`ldgr` to `~/.local/bin` by default. Override with:
+The installer requires Python 3, verifies the signed Core catalog with an
+embedded Ed25519 trust root, checks the archive checksum and detached signature,
+binds RELEASE-METADATA.json, and installs paired `ldgr` and `agentctl`.
+It installs to `~/.local/bin` by default. Override with:
 
 ```sh
 LDGR_VERSION=0.1.9 LDGR_INSTALL_DIR="$HOME/bin" sh -c "$(curl -fsSL https://raw.githubusercontent.com/hydra-dynamix/ldgr-core/main/scripts/install.sh)"
 ```
 
 Source install remains available:
+Key rotation, release ordering, mirrors, and air-gapped installer inputs are
+documented in [docs/release-signing.md](docs/release-signing.md).
+
 
 ```sh
 cargo install --git https://github.com/hydra-dynamix/ldgr-core --locked --force --package ldgr-core
@@ -53,41 +57,69 @@ cargo install --path .
 
 SQLite is bundled; source fallback requires a recent stable Rust toolchain.
 
-Before an upgrade, `ldgr schema doctor` inspects the active schema, generated
-adapter contract set, pending migrations, and last verified backup without
-changing the database. Upgrade Core before adapters; Core applies the complete
-migration plan atomically and refuses unknown shapes or incompatible sidecars.
-See `docs/database-upgrade-and-recovery.md` in the LDGR repository for the
-backup and restore procedure.
+Before an upgrade, `ldgr schema doctor` inspects the active central schema,
+registered components, pending migrations, and last verified backup without
+changing the database. Compatibility-v2 discovery separately evaluates adapter
+protocol, monotonic minimum Core schema, required capabilities, and optional
+central components; it does not require exact global release-set identity. See
+`docs/database-upgrade-and-recovery.md` in the LDGR integration repository for
+the backup, rollback, legacy diagnosis, and restore procedure.
+
+## Check for updates
+
+The top-level updater can authenticate the configured Core and adapter catalogs
+and resolve one compatibility-bound plan without changing the installation:
+
+```sh
+ldgr update --check
+ldgr update --check --json
+ldgr update --check --core-only
+ldgr update --check --adapters-only
+ldgr update --check --adapter research --adapter conduct
+ldgr update --check --prerelease
+ldgr update --check --offline
+```
+
+`--json` writes exactly one schema-versioned result to stdout; diagnostics stay
+on stderr. Check mode may update the user-level check cache under `~/.ldgr`, but
+never downloads release archives, runs installers, or changes installed files
+or the current project. Apply with `ldgr update` (or deliberate non-interactive
+`ldgr update --yes`): Core stages and verifies the whole plan before mutation
+and rolls back Core/agentctl, adapter bundles, resources, receipts, and central
+database bytes together on failure. `--core-only` cannot bypass an incompatible
+retained adapter.
 
 ## Numerical sequence telemetry
 
-LDGR can optionally share numerical state-transition sequences for research.
-Collection is disabled until an explicit telemetry choice is recorded. The first
-interactive `ldgr install` asks for Yes or No with no default; non-interactive
-installs must pass `--telemetry enable` or `--telemetry disable` because `--yes`
-is not telemetry consent. Later installs remember the stored decision.
+LDGR can share privacy-minimized numerical constructions for research.
+Anonymous construction telemetry is enabled by default and can be opted out at
+any time. Installation never prompts for telemetry and `--telemetry disable`
+records an opt-out. Experience donation is separate, non-anonymous, disabled by
+default, and requires `ldgr telemetry donation enable`.
 
-When enabled, Core buffers only committed terminal sequences as bare JSON integer
-arrays under `~/.ldgr/telemetry-pending/<protocol>/`. The released v1 protocols
-are `core-work/v1` and `research-workflow/v1`; adapters inherit Core consent and
-must use Core-owned buffering and transmission.
+Core maps raw local command/run data immediately into a finite ontology and
+stores only consolidated numerical construction keys and bucketed counts. A
+`command-experience/v1` construction is suppressed below local support five,
+released once per seven-day window, and subject to a 20-construction window cap.
+Pending wire payloads remain bare JSON integer arrays under
+`~/.ldgr/telemetry-pending/<protocol>/`.
 
 ```sh
 ldgr telemetry status
 ldgr telemetry preview
+ldgr telemetry transmit
 ldgr telemetry transmit --collector https://collector.example
 ldgr telemetry transmit --collector https://collector.example --root-ca-pem /path/to/ca.pem --max-delay-ms 30000 --timeout-ms 10000
 ldgr telemetry disable
+ldgr telemetry donation status
 ```
 
-`preview` prints the exact raw arrays and destination endpoints without sending
-them. `transmit` is best-effort, HTTPS-only, and can also read the collector
-origin from `LDGR_TELEMETRY_COLLECTOR`; failed sends are retained locally and do
-not affect ordinary LDGR commands. `disable` requires no network request, deletes
-unsent local payloads, and sends no final event. `LDGR_TELEMETRY=off` disables
-collection and transmission for the current process without changing the stored
-choice.
+`preview` performs the release check and prints exact raw arrays, endpoints, and
+decoded command constructions without sending them. `transmit` is best-effort,
+HTTPS-only, and resolves its origin from the flag, environment, then
+`https://ldgr.run`. Failed sends are retained and never affect ordinary commands.
+`disable` requires no network request, deletes pending payloads and local
+construction aggregates, and sends no final event.
 
 Already-ingested sequences cannot be individually located for deletion because
 the collector intentionally receives and stores no user, installation, request,

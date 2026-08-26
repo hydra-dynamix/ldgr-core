@@ -1,0 +1,119 @@
+name: Bootstrap signed Core catalog
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: "Type BOOTSTRAP-CORE-CATALOG to authorize the one-time ceremony"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: core-catalog-bootstrap
+  cancel-in-progress: false
+
+jobs:
+  bootstrap:
+    name: Bootstrap historical signed Core catalog
+    if: inputs.confirmation == 'BOOTSTRAP-CORE-CATALOG'
+    runs-on: ubuntu-latest
+    environment: core-release-signing
+    env:
+      GH_TOKEN: ${{ github.token }}
+      CATALOG_TOKEN: ${{ secrets.LDGR_CATALOG_REPOSITORY_TOKEN }}
+      LDGR_CATALOG_SIGNING_KEY: ${{ secrets.LDGR_CATALOG_SIGNING_KEY }}
+      LDGR_ARCHIVE_SIGNING_KEY: ${{ secrets.LDGR_CATALOG_SIGNING_KEY }}
+      INVENTORY: release/core-catalog-bootstrap-v1.json
+      KEY_ID: ldgr-release-2026-01
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Checkout empty catalog target
+        uses: actions/checkout@v4
+        with:
+          repository: hydra-dynamix/ldgr-releases
+          token: ${{ env.CATALOG_TOKEN }}
+          path: catalog-repository
+
+      - name: Require the official protected secrets and empty target
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$CATALOG_TOKEN"
+          test -n "$LDGR_CATALOG_SIGNING_KEY"
+          test ! -e catalog-repository/core-index.json
+          test ! -e catalog-repository/core-index.json.sig
+          test "$(jq -r '.keys[] | select(.key_id == env.KEY_ID) | .public_key' release-keyring.json)" = \
+            "3wI34tu3PrqWp6VdNrNsFfX1W5PWSeQ3vsR04B69d+I="
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify immutable GitHub provenance and download reviewed assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist candidate
+          repository="$(jq -r '.release_repository' "$INVENTORY")"
+          while IFS=$'\t' read -r release_id tag tag_commit; do
+            release="$(gh api "repos/$repository/releases/$release_id")"
+            test "$(jq -r .tag_name <<<"$release")" = "$tag"
+            test "$(jq -r .target_commitish <<<"$release")" = "$tag_commit"
+            test "$(gh api "repos/$repository/git/ref/tags/$tag" --jq .object.sha)" = "$tag_commit"
+          done < <(jq -r '.releases[] | [.release_id,.tag,.tag_commit] | @tsv' "$INVENTORY")
+          while IFS=$'\t' read -r tag asset_id name size digest; do
+            metadata="$(gh api "repos/$repository/releases/assets/$asset_id")"
+            test "$(jq -r .name <<<"$metadata")" = "$name"
+            test "$(jq -r .size <<<"$metadata")" = "$size"
+            test "$(jq -r '.digest | sub("^sha256:"; "")' <<<"$metadata")" = "$digest"
+            test "$(jq -r .browser_download_url <<<"$metadata")" = \
+              "https://github.com/$repository/releases/download/$tag/$name"
+            gh api "repos/$repository/releases/assets/$asset_id" \
+              -H 'Accept: application/octet-stream' > "dist/$name"
+          done < <(jq -r '.releases[] as $release | $release.provenance[] |
+            [$release.tag,.archive_asset_id,.archive_name,.archive_size,.archive_sha256],
+            [$release.tag,.checksum_asset_id,.checksum_name,.checksum_size,.checksum_sha256] | @tsv' "$INVENTORY")
+
+      - name: Sign archive bytes and canonical catalog bytes
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo run --locked --features release-tooling --bin ldgr-release -- \
+            --bootstrap-inventory "$INVENTORY" \
+            --trusted-keyring release-keyring.json \
+            --dist dist \
+            --output-catalog candidate/core-index.json \
+            --output-signature candidate/core-index.json.sig \
+            --catalog-key-id "$KEY_ID" \
+            --archive-key-id "$KEY_ID"
+
+      - name: Upload every archive signature before catalog activation
+        shell: bash
+        run: |
+          set -euo pipefail
+          while IFS=$'\t' read -r tag archive; do
+            gh release upload "$tag" "dist/$archive.sig" --repo "$GITHUB_REPOSITORY" --clobber
+            gh release download "$tag" --repo "$GITHUB_REPOSITORY" \
+              --pattern "$archive.sig" --dir hosted-signatures --clobber
+            cmp "dist/$archive.sig" "hosted-signatures/$archive.sig"
+          done < <(jq -r '.releases[] as $release | $release.provenance[] |
+            [$release.tag,.archive_name] | @tsv' "$INVENTORY")
+
+      - name: Publish the independently verified catalog last
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp candidate/core-index.json catalog-repository/core-index.json
+          cp candidate/core-index.json.sig catalog-repository/core-index.json.sig
+          cd catalog-repository
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add core-index.json core-index.json.sig
+          git diff --cached --check
+          git commit -m "release(core): bootstrap signed catalog"
+          git push origin HEAD:main

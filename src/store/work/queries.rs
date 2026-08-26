@@ -298,6 +298,27 @@ fn unblocked_slugs(connection: &Connection, work_item_id: i64) -> anyhow::Result
     Ok(rows)
 }
 
+pub fn oldest_active_run(connection: &Connection) -> anyhow::Result<Option<ClaimedRun>> {
+    let run_id = connection
+        .query_row(
+            "SELECT id
+             FROM run
+             WHERE status = 'running'
+             ORDER BY started_at, id
+             LIMIT 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .context("failed to read oldest active run")?;
+    let Some(run_id) = run_id else {
+        return Ok(None);
+    };
+    let run = get_run_by_id(connection, run_id)?;
+    let work_item = get_work_item_by_id(connection, run.work_item_id)?;
+    Ok(Some(ClaimedRun { work_item, run }))
+}
+
 pub fn oldest_running_work_item(connection: &Connection) -> anyhow::Result<Option<WorkItem>> {
     let active_run_work_item = connection
         .query_row(

@@ -21,7 +21,7 @@ pub enum TelemetryInstallChoice {
 
 #[derive(Debug, Args)]
 #[command(
-    after_help = "Examples:\n  ldgr install\n  ldgr install --harness pi --harness claude --adapter conduct --yes --telemetry disable\n  ldgr install --yes --no-agentctl --telemetry enable\n  ldgr install adapter code --yes\n\nThe first interactive install requires an explicit telemetry Yes or No choice with no default. Non-interactive installs must pass --telemetry enable or --telemetry disable; --yes is not telemetry consent. The decision is remembered and later installs do not ask again. Without --harness, the installer asks interactively and defaults to Pi. Multiple harnesses may be selected. In interactive mode the installer also offers adapter bundle selection. The selected harness config is recorded in ~/.ldgr/config.toml with a legacy config.json compatibility mirror. agentctl is installed when missing unless --no-agentctl is passed."
+    after_help = "Examples:\n  ldgr install\n  ldgr install --harness pi --harness claude --adapter conduct --yes --telemetry disable\n  ldgr install --yes --no-agentctl\n  ldgr install adapter code --yes\n\nPrivacy-minimized anonymous construction telemetry is enabled by default and can be opted out with --telemetry disable or `ldgr telemetry disable`. Experience donation is a separate opt-in. Without --harness, the installer asks interactively and defaults to Pi. Multiple harnesses may be selected. In interactive mode the installer also offers adapter bundle selection. The selected harness config is recorded in ~/.ldgr/config.toml with a legacy config.json compatibility mirror. agentctl is installed when missing unless --no-agentctl is passed."
 )]
 pub struct InstallArgs {
     #[command(subcommand)]
@@ -87,7 +87,7 @@ pub struct InstallAdapterArgs {
 
 #[derive(Debug, Args)]
 #[command(
-    after_help = "Examples:\n  ldgr context --brief\n  ldgr context --json\n\nContext is the expanded handoff view. Start with `ldgr status`; use context when you need deeper history. Opening a recognized older database runs the Core-owned migration and reports its verified backup."
+    after_help = "Examples:\n  ldgr context --brief\n  ldgr context --json\n\nContext is the expanded handoff view. Start with `ldgr status`; use context when you need deeper history. Before reading work, context diagnoses the central database, applies recognized Core migrations with a verified backup, and reports database_alignment in JSON. Unknown or unsafe states remain unchanged and return schema-doctor recovery details."
 )]
 pub struct ContextArgs {
     #[arg(long)]
@@ -108,7 +108,7 @@ pub struct ContextArgs {
 
 #[derive(Debug, Args)]
 #[command(
-    after_help = "Examples:\n  ldgr status\n  ldgr status --program audit --priority P0\n  ldgr status --full\n  ldgr status --json\n\nStatus does not change work state. Opening a recognized older database runs the Core-owned migration and reports its verified backup. Default output is scoped to actionable work; --full includes global history. To change work state, use `ldgr work status set <work> <status>`."
+    after_help = "Examples:\n  ldgr status\n  ldgr status --program audit --priority P0\n  ldgr status --full\n  ldgr status --json\n\nStatus does not change work state. Before reading work, status diagnoses the central database, applies recognized Core migrations with a verified backup, and reports database_alignment in JSON. Unknown or unsafe states remain unchanged and return schema-doctor recovery details. Default output is scoped to actionable work; --full includes global history. To change work state, use `ldgr work status set <work> <status>`."
 )]
 pub struct StatusArgs {
     #[arg(long)]
@@ -173,7 +173,7 @@ pub struct WorkflowArgs {
 
 #[derive(Debug, Args)]
 #[command(
-    after_help = "Examples:\n  ldgr config show\n  ldgr config set interview-depth low\n\nReads and writes ~/.ldgr/config.json. Unknown keys in that file are preserved."
+    after_help = "Examples:\n  ldgr config show\n  ldgr config set interview-depth low\n  ldgr config set updates.check never\n  ldgr config set updates.interval-hours 12\n  ldgr config set updates.channel prerelease\n  ldgr config set updates.include-adapters false\n  ldgr config set updates.notify false\n\nReads and writes canonical ~/.ldgr/config.toml plus the legacy config.json mirror. Unknown extensions are preserved."
 )]
 pub struct ConfigArgs {
     #[command(subcommand)]
@@ -196,7 +196,7 @@ pub struct ConfigShowArgs {
 
 #[derive(Debug, Args)]
 pub struct ConfigSetArgs {
-    /// Configuration key. Currently: interview-depth.
+    /// Configuration key: interview-depth or an updates.* key shown in config --help.
     pub key: String,
     /// Value to set.
     pub value: String,
@@ -225,10 +225,48 @@ pub struct WebArgs {
     pub control_token: Option<String>,
 }
 
+const LOOP_HELP: &str = "Examples:\n  ldgr loop run --prompt prompts/loop-prompt.md --agent agentctl\n  ldgr loop run --prompt-slug implementation-loop --until-empty\n  ldgr loop run --bundle release --prompt-role implementation-loop --detach\n\n`loop run` renders durable LDGR context into a selected prompt and executes bounded agent sessions. Run `ldgr loop run --help` for prompt sources, active-run resumption, iteration controls, artifacts, completion audits, and detailed examples.";
+
+const LOOP_RUN_HELP: &str = r#"Execution model:
+  * Choose exactly one prompt source: --prompt, --prompt-slug, or --bundle.
+  * If a run is already active, the loop resumes that run and its work item instead
+    of claiming another item. A running work item with no active run still requires
+    a decision or lifecycle correction before new work can start.
+  * With no active run, the loop atomically claims the next ready pending item.
+  * Every cycle renders fresh LDGR context, invokes one fresh agent process, records
+    prompt provenance and process output, and finishes the run if it is still active.
+
+Agents and output:
+  --agent agentctl is the default. Use --agent-argv with a JSON argv array for a
+  custom process; the rendered prompt is sent on stdin. --stream-agent-output tees
+  stdout/stderr while retaining full artifact files. --summary-agent or
+  --summary-argv adds a separate one-shot summary and --summary-log selects its log.
+  --agent-timeout-seconds 0 disables the timeout.
+
+Iteration and background execution:
+  The default is one cycle. --max-iterations N bounds repeated cycles;
+  --until-empty continues until the queue drains, a subprocess fails, or the loop
+  blocks. --detach launches the same loop in the background and writes stdout/stderr
+  under .ldgr/logs. --dry-run renders and records artifacts without spawning agents.
+
+Project completion:
+  --project-complete-requested requires --audit-argv. The fresh audit runs before
+  the worker, and both processes must succeed for a successful loop result.
+
+Examples:
+  ldgr loop run --prompt prompts/loop-prompt.md
+  ldgr loop run --prompt-slug implementation-loop --agent agentctl
+  ldgr loop run --bundle release --prompt-role implementation-loop --until-empty
+  ldgr loop run --prompt prompts/loop-prompt.md --agent-argv '["my-agent","--batch"]'
+  ldgr loop run --prompt prompts/loop-prompt.md --dry-run
+  ldgr loop run --prompt prompts/loop-prompt.md --until-empty --summary-agent agentctl
+  ldgr loop run --prompt prompts/loop-prompt.md --until-empty --detach
+  ldgr loop run --prompt prompts/loop-prompt.md --project-complete-requested \
+    --audit-argv '["my-auditor","--fresh"]'
+"#;
+
 #[derive(Debug, Args)]
-#[command(
-    after_help = "Examples:\n  ldgr loop run --prompt prompts/loop-prompt.md --agent agentctl\n  ldgr loop run --prompt prompts/loop-prompt.md --agent agentctl --until-empty --summary-agent agentctl\n  ldgr loop run --prompt prompts/loop-prompt.md --agent agentctl --until-empty --detach\n  ldgr loop run --prompt prompts/loop-prompt.md --dry-run\n  ldgr loop run --prompt prompts/loop-prompt.md --agent-argv '[\"my-agent\"]'\n\nLoop run executes bounded cycles from pending work items. Each cycle is a fresh agent invocation that rehydrates from LDGR context. Use --until-empty to keep launching one fresh cycle at a time until no pending work remains or the loop blocks. Use --detach for a background process whose stdout and stderr are written under the LDGR logs directory."
-)]
+#[command(after_help = LOOP_HELP)]
 pub struct LoopArgs {
     #[command(subcommand)]
     pub command: LoopCommand,
@@ -241,6 +279,7 @@ pub enum LoopCommand {
 }
 
 #[derive(Debug, Args)]
+#[command(after_help = LOOP_RUN_HELP)]
 pub struct LoopRunArgs {
     /// Editable prompt document used as the model system prompt template.
     #[arg(long, conflicts_with_all = ["prompt_slug", "bundle"])]

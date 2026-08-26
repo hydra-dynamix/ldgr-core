@@ -1,3 +1,4 @@
+pub mod adapter_compatibility;
 pub mod adapter_manifest;
 pub mod adapter_registry;
 pub mod claims;
@@ -13,4 +14,5 @@ pub mod release_index;
 pub mod store;
 pub mod telemetry;
 pub mod tool_runner;
+pub mod update;
 pub mod web;

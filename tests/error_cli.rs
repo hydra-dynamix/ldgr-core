@@ -57,6 +57,82 @@ fn record_structured(
 }
 
 #[test]
+fn shorthand_error_report_generates_metadata_and_links_the_active_run() -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    command(&project)?.arg("init").assert().success();
+    command(&project)?
+        .args([
+            "work",
+            "create",
+            "fix-tests",
+            "--title",
+            "Fix tests",
+            "--description",
+            "Repair the focused test failure",
+        ])
+        .assert()
+        .success();
+    command(&project)?
+        .args(["run", "start", "fix-tests", "--command", "repair tests"])
+        .assert()
+        .success();
+
+    let output = command(&project)?
+        .args([
+            "error",
+            "cargo-test",
+            "validation",
+            "focused",
+            "test",
+            "still",
+            "fails",
+        ])
+        .output()?;
+    anyhow::ensure!(
+        output.status.success(),
+        "shorthand error command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(stdout.contains("command=cargo-test type=validation"));
+    assert!(stdout.contains("work=fix-tests"));
+    assert!(stdout.contains("message: focused test still fails"));
+
+    let connection = Connection::open(project.path().join(".ldgr/ldgr.db"))?;
+    let occurrence = connection.query_row(
+        "SELECT class, domain, code, summary, json_extract(details_json, '$.command')
+         FROM error_occurrence",
+        [],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        },
+    )?;
+    assert_eq!(
+        occurrence,
+        (
+            "validation-failure".to_owned(),
+            "agent.command".to_owned(),
+            "validation".to_owned(),
+            "focused test still fails".to_owned(),
+            "cargo-test".to_owned(),
+        )
+    );
+    let relation_count: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM error_relation WHERE relation_kind = 'affected'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(relation_count, 2);
+    Ok(())
+}
+
+#[test]
 fn durable_error_cli_covers_classes_replay_lifecycle_and_relations() -> anyhow::Result<()> {
     let project = TempDir::new()?;
     command(&project)?.arg("init").assert().success();

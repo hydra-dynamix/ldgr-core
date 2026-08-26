@@ -1,0 +1,242 @@
+{
+  "release_repository": "hydra-dynamix/ldgr-core",
+  "releases": [
+    {
+      "provenance": [
+        {
+          "archive_asset_id": 505606069,
+          "archive_name": "ldgr-core-0.1.14-linux-x86_64.tar.gz",
+          "archive_sha256": "db008faf69f04a8cd4f9844e46d9611da54c107023b68051675b986102db14a6",
+          "archive_size": 6222844,
+          "checksum_asset_id": 505606082,
+          "checksum_name": "ldgr-core-0.1.14-linux-x86_64.tar.gz.sha256",
+          "checksum_sha256": "d022adbc38487fda9c4d3c4d4cd420e0cb13cbe17a97be77760f7cf66d3ec472",
+          "checksum_size": 108,
+          "platform": "linux-x86_64"
+        },
+        {
+          "archive_asset_id": 505606071,
+          "archive_name": "ldgr-core-0.1.14-linux-aarch64.tar.gz",
+          "archive_sha256": "07dd0163079085cb0db03441f48320e733f0ebd63baf8eaf2650a2cf2715b409",
+          "archive_size": 6148296,
+          "checksum_asset_id": 505606079,
+          "checksum_name": "ldgr-core-0.1.14-linux-aarch64.tar.gz.sha256",
+          "checksum_sha256": "0a974b90805350a723bfb4bc9ae14568630f56914fa54efc1317f4716f5ac3a0",
+          "checksum_size": 109,
+          "platform": "linux-aarch64"
+        },
+        {
+          "archive_asset_id": 505606068,
+          "archive_name": "ldgr-core-0.1.14-macos-x86_64.tar.gz",
+          "archive_sha256": "211075eff5b65fe558ebf794eb0b40c04529756730ceb4f54ead71981efd311d",
+          "archive_size": 5895687,
+          "checksum_asset_id": 505606083,
+          "checksum_name": "ldgr-core-0.1.14-macos-x86_64.tar.gz.sha256",
+          "checksum_sha256": "1c72fe7892e7952ffe8ef00a68f411937d7540514d8fdeaa96b31cec745d50b1",
+          "checksum_size": 108,
+          "platform": "macos-x86_64"
+        },
+        {
+          "archive_asset_id": 505606070,
+          "archive_name": "ldgr-core-0.1.14-macos-aarch64.tar.gz",
+          "archive_sha256": "1b7ec97fc632955f0a78c937718ea9440cab2a3c207ad229b79f11d0b891c8d7",
+          "archive_size": 5606704,
+          "checksum_asset_id": 505606081,
+          "checksum_name": "ldgr-core-0.1.14-macos-aarch64.tar.gz.sha256",
+          "checksum_sha256": "e21d8658a3e4549e7545e6f005c2c7a015433e3e03170f0625a1019d6f535351",
+          "checksum_size": 109,
+          "platform": "macos-aarch64"
+        },
+        {
+          "archive_asset_id": 505606072,
+          "archive_name": "ldgr-core-0.1.14-windows-x86_64.tar.gz",
+          "archive_sha256": "be909aa8e5fc465e9dcbc159cd3fe9bd1847a91c0fd9a84905073e22982854d1",
+          "archive_size": 5446887,
+          "checksum_asset_id": 505606084,
+          "checksum_name": "ldgr-core-0.1.14-windows-x86_64.tar.gz.sha256",
+          "checksum_sha256": "2c82251eca3a1992e616dfd05cce975c58a88032b019484652f1300797dfd2df",
+          "checksum_size": 110,
+          "platform": "windows-x86_64"
+        }
+      ],
+      "release": {
+        "agentctl": {
+          "commit": "aa5c007fd2335ad507f1f24e3460d8f531f863f3",
+          "repository": "hydra-dynamix/agentctl",
+          "version": "0.1.2"
+        },
+        "channel": "stable",
+        "compatibility": {
+          "adapter_compatibility": {
+            "legacy_profile": {
+              "components": [
+                {
+                  "migration_digest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                  "migration_sources": [],
+                  "minimum_core_schema": 5,
+                  "namespace": "bench",
+                  "schema_version": 1
+                },
+                {
+                  "migration_digest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                  "migration_sources": [],
+                  "minimum_core_schema": 5,
+                  "namespace": "code",
+                  "schema_version": 1
+                },
+                {
+                  "migration_digest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                  "migration_sources": [],
+                  "minimum_core_schema": 5,
+                  "namespace": "conduct",
+                  "schema_version": 1
+                },
+                {
+                  "migration_digest": "sha256:b8230dce6e78b58c75dbe0f69cf771276f513be4e72a8291c2a4965f5b777a35",
+                  "migration_sources": [
+                    "ldgr-core/src/store/schema.rs"
+                  ],
+                  "minimum_core_schema": 5,
+                  "namespace": "core",
+                  "schema_version": 5
+                },
+                {
+                  "migration_digest": "sha256:c6ccb9b2d2981ee82f02e915eb9d5be3c5b5a9e7d49ae256eae133b05e68e6fe",
+                  "migration_sources": [
+                    "ldgr-evidence/src/schema.rs"
+                  ],
+                  "minimum_core_schema": 5,
+                  "namespace": "evidence",
+                  "schema_version": 1
+                },
+                {
+                  "migration_digest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                  "migration_sources": [],
+                  "minimum_core_schema": 5,
+                  "namespace": "example",
+                  "schema_version": 1
+                },
+                {
+                  "migration_digest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                  "migration_sources": [],
+                  "minimum_core_schema": 5,
+                  "namespace": "explore",
+                  "schema_version": 1
+                },
+                {
+                  "migration_digest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                  "migration_sources": [],
+                  "minimum_core_schema": 5,
+                  "namespace": "private-commercial",
+                  "schema_version": 1
+                },
+                {
+                  "migration_digest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                  "migration_sources": [],
+                  "minimum_core_schema": 5,
+                  "namespace": "programbench",
+                  "schema_version": 1
+                },
+                {
+                  "migration_digest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                  "migration_sources": [],
+                  "minimum_core_schema": 5,
+                  "namespace": "recall",
+                  "schema_version": 1
+                },
+                {
+                  "migration_digest": "sha256:1795f5ad5d3dbb3b57b5f733beec88c7f7f2b394d85e10b1bfe97a826d21eda4",
+                  "migration_sources": [
+                    "ldgr-research/src/migrations.rs"
+                  ],
+                  "minimum_core_schema": 5,
+                  "namespace": "research",
+                  "schema_version": 4
+                },
+                {
+                  "migration_digest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                  "migration_sources": [],
+                  "minimum_core_schema": 5,
+                  "namespace": "security",
+                  "schema_version": 1
+                }
+              ],
+              "contract_hash": "sha256:39beaf2a23ce5b9099adc6dd9458887fde58b9a101fbc70da0b0690c10482158",
+              "core_schema_version": 5
+            },
+            "profile": {
+              "central_components": [],
+              "core_capabilities": [
+                "prompt.v1",
+                "telemetry.v1",
+                "work.v1"
+              ],
+              "core_schema_version": 5,
+              "format": "ldgr.core-compatibility.v2",
+              "supported_adapter_protocol_epochs": [
+                1
+              ]
+            },
+            "projected_database_components": []
+          },
+          "error_recovery_schema": 1,
+          "launcher_compatibility_schema": "ldgr.launcher-compatibility.v1",
+          "release_metadata_schema": 1
+        },
+        "core_commit": "5f0f818d25b3d3243f868cf59ad4218be82bf848",
+        "minimum_updater_version": "0.1.14",
+        "platforms": [
+          {
+            "archive_root": "ldgr-core-0.1.14",
+            "archive_url": "https://github.com/hydra-dynamix/ldgr-core/releases/download/v0.1.14/ldgr-core-0.1.14-linux-x86_64.tar.gz",
+            "platform": "linux-x86_64",
+            "sha256": "db008faf69f04a8cd4f9844e46d9611da54c107023b68051675b986102db14a6",
+            "signature_url": "https://github.com/hydra-dynamix/ldgr-core/releases/download/v0.1.14/ldgr-core-0.1.14-linux-x86_64.tar.gz.sig",
+            "signing_key_id": "ldgr-release-2026-01"
+          },
+          {
+            "archive_root": "ldgr-core-0.1.14",
+            "archive_url": "https://github.com/hydra-dynamix/ldgr-core/releases/download/v0.1.14/ldgr-core-0.1.14-linux-aarch64.tar.gz",
+            "platform": "linux-aarch64",
+            "sha256": "07dd0163079085cb0db03441f48320e733f0ebd63baf8eaf2650a2cf2715b409",
+            "signature_url": "https://github.com/hydra-dynamix/ldgr-core/releases/download/v0.1.14/ldgr-core-0.1.14-linux-aarch64.tar.gz.sig",
+            "signing_key_id": "ldgr-release-2026-01"
+          },
+          {
+            "archive_root": "ldgr-core-0.1.14",
+            "archive_url": "https://github.com/hydra-dynamix/ldgr-core/releases/download/v0.1.14/ldgr-core-0.1.14-macos-x86_64.tar.gz",
+            "platform": "macos-x86_64",
+            "sha256": "211075eff5b65fe558ebf794eb0b40c04529756730ceb4f54ead71981efd311d",
+            "signature_url": "https://github.com/hydra-dynamix/ldgr-core/releases/download/v0.1.14/ldgr-core-0.1.14-macos-x86_64.tar.gz.sig",
+            "signing_key_id": "ldgr-release-2026-01"
+          },
+          {
+            "archive_root": "ldgr-core-0.1.14",
+            "archive_url": "https://github.com/hydra-dynamix/ldgr-core/releases/download/v0.1.14/ldgr-core-0.1.14-macos-aarch64.tar.gz",
+            "platform": "macos-aarch64",
+            "sha256": "1b7ec97fc632955f0a78c937718ea9440cab2a3c207ad229b79f11d0b891c8d7",
+            "signature_url": "https://github.com/hydra-dynamix/ldgr-core/releases/download/v0.1.14/ldgr-core-0.1.14-macos-aarch64.tar.gz.sig",
+            "signing_key_id": "ldgr-release-2026-01"
+          },
+          {
+            "archive_root": "ldgr-core-0.1.14",
+            "archive_url": "https://github.com/hydra-dynamix/ldgr-core/releases/download/v0.1.14/ldgr-core-0.1.14-windows-x86_64.tar.gz",
+            "platform": "windows-x86_64",
+            "sha256": "be909aa8e5fc465e9dcbc159cd3fe9bd1847a91c0fd9a84905073e22982854d1",
+            "signature_url": "https://github.com/hydra-dynamix/ldgr-core/releases/download/v0.1.14/ldgr-core-0.1.14-windows-x86_64.tar.gz.sig",
+            "signing_key_id": "ldgr-release-2026-01"
+          }
+        ],
+        "source_repository": "hydra-dynamix/ldgr",
+        "version": "0.1.14"
+      },
+      "release_id": 366981856,
+      "tag": "v0.1.14",
+      "tag_commit": "5f0f818d25b3d3243f868cf59ad4218be82bf848"
+    }
+  ],
+  "schema_version": 1,
+  "supported_stable_versions": [
+    "0.1.14"
+  ]
+}

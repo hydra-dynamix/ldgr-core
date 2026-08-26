@@ -1,5 +1,6 @@
 pub mod args;
 pub mod commands;
+mod database_alignment;
 pub(crate) mod render;
 mod rust_toolchain;
 
@@ -15,7 +16,9 @@ use clap::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::adapter_registry::{AdapterCommandNamespace, AdapterRegistry};
+use crate::adapter_registry::{
+    AdapterCommandNamespace, AdapterOperationalState, AdapterRegistry, DiscoveredAdapter,
+};
 use crate::store::open_store;
 
 use args::*;
@@ -36,7 +39,7 @@ pub(crate) const CLI_DEFAULT_HELP_SECTIONS: &str = r#"Core loop:
   artifact add <run-id-or-work-slug> --path <file> --description <why-it-matters>
   artifact show <artifact-id>
   validation record <run-id-or-work-slug> --outcome <pass|fail|error|skipped> --rationale <why-if-skipped>
-  error record --occurrence-id <id> --producer <producer> --idempotency-key <key> ...
+  error <command> <task|validation|infrastructure|interruption|cancellation> <message>
   error list
   error context <error-id> [--occurrence-id <id>] [--limit 5]
   decision record <work-slug> --outcome continue --rationale <why> --next-slug <slug> --next-title <title> --next-description <description>
@@ -82,7 +85,10 @@ fn render_full_command_map() -> String {
 }
 
 fn render_command_paths(command: &clap::Command, parent: &[&str], output: &mut String) {
-    for subcommand in command.get_subcommands() {
+    for subcommand in command
+        .get_subcommands()
+        .filter(|subcommand| !subcommand.is_hide_set())
+    {
         let mut path = parent.to_vec();
         path.push(subcommand.get_name());
         output.push_str("  ");
@@ -123,6 +129,36 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    #[command(name = "__update-check-worker", hide = true)]
+    UpdateCheckWorker {
+        #[arg(long, hide = true)]
+        token: String,
+    },
+    #[cfg(windows)]
+    #[command(name = "__update-finalizer", hide = true)]
+    UpdateFinalizer {
+        #[arg(long, hide = true)]
+        parent_pid: u32,
+        #[arg(long, hide = true)]
+        plan: PathBuf,
+        #[arg(long, hide = true)]
+        token: String,
+    },
+    #[command(name = "__record-core-installation", hide = true)]
+    RecordCoreInstallation {
+        #[arg(long)]
+        home: PathBuf,
+        #[arg(long)]
+        agentctl_binary: PathBuf,
+        #[arg(long)]
+        release_metadata: PathBuf,
+        #[arg(long)]
+        archive_url: String,
+        #[arg(long)]
+        archive_sha256: String,
+        #[arg(long)]
+        signing_key_id: String,
+    },
     /// Negotiate the launcher/Core recovery protocol before worker startup.
     Compatibility {
         /// Agentctl semantic version requesting compatibility.
@@ -182,6 +218,8 @@ enum Command {
     Web(WebArgs),
     /// Run the prompt-driven autonomous event loop runtime.
     Loop(LoopArgs),
+    /// Check for compatibility-bound Core, agentctl, and adapter updates.
+    Update(UpdateArgs),
     /// Discover installed adapter manifests and command metadata.
     #[command(alias = "adapters")]
     Adapter(AdapterArgs),
@@ -223,6 +261,10 @@ where
             return Ok(());
         }
         Err(error) => {
+            if requests_machine_update_output(&args) {
+                error.print()?;
+                std::process::exit(2);
+            }
             if try_dispatch_adapter_namespace(&args)? {
                 return Ok(());
             }
@@ -232,7 +274,53 @@ where
             std::process::exit(2);
         }
     };
+    #[cfg(windows)]
+    if !matches!(cli.command, Some(Command::UpdateFinalizer { .. })) {
+        match crate::update::finalizer::recover_and_report_pending() {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(error) => {
+                eprintln!("warning: update startup recovery could not complete: {error:#}");
+            }
+        }
+    }
+    if should_run_startup_update_hook(&cli, &args) {
+        crate::update::startup::maybe_schedule_update_check();
+    }
     handle_cli(cli)
+}
+
+fn should_run_startup_update_hook(cli: &Cli, args: &[OsString]) -> bool {
+    if cli.full
+        || args.iter().any(|argument| {
+            matches!(
+                argument.to_str(),
+                Some("--help" | "-h" | "--version" | "-V")
+            )
+        })
+    {
+        return false;
+    }
+    #[cfg(windows)]
+    if matches!(cli.command, Some(Command::UpdateFinalizer { .. })) {
+        return false;
+    }
+    !matches!(
+        cli.command,
+        None | Some(Command::Update(_))
+            | Some(Command::UpdateCheckWorker { .. })
+            | Some(Command::RecordCoreInstallation { .. })
+    )
+}
+
+fn requests_machine_update_output(args: &[OsString]) -> bool {
+    first_command_arg_index(args).is_some_and(|index| {
+        args.get(index).and_then(|arg| arg.to_str()) == Some("update")
+            && args
+                .iter()
+                .skip(index + 1)
+                .any(|arg| arg.to_str() == Some("--json"))
+    })
 }
 
 pub fn command() -> clap::Command {
@@ -282,6 +370,49 @@ fn normalize_command_aliases(mut args: Vec<OsString>) -> Vec<OsString> {
     let Some(command) = args[command_index].to_str() else {
         return args;
     };
+    if command == "error" {
+        let known_subcommands = [
+            "report",
+            "record",
+            "list",
+            "show",
+            "context",
+            "occurrence",
+            "disposition",
+            "retry-check",
+            "acknowledge",
+            "resolve",
+            "accept",
+            "link",
+        ];
+        let error_type = args
+            .get(command_index + 2)
+            .and_then(|argument| argument.to_str());
+        let simple_types = [
+            "task",
+            "validation",
+            "infrastructure",
+            "infra",
+            "interruption",
+            "cancellation",
+            "cancel",
+        ];
+        let is_simple_type = error_type.is_some_and(|error_type| {
+            simple_types
+                .iter()
+                .any(|known| known.eq_ignore_ascii_case(error_type))
+        });
+        let first_argument = args
+            .get(command_index + 1)
+            .and_then(|argument| argument.to_str());
+        if first_argument.is_some_and(|argument| !known_subcommands.contains(&argument))
+            && is_simple_type
+            && args.get(command_index + 3).is_some()
+        {
+            args.insert(command_index + 1, OsString::from("report"));
+        }
+        return args;
+    }
     if command != "observation" {
         return args;
     }
@@ -376,6 +507,38 @@ fn handle_cli(cli: Cli) -> anyhow::Result<()> {
         return Ok(());
     };
     match command {
+        Command::UpdateCheckWorker { token } => {
+            commands::update::handle_startup_check_worker(&token)
+        }
+        #[cfg(windows)]
+        Command::UpdateFinalizer {
+            parent_pid,
+            plan,
+            token,
+        } => crate::update::finalizer::handle_finalizer(parent_pid, &plan, &token),
+        Command::RecordCoreInstallation {
+            home,
+            agentctl_binary,
+            release_metadata,
+            archive_url,
+            archive_sha256,
+            signing_key_id,
+        } => {
+            let current_exe = std::env::current_exe().context("failed to resolve current_exe")?;
+            crate::update::installation::write_official_installation_receipt(
+                &crate::update::installation::OfficialReceiptInput {
+                    home,
+                    current_exe,
+                    agentctl_binary,
+                    release_metadata_path: release_metadata,
+                    archive_url,
+                    archive_sha256,
+                    signing_key_id,
+                    previous_successful_plan_id: None,
+                },
+            )?;
+            Ok(())
+        }
         Command::Compatibility {
             agentctl_version,
             json,
@@ -397,32 +560,33 @@ fn handle_cli(cli: Cli) -> anyhow::Result<()> {
         Command::Prompt(args) => commands::prompts::handle_prompt(&open_store(&cli.db)?, args),
         Command::Bundle(args) => commands::prompts::handle_bundle(&open_store(&cli.db)?, args),
         Command::Status(args) => {
-            let (connection, migration) = crate::store::open_store_with_migration_info(&cli.db)?;
-            commands::ops::print_migration_notice(migration.as_ref());
+            let (connection, alignment) = database_alignment::align_existing_database(&cli.db)?;
+            database_alignment::print_migration_notice(&alignment);
             let recovery = crate::recovery::reconcile_startup(
                 &connection,
                 &crate::recovery::project_root_for_db(&cli.db),
             )?;
             crate::recovery::print_startup_recovery_report(&recovery);
-            commands::ops::handle_status(&connection, &cli.artifact_root, args)
+            commands::ops::handle_status(&connection, &cli.artifact_root, &alignment, args)
         }
         Command::Schema(args) => commands::ops::handle_schema(&cli.db, args),
         Command::Migrate(args) => commands::ops::handle_migrate(&cli.db, args),
         Command::Workflow(args) => commands::ops::handle_workflow(args),
         Command::Config(args) => commands::ops::handle_config(args),
         Command::Context(args) => {
-            let (connection, migration) = crate::store::open_store_with_migration_info(&cli.db)?;
-            commands::ops::print_migration_notice(migration.as_ref());
+            let (connection, alignment) = database_alignment::align_existing_database(&cli.db)?;
+            database_alignment::print_migration_notice(&alignment);
             let recovery = crate::recovery::reconcile_startup(
                 &connection,
                 &crate::recovery::project_root_for_db(&cli.db),
             )?;
             crate::recovery::print_startup_recovery_report(&recovery);
-            commands::ops::handle_context(&connection, &cli.artifact_root, args)
+            commands::ops::handle_context(&connection, &cli.artifact_root, &alignment, args)
         }
         Command::Web(args) => commands::ops::handle_web(&cli.db, &cli.artifact_root, args),
         Command::Loop(args) => commands::ops::handle_loop_entry(&cli.db, &cli.artifact_root, args),
-        Command::Adapter(args) => commands::adapters::handle_adapter(args),
+        Command::Update(args) => commands::update::handle_update(args),
+        Command::Adapter(args) => commands::adapters::handle_adapter(args, &cli.db),
         Command::Telemetry(args) => commands::ops::handle_telemetry(args),
         Command::Next(args) => commands::work::handle_next(&open_store(&cli.db)?, args),
         Command::Rerun => handle_rerun(),
@@ -460,7 +624,7 @@ fn try_dispatch_adapter_namespace(args: &[OsString]) -> anyhow::Result<bool> {
     let Some(mut request) = adapter_namespace_request(args) else {
         return Ok(false);
     };
-    let registry = AdapterRegistry::discover();
+    let registry = AdapterRegistry::discover_for_database(&request.db);
     let normalized = request
         .namespace
         .trim()
@@ -470,11 +634,114 @@ fn try_dispatch_adapter_namespace(args: &[OsString]) -> anyhow::Result<bool> {
         .resolve_namespace(&request.namespace)
         .or_else(|| registry.resolve_namespace(&normalized))
     else {
+        if let Some(adapter) = registry
+            .find_by_namespace(&request.namespace)
+            .or_else(|| registry.find_by_namespace(&normalized))
+        {
+            bail!("{}", commands::adapters::blocked_dispatch_message(adapter));
+        }
         return Ok(false);
     };
     request.namespace = command.namespace.clone();
+    if let Some(json) = adapter_workflow_request(&request.remaining)? {
+        let adapter = registry.find(&command.adapter_slug).with_context(|| {
+            format!(
+                "adapter `{}` disappeared while rendering its workflow",
+                command.adapter_slug
+            )
+        })?;
+        print_adapter_workflow(adapter, command, json)?;
+        return Ok(true);
+    }
     dispatch_adapter_namespace(command, request)?;
     Ok(true)
+}
+
+fn adapter_workflow_request(arguments: &[OsString]) -> anyhow::Result<Option<bool>> {
+    let Some(command) = arguments.first().and_then(|argument| argument.to_str()) else {
+        return Ok(None);
+    };
+    if command != "workflow" {
+        return Ok(None);
+    }
+    match arguments {
+        [_] => Ok(Some(false)),
+        [_, flag] if flag == "--json" => Ok(Some(true)),
+        [_, flag] if matches!(flag.to_str(), Some("--help" | "-h")) => Ok(Some(false)),
+        _ => bail!("adapter workflow accepts only `--json`"),
+    }
+}
+
+fn print_adapter_workflow(
+    adapter: &DiscoveredAdapter,
+    command: &AdapterCommandNamespace,
+    json: bool,
+) -> anyhow::Result<()> {
+    let canonical = format!("ldgr {}", command.namespace);
+    let status_command = (!command.status_args.is_empty())
+        .then(|| format!("{canonical} {}", command.status_args.join(" ")));
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "adapter": adapter.slug,
+                "namespace": command.namespace,
+                "title": adapter.title,
+                "canonical_command": canonical,
+                "help_command": format!("{canonical} --help"),
+                "status_command": status_command,
+                "profile": {
+                    "loop_prompt_path": adapter.profile.loop_prompt_path,
+                    "default_milestone_template": adapter.profile.default_milestone_template,
+                    "spec_artifact_path": adapter.profile.spec_artifact_path,
+                    "readiness_policy": adapter.profile.readiness_policy,
+                },
+                "target_profiles": adapter.target_profiles,
+            }))?
+        );
+        return Ok(());
+    }
+
+    println!("# {} workflow", adapter.title);
+    println!();
+    println!("Canonical command: `{canonical} <command>`");
+    println!("Start with: `{canonical} --help`");
+    if let Some(status_command) = &status_command {
+        println!("Inspect adapter state with: `{status_command}`");
+    }
+    println!("Inspect Core state with: `ldgr context`");
+    println!();
+    println!("Adapter resources:");
+    println!("- specification: `{}`", adapter.profile.spec_artifact_path);
+    println!(
+        "- milestone template: `{}`",
+        adapter.profile.default_milestone_template
+    );
+    println!("- loop prompt: `{}`", adapter.profile.loop_prompt_path);
+    println!();
+    println!("Readiness policy:");
+    println!("{}", adapter.profile.readiness_policy);
+
+    if !adapter.target_profiles.is_empty() {
+        println!();
+        println!("Validation profiles:");
+        for profile in &adapter.target_profiles {
+            println!(
+                "- {} (`{}`): {}",
+                profile.title, profile.slug, profile.description
+            );
+            for probe in &profile.probes {
+                println!(
+                    "  - {} (`{}`): {}",
+                    probe.title, probe.slug, probe.description
+                );
+                if let Some(hint) = &probe.validation_hint {
+                    println!("    Validate: {hint}");
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 struct AdapterNamespaceRequest {
@@ -533,6 +800,36 @@ fn dispatch_adapter_namespace(
     command: &AdapterCommandNamespace,
     request: AdapterNamespaceRequest,
 ) -> anyhow::Result<()> {
+    let current_registry = AdapterRegistry::discover_for_database(&request.db);
+    let current_adapter = current_registry
+        .find(&command.adapter_slug)
+        .with_context(|| {
+            format!(
+                "adapter `{}` disappeared during dispatch revalidation",
+                command.adapter_slug
+            )
+        })?;
+    if !current_adapter.state.permits_dispatch() {
+        bail!(
+            "{}",
+            commands::adapters::blocked_dispatch_message(current_adapter)
+        );
+    }
+    if current_adapter.state == AdapterOperationalState::Degraded {
+        eprintln!(
+            "warning: adapter `{}` uses legacy compatibility metadata; repair with `{}`",
+            current_adapter.slug, current_adapter.repair.command
+        );
+    }
+    if current_registry
+        .resolve_namespace(&command.namespace)
+        .is_none()
+    {
+        bail!(
+            "adapter namespace `{}` changed during dispatch revalidation",
+            command.namespace
+        );
+    }
     if command.argv.is_empty() {
         bail!("adapter namespace `{}` has empty argv", command.namespace);
     }
@@ -578,6 +875,7 @@ fn dispatch_adapter_namespace(
     argv.extend(request.remaining);
     let mut process = crate::host_process::command_from_argv(&argv)?;
     process
+        .env(crate::update::startup::RECURSION_GUARD_ENV, "1")
         .env("LDGR_DB", &request.db)
         .env("LDGR_ARTIFACT_ROOT", &request.artifact_root)
         .env("LDGR_WORKING_DIR", working_dir)
@@ -614,7 +912,11 @@ fn print_dynamic_adapter_help() {
     }
     println!();
     println!("Installed adapter control surface:");
-    for adapter in &registry.adapters {
+    for adapter in registry
+        .adapters
+        .iter()
+        .filter(|adapter| adapter.state.permits_dispatch())
+    {
         println!("  {} — {}", adapter.slug, adapter.title);
         for namespace in &adapter.command_namespaces {
             let description = namespace
@@ -662,7 +964,11 @@ fn maybe_print_adapter_namespace_hint(args: &[OsString]) {
     let input = input.to_ascii_lowercase().replace('_', "-");
     let registry = AdapterRegistry::discover();
     let mut scored = Vec::new();
-    for adapter in &registry.adapters {
+    for adapter in registry
+        .adapters
+        .iter()
+        .filter(|adapter| adapter.state.permits_dispatch())
+    {
         for namespace in &adapter.command_namespaces {
             let distance = std::iter::once(namespace.namespace.as_str())
                 .chain(namespace.aliases.iter().map(String::as_str))

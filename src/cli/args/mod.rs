@@ -5,6 +5,7 @@ mod ops;
 mod prompts;
 mod runs;
 mod telemetry;
+mod update;
 mod work;
 
 pub use adapters::*;
@@ -14,4 +15,5 @@ pub use ops::*;
 pub use prompts::*;
 pub use runs::*;
 pub use telemetry::*;
+pub use update::*;
 pub use work::*;

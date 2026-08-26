@@ -7,10 +7,13 @@ pub fn run_loop_once(
         return Ok(LoopRuntimeOutcome::BlockedByIntervention);
     }
 
-    if let Some(work_item) = oldest_running_work_item(connection)? {
-        return Ok(LoopRuntimeOutcome::BlockedByIncompleteCycle {
-            work_slug: work_item.slug,
-        });
+    let active_run = oldest_active_run(connection)?;
+    if active_run.is_none() {
+        if let Some(work_item) = oldest_running_work_item(connection)? {
+            return Ok(LoopRuntimeOutcome::BlockedByIncompleteCycle {
+                work_slug: work_item.slug,
+            });
+        }
     }
 
     let steering_interventions = pending_loop_interventions(connection)?
@@ -18,17 +21,24 @@ pub fn run_loop_once(
         .filter(|intervention| intervention.action == LoopInterventionAction::Steer)
         .collect::<Vec<_>>();
 
-    let command_text = options.agent.command_label();
-    let Some(claimed) = claim_next_pending_run(connection, Some(&command_text))? else {
-        return Ok(LoopRuntimeOutcome::NoPendingWork);
+    let (work_item, run, resumed) = if let Some(active_run) = active_run {
+        (active_run.work_item, active_run.run, true)
+    } else {
+        let command_text = options.agent.command_label();
+        let Some(claimed) = claim_next_pending_run(connection, Some(&command_text))? else {
+            return Ok(LoopRuntimeOutcome::NoPendingWork);
+        };
+        (claimed.work_item, claimed.run, false)
     };
-    let work_item = claimed.work_item;
-    let run = claimed.run;
     record_run_phase(
         connection,
         run.id,
-        "started",
-        &format!("Started bounded loop session for {}.", work_item.slug),
+        if resumed { "resumed" } else { "started" },
+        &format!(
+            "{} bounded loop session for {}.",
+            if resumed { "Resumed existing" } else { "Started" },
+            work_item.slug
+        ),
     )?;
 
     for intervention in &steering_interventions {

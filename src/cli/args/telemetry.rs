@@ -4,7 +4,7 @@ use clap::{Args, Subcommand};
 
 #[derive(Debug, Args)]
 #[command(
-    after_help = "Examples:\n  ldgr telemetry status\n  ldgr telemetry preview\n  ldgr telemetry transmit --collector https://collector.example\n  ldgr telemetry enable\n  ldgr telemetry disable\n\nTelemetry controls apply only to numerical state-sequence collection. Disable takes effect immediately and does not require a network request."
+    after_help = "Examples:\n  ldgr telemetry status\n  ldgr telemetry preview\n  ldgr telemetry transmit\n  ldgr telemetry disable\n  ldgr telemetry donation enable\n\nAnonymous construction telemetry is enabled by default and can be disabled immediately. Experience donation is separate and remains off until explicitly enabled."
 )]
 pub struct TelemetryArgs {
     #[command(subcommand)]
@@ -23,11 +23,29 @@ pub enum TelemetryCommand {
     Enable,
     /// Immediately opt out and delete unsent numerical sequences.
     Disable,
+    /// Control the separate, non-anonymous experience-donation program.
+    Donation(TelemetryDonationArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct TelemetryDonationArgs {
+    #[command(subcommand)]
+    pub command: TelemetryDonationCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum TelemetryDonationCommand {
+    /// Show whether experience donation has been explicitly enabled.
+    Status,
+    /// Explicitly opt in to user-selected, locally previewed experience donation.
+    Enable,
+    /// Disable experience donation. Anonymous construction telemetry is unchanged.
+    Disable,
 }
 
 #[derive(Debug, Args)]
 pub struct TelemetryTransmitArgs {
-    /// Bare HTTPS collector origin. Falls back to LDGR_TELEMETRY_COLLECTOR.
+    /// Bare HTTPS collector origin. Falls back to LDGR_TELEMETRY_COLLECTOR, then https://ldgr.run.
     #[arg(long, value_name = "HTTPS_ORIGIN")]
     pub collector: Option<String>,
 

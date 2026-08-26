@@ -30,7 +30,35 @@ ldgr adapter install conduct
 ldgr adapter install research
 ```
 
-`ldgr adapter install list` shows installable adapters and where they come from. Core installation acquires or runs the adapter binary, then delegates setup to the adapter-owned installer. The adapter writes its bundle to `~/.ldgr/adapters/<adapter>`, installs adapter-owned prompts, skills, commands, and extensions into the paths declared by configured harness entries in canonical `~/.ldgr/config.toml`, and records license paths there when the adapter supports commercial licensing. Core also maintains `~/.ldgr/config.json` as a compatibility mirror for older adapters during migration.
+`ldgr adapter install list` shows installable adapters and where they come from. Core authenticates the release catalog, resolves a platform artifact against the active compatibility-v2 Core profile, verifies its signature/checksum and staged `adapter-compatibility.json`, then delegates resource setup to the adapter-owned installer. The adapter writes its bundle to `~/.ldgr/adapters/<adapter>`, installs adapter-owned prompts, skills, commands, and extensions into the paths declared by configured harness entries in canonical `~/.ldgr/config.toml`, and records license paths there when the adapter supports commercial licensing. Core also maintains `~/.ldgr/config.json` as a compatibility mirror for older adapters during migration.
+
+Ordinary v2 resolution and discovery compare the adapter protocol epoch,
+monotonic minimum Core schema, required Core capabilities, and optional
+registered central components. They do **not** require an exact Core package
+patch, global database-contract hash, or coherent release-set fingerprint.
+Signatures, receipts, catalog authentication, platform, ownership, and
+entitlement remain independent gates.
+
+### Canonical Research installation
+
+Start from an installed Core; do not bootstrap discovery with a standalone
+`ldgr-research` binary:
+
+```bash
+ldgr adapter install research
+ldgr research install
+ldgr research workflow
+ldgr research init
+ldgr research doctor
+```
+
+The first command installs and registers the signed adapter bundle. The second
+idempotently materializes Research-owned prompts and skills through Core's
+absolute manifest argv. `workflow` prints the adapter workflow before project
+mutation, `init` creates/migrates `.ldgr/research/research.db` and activates the
+`research-loop` prompt, and `doctor` verifies the result. Initialize each project
+once; rerunning `ldgr research install` is safe and must not rewrite Core's
+signed-release receipt.
 
 For local development, `--source-root` accepts either the LDGR monorepo checkout
 containing an adapter crate or the adapter crate root itself. Core selects the
@@ -95,6 +123,57 @@ boundaries are rejected rather than deleted.
 The `source-target` directory is a generated Cargo cache owned by the
 installation. It may change during normal dispatch and is excluded from drift
 checks; uninstall removes it with the tracked install root.
+
+## Compatibility states and repair
+
+Discovery enumerates installed candidates before evaluating compatibility, so a
+stale adapter does not disappear. Inspect human or machine-readable state with:
+
+```bash
+ldgr adapter list
+ldgr adapter show <adapter> --json
+```
+
+- `ready`: valid v2 metadata; dispatch is enabled.
+- `degraded`: valid legacy v1 metadata exactly matches its historical global
+  contract and Core range; dispatch is enabled with a migration warning.
+- `blocked`: identity is known but compatibility failed; dispatch is denied.
+- `invalid`: manifest, sidecar, or receipt is missing, malformed, ambiguous, or
+  unsupported; dispatch is denied.
+
+JSON includes stable `reasons` and a `repair` object with exact argv and a
+shell-rendered command. Common stale-v1 reasons are
+`compatibility.legacy_global_contract_mismatch` and
+`compatibility.legacy_core_schema_mismatch`. Run the rendered Core-owned repair,
+usually `ldgr update --adapter <adapter>`; never copy a current hash into a v1
+sidecar, delete malformed v2 metadata to force fallback, or use a standalone
+adapter binary to rewrite the bundle.
+
+## Top-level updates
+
+`ldgr update --check` verifies signed catalog snapshots and reports the Core,
+paired `agentctl`, and every eligible user adapter as one deterministic plan.
+Use `--adapter <slug>` repeatedly for a subset, `--adapters-only` to leave Core
+unchanged, or `--core-only` to select only Core/agentctl. `--core-only` cannot
+bypass a known incompatibility: every retained adapter must pass candidate-Core
+preflight. Project adapters, `LDGR_ADAPTER_PATH` development overrides, and
+adapters without valid receipts are reported as skipped and are never
+bulk-mutated.
+
+Apply with `ldgr update` (or deliberate non-interactive `ldgr update --yes`).
+Every artifact is staged and verified before mutation. One durable transaction
+covers binaries, adapter bundles, resources, and receipts; a failure restores
+the complete prior installation. Core central migrations use a verified database
+backup, while adapter-local stores remain adapter-owned and are not opened by
+Core preflight. Interrupted activation resumes or rolls back from the same
+journal on the next startup.
+
+`--offline` forbids network access and therefore requires local catalog,
+signature, keyring, and artifact references. `--prerelease` opts into
+prerelease targets but never bypasses compatibility. `--json` emits the
+schema-versioned result document on stdout while warnings and failures remain on
+stderr. Check mode does not fetch archive or archive-signature payloads and does
+not invoke adapter installers.
 
 ## Dynamic command surface
 

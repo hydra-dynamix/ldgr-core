@@ -39,6 +39,12 @@ pub fn database_contract_json() -> &'static str {
     GENERATED_DATABASE_CONTRACT_JSON
 }
 
+/// Global coherent-release provenance retained for the bounded legacy-v1
+/// bridge. V2 compatibility never compares this release-set fingerprint.
+pub fn database_release_set_json() -> &'static str {
+    GENERATED_DATABASE_RELEASE_SET_JSON
+}
+
 pub fn database_component(namespace: &str) -> Option<&'static DatabaseComponentContract> {
     GENERATED_DATABASE_COMPONENTS
         .iter()
@@ -54,8 +60,8 @@ pub fn parse_and_validate_adapter_contract(text: &str) -> anyhow::Result<Adapter
         contract.format
     );
     anyhow::ensure!(
-        contract.contract_hash == DATABASE_CONTRACT_HASH,
-        "adapter database contract hash does not match active Core contract"
+        contract.contract_hash == DATABASE_RELEASE_SET_HASH,
+        "adapter database contract hash does not match active Core release set"
     );
     anyhow::ensure!(
         contract.core_schema_version == GENERATED_CORE_SCHEMA_VERSION,
@@ -63,8 +69,8 @@ pub fn parse_and_validate_adapter_contract(text: &str) -> anyhow::Result<Adapter
         contract.core_schema_version,
         GENERATED_CORE_SCHEMA_VERSION
     );
-    let generated: OwnedDatabaseContract = serde_json::from_str(database_contract_json())
-        .context("failed to parse generated database contract")?;
+    let generated: OwnedDatabaseContract = serde_json::from_str(database_release_set_json())
+        .context("failed to parse generated database release set")?;
     let expected = generated
         .components
         .iter()
@@ -84,8 +90,8 @@ pub fn parse_and_validate_adapter_contract(text: &str) -> anyhow::Result<Adapter
 }
 
 pub fn generated_adapter_contract_json(namespace: &str) -> anyhow::Result<String> {
-    let generated: serde_json::Value = serde_json::from_str(database_contract_json())
-        .context("failed to parse generated database contract")?;
+    let generated: serde_json::Value = serde_json::from_str(database_release_set_json())
+        .context("failed to parse generated database release set")?;
     let component = generated["components"]
         .as_array()
         .context("generated database contract components are not an array")?
@@ -95,7 +101,7 @@ pub fn generated_adapter_contract_json(namespace: &str) -> anyhow::Result<String
         .clone();
     Ok(serde_json::to_string_pretty(&serde_json::json!({
         "format": ADAPTER_DATABASE_CONTRACT_FORMAT,
-        "contract_hash": DATABASE_CONTRACT_HASH,
+        "contract_hash": DATABASE_RELEASE_SET_HASH,
         "core_schema_version": GENERATED_CORE_SCHEMA_VERSION,
         "component": component,
     }))? + "\n")
@@ -159,7 +165,22 @@ mod tests {
     }
 
     #[test]
-    fn every_supported_adapter_has_one_generated_component() {
+    fn central_contract_excludes_unregistered_and_local_adapter_components() {
+        assert_eq!(
+            GENERATED_DATABASE_COMPONENTS
+                .iter()
+                .map(|component| component.namespace)
+                .collect::<Vec<_>>(),
+            vec!["core"]
+        );
+        assert!(database_component("research").is_none());
+        assert!(database_component("evidence").is_none());
+
+        let release_set: OwnedContract = serde_json::from_str(database_release_set_json()).unwrap();
+        assert_eq!(
+            release_set.contract_hash.as_deref(),
+            Some(DATABASE_RELEASE_SET_HASH)
+        );
         for namespace in [
             "bench",
             "code",
@@ -174,15 +195,19 @@ mod tests {
             "security",
         ] {
             assert!(
-                database_component(namespace).is_some(),
-                "missing {namespace}"
+                release_set
+                    .components
+                    .iter()
+                    .any(|component| component.namespace == namespace),
+                "missing {namespace} from release provenance"
             );
         }
     }
 
     #[test]
     fn adapter_contract_validation_is_exact_and_fail_closed() {
-        let generated: serde_json::Value = serde_json::from_str(database_contract_json()).unwrap();
+        let generated: serde_json::Value =
+            serde_json::from_str(database_release_set_json()).unwrap();
         let component = generated["components"]
             .as_array()
             .unwrap()
@@ -192,7 +217,7 @@ mod tests {
             .clone();
         let valid = serde_json::json!({
             "format": ADAPTER_DATABASE_CONTRACT_FORMAT,
-            "contract_hash": DATABASE_CONTRACT_HASH,
+            "contract_hash": DATABASE_RELEASE_SET_HASH,
             "core_schema_version": GENERATED_CORE_SCHEMA_VERSION,
             "component": component,
         });

@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "release_keys": [],
+  "releases": [
+    {
+      "version": "0.1.15",
+      "channel": "stable",
+      "minimum_updater_version": "0.1.14",
+      "core_commit": "1111111111111111111111111111111111111111",
+      "source_repository": "hydra-dynamix/ldgr-core",
+      "agentctl": {
+        "version": "0.1.2",
+        "repository": "hydra-dynamix/agentctl",
+        "commit": "2222222222222222222222222222222222222222"
+      },
+      "compatibility": {
+        "launcher_compatibility_schema": "ldgr.launcher-compatibility.v1",
+        "error_recovery_schema": 1,
+        "release_metadata_schema": 1
+      },
+      "platforms": [
+        {
+          "platform": "linux-x86_64",
+          "archive_url": "https://github.com/hydra-dynamix/ldgr-core/releases/download/v0.1.15/ldgr-core-0.1.15-linux-x86_64.tar.gz",
+          "archive_root": "ldgr-core-0.1.15",
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+          "signature_url": "https://github.com/hydra-dynamix/ldgr-core/releases/download/v0.1.15/ldgr-core-0.1.15-linux-x86_64.tar.gz.sig",
+          "signing_key_id": "fixture-anchor"
+        }
+      ]
+    }
+  ]
+}

@@ -52,6 +52,9 @@ pub fn validate_sequence(protocol: &NumericalProtocol, states: &[StateCode]) -> 
             protocol.endpoint()
         );
     }
+    if protocol.endpoint() == super::command_experience::COMMAND_EXPERIENCE_V1.endpoint() {
+        super::command_experience::validate_command_experience_sequence(states)?;
+    }
     Ok(())
 }
 

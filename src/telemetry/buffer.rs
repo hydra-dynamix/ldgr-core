@@ -9,7 +9,7 @@ use super::serializer::serialize_sequence;
 use super::transition::{
     CommittedSequence, NormalizedTerminal, NumericalProtocol, StateCode, TransitionAcceptance,
 };
-use super::{load_telemetry_consent, telemetry_kill_switch_active, TELEMETRY_PENDING_DIRECTORY};
+use super::{anonymous_collection_is_eligible, TELEMETRY_PENDING_DIRECTORY};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BufferedTransition {
@@ -91,12 +91,7 @@ impl<'protocol> LocalSequenceBuffer<'protocol> {
 }
 
 fn collection_is_eligible(ldgr_home: &Path) -> bool {
-    if telemetry_kill_switch_active() {
-        return false;
-    }
-    load_telemetry_consent(ldgr_home)
-        .map(|consent| consent.collection_enabled())
-        .unwrap_or(false)
+    anonymous_collection_is_eligible(ldgr_home)
 }
 
 pub(crate) fn queue_committed_terminal_sequence(
@@ -249,9 +244,9 @@ mod tests {
     );
 
     #[test]
-    fn undecided_and_disabled_consent_create_no_buffer_or_files() -> anyhow::Result<()> {
+    fn missing_consent_defaults_on_and_explicit_disable_creates_no_files() -> anyhow::Result<()> {
         let home = tempfile::tempdir()?;
-        assert!(LocalSequenceBuffer::begin_after_commit(home.path(), &CORE_WORK_V1)?.is_none());
+        assert!(LocalSequenceBuffer::begin_after_commit(home.path(), &CORE_WORK_V1)?.is_some());
         save_telemetry_consent(
             home.path(),
             &TelemetryConsent::current(TelemetryConsentDecision::Disabled),
@@ -268,12 +263,6 @@ mod tests {
             .expect("environment lock poisoned");
         let home = tempfile::tempdir()?;
         let adapter_path = [PENDING, RUNNING, COMPLETED_POSITIVE];
-
-        assert_eq!(
-            queue_committed_terminal_sequence(home.path(), &ADAPTER_V1, &adapter_path)?,
-            QueuedTerminalSequence::Dropped
-        );
-        assert!(pending_files_for(home.path(), "example-adapter-work/v1")?.is_empty());
 
         save_telemetry_consent(
             home.path(),

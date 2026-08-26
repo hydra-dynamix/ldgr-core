@@ -30,9 +30,17 @@ Then run `ldgr workflow` to learn how to work this project, and
 `ldgr <adapter> workflow` for an installed adapter.
 
 Read `.ldgr/agent-errors.md` when present. Errors are first-class causal
-records: checkpoint after unexpected behavior, user corrections, process
-handoff, and before exit. Record accepted-operation failures before retrying;
-repeated errors require prior context and an explicit disposition.
+records only when they have durable, blocking, ambiguous, or integrity-relevant
+impact. Correct transient command, quoting, path, discovery, and expected-test
+failures inline without ledger ceremony. Record an error when an accepted
+operation may have partial effects, remains blocked after one reasonable
+correction, or must survive handoff. Repeated substantive errors require prior
+context and an explicit disposition before an unchanged retry.
+
+Record ordinary substantive failures with `ldgr error <command> <type> <msg>`.
+Use a stable command label without arguments; Core supplies identities,
+fingerprints, timestamps, policy fields, and active run/work links. Use the
+detailed `ldgr error record` command only when an integration owns that metadata.
 
 ## Do not run these
 
