@@ -191,7 +191,7 @@ fn installer_helper_verifies_catalog_checksum_signature_and_embedded_metadata() 
     write_signature(&archive_signature, "fixture-root", &key, &archive_bytes)?;
     fs::write(&checksum, format!("{digest}  {}\n", archive.display()))?;
     let archive_url = file_url(&archive);
-    let catalog = CoreUpdateCatalog {
+    let mut catalog = CoreUpdateCatalog {
         schema_version: 1,
         release_keys: Vec::new(),
         releases: vec![CoreRelease {
@@ -233,6 +233,84 @@ fn installer_helper_verifies_catalog_checksum_signature_and_embedded_metadata() 
     fs::write(&keyring_path, serde_json::to_vec_pretty(&keyring)?)?;
     let helper = repository().join("scripts/core-catalog.py");
 
+    let output = python(&helper)
+        .args([
+            "resolve",
+            "--catalog",
+            path(&catalog_path),
+            "--signature",
+            path(&catalog_signature),
+            "--keyring",
+            path(&keyring_path),
+            "--platform",
+            "windows-x86_64",
+            "--version",
+            "1.2.3",
+            "--offline",
+            "--output",
+            path(&resolved),
+        ])
+        .output()?;
+    ensure!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = python(&helper)
+        .args([
+            "verify-archive",
+            "--resolved",
+            path(&resolved),
+            "--archive",
+            path(&archive),
+            "--checksum",
+            path(&checksum),
+            "--signature",
+            path(&archive_signature),
+        ])
+        .output()?;
+    ensure!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let historical_metadata = serde_json::json!({
+        "schema_version": 1,
+        "component": "ldgr-core",
+        "package": "ldgr-core",
+        "binary": "ldgr",
+        "version": "1.2.3",
+        "platform": "windows-x86_64",
+        "root_commit": "c".repeat(40),
+        "component_commit": "a".repeat(40),
+        "source_repository": "hydra-dynamix/ldgr-core",
+        "agentctl_version": "0.1.2",
+        "agentctl_repository": "hydra-dynamix/agentctl",
+        "agentctl_commit": "b".repeat(40),
+    });
+    write_archive(&archive, &historical_metadata)?;
+    let historical_archive = fs::read(&archive)?;
+    let historical_digest = format!("{:x}", Sha256::digest(&historical_archive));
+    catalog.releases[0].platforms[0].sha256 = historical_digest.clone();
+    write_signature(
+        &archive_signature,
+        "fixture-root",
+        &key,
+        &historical_archive,
+    )?;
+    fs::write(
+        &checksum,
+        format!("{historical_digest}  {}\n", archive.display()),
+    )?;
+    let historical_catalog = canonical_catalog_bytes(&catalog)?;
+    fs::write(&catalog_path, &historical_catalog)?;
+    write_signature(
+        &catalog_signature,
+        "fixture-root",
+        &key,
+        &historical_catalog,
+    )?;
     let output = python(&helper)
         .args([
             "resolve",
@@ -377,7 +455,7 @@ fn write_signature(
     Ok(())
 }
 
-fn write_archive(path: &Path, metadata: &CoreReleaseMetadata) -> anyhow::Result<()> {
+fn write_archive(path: &Path, metadata: &impl serde::Serialize) -> anyhow::Result<()> {
     let file = fs::File::create(path)?;
     let mut archive = Builder::new(GzEncoder::new(file, Compression::default()));
     append(

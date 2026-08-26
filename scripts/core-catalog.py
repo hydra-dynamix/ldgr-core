@@ -414,7 +414,25 @@ def verify_archive(args: argparse.Namespace) -> None:
             "platform": platform["platform"], "commit": resolved["core_commit"],
             "source_repository": resolved["source_repository"],
         }
-        require(metadata == expected, "embedded RELEASE-METADATA.json does not match the signed catalog")
+        if metadata != expected:
+            historical = {
+                "schema_version": resolved["compatibility"]["release_metadata_schema"],
+                "component": "ldgr-core", "package": "ldgr-core", "binary": "ldgr",
+                "version": resolved["version"], "platform": platform["platform"],
+                "component_commit": resolved["core_commit"],
+                "source_repository": resolved["source_repository"],
+                "agentctl_version": resolved["agentctl"]["version"],
+                "agentctl_repository": resolved["agentctl"]["repository"],
+                "agentctl_commit": resolved["agentctl"]["commit"],
+            }
+            root_commit = metadata.get("root_commit") if isinstance(metadata, dict) else None
+            without_root = {key: value for key, value in metadata.items() if key != "root_commit"} if isinstance(metadata, dict) else None
+            require(
+                without_root == historical
+                and isinstance(root_commit, str)
+                and re.fullmatch(r"[0-9a-f]{40}", root_commit) is not None,
+                "embedded RELEASE-METADATA.json does not match the signed catalog",
+            )
         extension = ".exe" if platform["platform"].startswith("windows-") else ""
         for binary in (f"ldgr{extension}", f"agentctl{extension}"):
             name = f"{root}/{platform['platform']}/{binary}"
