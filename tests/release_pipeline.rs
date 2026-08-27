@@ -47,6 +47,7 @@ fn release_workflow_catalog_publication_is_last_and_matrix_gated() -> anyhow::Re
     for required in [
         "LDGR_CATALOG_SIGNING_KEY",
         "LDGR_ARCHIVE_SIGNING_KEY",
+        r#""target/release/${BINARY}${{ matrix.binary_ext }}" --version"#,
         "dist/*.tar.gz.sig",
         "(cd candidate && sha256sum -c \"dist/$archive.sha256\")",
         "previous-version.txt",
