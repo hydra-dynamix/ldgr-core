@@ -62,6 +62,13 @@ current atomic update contract. Earlier releases are retained on GitHub but
 are not supported signed-catalog update inputs because their archives omit
 agentctl; the ceremony must not relabel those incomplete bundles as supported.
 
+Core 0.1.14 is the paired bootstrap archive, but its public binary predates the
+`update` command and official installation receipt command. The 0.1.15
+transition gate therefore verifies signed installer replacement from 0.1.14 on
+all five platforms. Core 0.1.15 becomes the oldest release for ordinary
+previous-version self-update gates. Future release gates must not reuse the
+0.1.14 transition exception for any other version.
+
 The workflow retrieves assets by pinned GitHub asset ID and checks remote
 release metadata before downloading. `ldgr-release --bootstrap-inventory ...`
 then rechecks every byte and checksum, signs each archive with the already

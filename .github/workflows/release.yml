@@ -338,9 +338,17 @@ jobs:
           HOME="$root/home" LDGR_INSTALL_DIR="$previous_install" LDGR_VERSION="$previous" \
             LDGR_CORE_UPDATE_INDEX="$catalog" LDGR_CORE_CATALOG_HELPER="$helper" \
             LDGR_CORE_RELEASE_KEYRING="$keyring" sh scripts/install.sh
-          HOME="$root/home" LDGR_CORE_UPDATE_INDEX="$catalog" \
-            LDGR_CORE_RELEASE_KEYRING="$keyring" \
-            "$previous_install/ldgr" update --core-only --yes
+          if [ "$previous" = "0.1.14" ]; then
+            # The reviewed paired bootstrap archive predates the public update command.
+            HOME="$root/home" LDGR_INSTALL_DIR="$previous_install" \
+              LDGR_VERSION="$TARGET_VERSION" LDGR_CORE_UPDATE_INDEX="$catalog" \
+              LDGR_CORE_CATALOG_HELPER="$helper" LDGR_CORE_RELEASE_KEYRING="$keyring" \
+              sh scripts/install.sh
+          else
+            HOME="$root/home" LDGR_CORE_UPDATE_INDEX="$catalog" \
+              LDGR_CORE_RELEASE_KEYRING="$keyring" \
+              "$previous_install/ldgr" update --core-only --yes
+          fi
           test "$("$previous_install/ldgr" --version)" = "ldgr $TARGET_VERSION"
           HOME="$root/current-home" LDGR_INSTALL_DIR="$root/current" \
             LDGR_VERSION="$TARGET_VERSION" LDGR_CORE_UPDATE_INDEX="$catalog" \
@@ -369,7 +377,14 @@ jobs:
           $env:LDGR_CORE_CATALOG_HELPER = $helper.AbsoluteUri
           $env:LDGR_CORE_RELEASE_KEYRING = $keyring.AbsoluteUri
           & scripts/install.ps1
-          & "$previousInstall/ldgr.exe" update --core-only --yes
+          if ($previous -eq "0.1.14") {
+            # The reviewed paired bootstrap archive predates the public update command.
+            $env:LDGR_INSTALL_DIR = $previousInstall
+            $env:LDGR_VERSION = $env:TARGET_VERSION
+            & scripts/install.ps1
+          } else {
+            & "$previousInstall/ldgr.exe" update --core-only --yes
+          }
           $deadline = [DateTime]::UtcNow.AddSeconds(30)
           do {
             Start-Sleep -Milliseconds 250
