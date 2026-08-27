@@ -58,6 +58,7 @@ fn release_workflow_catalog_publication_is_last_and_matrix_gated() -> anyhow::Re
         "The reviewed paired bootstrap archive predates the public update command.",
         "injected_failure_after_each_paired_activation_checkpoint_restores_every_target",
         "core-index.json.sig",
+        r#"--repo "$GITHUB_REPOSITORY" "${args[@]}""#,
     ] {
         ensure!(workflow.contains(required), "workflow omits {required}");
     }

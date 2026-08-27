@@ -441,7 +441,8 @@ jobs:
         run: |
           args=(--draft=false)
           if [[ "${{ needs.metadata.outputs.prerelease }}" == "true" ]]; then args+=(--prerelease); else args+=(--latest); fi
-          gh release edit "v${{ needs.metadata.outputs.version }}" "${args[@]}"
+          gh release edit "v${{ needs.metadata.outputs.version }}" \
+            --repo "$GITHUB_REPOSITORY" "${args[@]}"
       - name: Publish signed Core catalog
         shell: bash
         run: |
