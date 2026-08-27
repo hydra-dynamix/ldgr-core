@@ -389,10 +389,27 @@ try {
         "--signing-key-id", $signingKeyId
     )
     & $destination @receiptArgs
-    if ($LASTEXITCODE -ne 0) {
-        throw "Installed pair validated, but the Core installation receipt was not written."
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "Recorded official installation ownership under $homeDirectory\.ldgr"
+    } else {
+        $historical = Get-Content -Raw -LiteralPath $releaseMetadataPath | ConvertFrom-Json
+        $historicalProperties = @($historical.PSObject.Properties.Name | Sort-Object)
+        $expectedHistoricalProperties = @(
+            "agentctl_commit", "agentctl_repository", "agentctl_version", "binary",
+            "component", "component_commit", "package", "platform", "root_commit",
+            "schema_version", "source_repository", "version"
+        ) | Sort-Object
+        $historicalShape =
+            ($historicalProperties -join "|") -eq ($expectedHistoricalProperties -join "|") -and
+            $historical.schema_version -eq 1 -and
+            $historical.component -eq "ldgr-core" -and
+            $historical.root_commit -match "^[0-9a-f]{40}$" -and
+            $historical.component_commit -match "^[0-9a-f]{40}$"
+        if (-not $historicalShape) {
+            throw "Installed pair validated, but the Core installation receipt was not written."
+        }
+        Write-Host "Installed reviewed historical paired Core; the first update requires --yes for safe ownership adoption."
     }
-    Write-Host "Recorded official installation ownership under $homeDirectory\.ldgr"
 } finally {
     if (Test-Path -LiteralPath $temporaryDirectory) {
         Remove-Item -LiteralPath $temporaryDirectory -Recurse -Force

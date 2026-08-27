@@ -168,11 +168,23 @@ agentctl_version_output="$("$INSTALL_DIR/$AGENTCTL_FILE" --version)"
   fail "installed agentctl version mismatch: expected agentctl $AGENTCTL_VERSION; got $agentctl_version_output"
 "$INSTALL_DIR/$BINARY_FILE" compatibility \
   --agentctl-version "$AGENTCTL_VERSION" --json
-"$INSTALL_DIR/$BINARY_FILE" __record-core-installation \
+if "$INSTALL_DIR/$BINARY_FILE" __record-core-installation \
   --home "$HOME" \
   --agentctl-binary "$INSTALL_DIR/$AGENTCTL_FILE" \
   --release-metadata "$RELEASE_METADATA" \
   --archive-url "$URL" \
   --archive-sha256 "$EXPECTED_SHA256" \
-  --signing-key-id "$SIGNING_KEY_ID"
-log "Recorded official installation ownership under $HOME/.ldgr"
+  --signing-key-id "$SIGNING_KEY_ID"; then
+  log "Recorded official installation ownership under $HOME/.ldgr"
+elif python3 - "$RELEASE_METADATA" <<'PY'
+import json,re,sys
+value=json.load(open(sys.argv[1],encoding="utf-8"))
+required={"schema_version","component","package","binary","version","platform","root_commit","component_commit","source_repository","agentctl_version","agentctl_repository","agentctl_commit"}
+valid=(set(value)==required and value["schema_version"]==1 and value["component"]=="ldgr-core" and re.fullmatch(r"[0-9a-f]{40}",value["root_commit"]) and re.fullmatch(r"[0-9a-f]{40}",value["component_commit"]))
+raise SystemExit(0 if valid else 1)
+PY
+then
+  log "Installed reviewed historical paired Core; the first update requires --yes for safe ownership adoption."
+else
+  fail "installed pair validated, but the Core installation receipt was not written"
+fi

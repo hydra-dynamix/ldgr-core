@@ -51,6 +51,8 @@ fn release_workflow_catalog_publication_is_last_and_matrix_gated() -> anyhow::Re
         "dist/*.tar.gz.sig",
         "(cd candidate && sha256sum -c \"dist/$archive.sha256\")",
         "previous-version.txt",
+        r#"previous_install="$root/home/.local/bin""#,
+        r#"$previousInstall = Join-Path $env:HOME ".local\bin""#,
         "injected_failure_after_each_paired_activation_checkpoint_restores_every_target",
         "core-index.json.sig",
     ] {
@@ -164,6 +166,10 @@ fn release_workflow_runs_actionlint_and_signed_installer_fixtures() -> anyhow::R
     ensure!(powershell.contains("Installer redirects must remain HTTPS"));
     ensure!(shell.contains("agentctl $AGENTCTL_VERSION"));
     ensure!(powershell.contains("agentctl $expectedAgentctlVersion"));
+    for installer in [&shell, &powershell] {
+        ensure!(installer.contains("Installed reviewed historical paired Core"));
+        ensure!(installer.contains("first update requires --yes"));
+    }
     Ok(())
 }
 
