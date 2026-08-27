@@ -338,13 +338,15 @@ jobs:
           HOME="$root/home" LDGR_INSTALL_DIR="$previous_install" LDGR_VERSION="$previous" \
             LDGR_CORE_UPDATE_INDEX="$catalog" LDGR_CORE_CATALOG_HELPER="$helper" \
             LDGR_CORE_RELEASE_KEYRING="$keyring" sh scripts/install.sh
-          if [ "$previous" = "0.1.14" ]; then
-            # The reviewed paired bootstrap archive predates the public update command.
+          if [ "$previous" = "0.1.14" ] || [ "$previous" = "0.1.15" ]; then
+            # Core 0.1.16 fixes pre-receipt update activation. Older binaries
+            # require the signed installer for this one-time bootstrap.
             HOME="$root/home" LDGR_INSTALL_DIR="$previous_install" \
               LDGR_VERSION="$TARGET_VERSION" LDGR_CORE_UPDATE_INDEX="$catalog" \
               LDGR_CORE_CATALOG_HELPER="$helper" LDGR_CORE_RELEASE_KEYRING="$keyring" \
               sh scripts/install.sh
           else
+            rm "$root/home/.ldgr/core-installation-receipt.json"
             HOME="$root/home" LDGR_CORE_UPDATE_INDEX="$catalog" \
               LDGR_CORE_RELEASE_KEYRING="$keyring" \
               "$previous_install/ldgr" update --core-only --yes
@@ -377,12 +379,14 @@ jobs:
           $env:LDGR_CORE_CATALOG_HELPER = $helper.AbsoluteUri
           $env:LDGR_CORE_RELEASE_KEYRING = $keyring.AbsoluteUri
           & scripts/install.ps1
-          if ($previous -eq "0.1.14") {
-            # The reviewed paired bootstrap archive predates the public update command.
+          if ($previous -eq "0.1.14" -or $previous -eq "0.1.15") {
+            # Core 0.1.16 fixes pre-receipt update activation. Older binaries
+            # require the signed installer for this one-time bootstrap.
             $env:LDGR_INSTALL_DIR = $previousInstall
             $env:LDGR_VERSION = $env:TARGET_VERSION
             & scripts/install.ps1
           } else {
+            Remove-Item (Join-Path $env:HOME ".ldgr\core-installation-receipt.json")
             & "$previousInstall/ldgr.exe" update --core-only --yes
           }
           $deadline = [DateTime]::UtcNow.AddSeconds(30)

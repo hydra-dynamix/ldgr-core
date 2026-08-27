@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.16] - 2026-08-27
+
+### Fixed
+
+- Let plain interactive `ldgr update` safely adopt verified pre-receipt Core installations through the existing plan confirmation.
+- Migrate canonical pre-receipt user adapters to verified signed releases without manual directory removal or separate reinstall commands.
+- Preserve strict ownership checks for malformed receipts, modified receipt-owned files, package-manager installs, project adapters, and environment overrides.
+
 ## [0.1.15] - 2026-08-26
 
 ### Added

@@ -75,7 +75,7 @@ The implemented Core behavior is:
 - Installing updates automatically at startup.
 - Updating adapters found only through project `.ldgr/adapters` or `LDGR_ADAPTER_PATH` development overrides.
 - Acting as a general package-manager updater for Homebrew, Cargo, WinGet, or system-managed installations.
-- Updating an untracked adapter that has no valid installation receipt.
+- Overwriting an adapter with a malformed receipt, modified receipt-owned files, or an install root outside the canonical user boundary.
 - Downgrading components through normal resolution. Explicit rollback or version pinning can be designed separately.
 - Recording user-level update checks in whichever project `.ldgr/ldgr.db` happens to be current.
 
@@ -94,7 +94,7 @@ Without flags, the command:
 7. downloads, verifies, and stages every selected artifact before mutation;
 8. applies the plan, rolls back on failure, validates the resulting installation, and writes a durable receipt.
 
-The default selection is the Core/`agentctl` pair plus all receipt-managed adapters under the user LDGR home. Components already current are reported as no-ops.
+The default selection is the Core/`agentctl` pair plus all user adapters under the canonical LDGR home. The updater migrates safe pre-receipt installations through verified signed releases. Components already current are reported as no-ops.
 
 ### Options
 
@@ -256,14 +256,14 @@ Resolution is one immutable plan built from one verified snapshot of each catalo
 1. Determine the running Core version from `CARGO_PKG_VERSION` and the platform from the existing platform-tag logic.
 2. Resolve the newest allowed Core release strictly newer than the running version. Normal update never downgrades.
 3. Treat the Core archive’s `ldgr` and `agentctl` as one component. Verify the catalog metadata against `RELEASE-METADATA.json` after extraction.
-4. Discover adapters, but select only installations with valid receipts whose install roots are within the configured user adapter root and whose owned resources remain within recorded/configured harness boundaries.
+4. Discover adapters under the canonical user root. Select receipt-managed installations whose ownership remains valid. Classify a canonical adapter with no receipt as a one-time signed migration candidate.
 5. Resolve signed-release adapters against the **candidate Core profile** (or
    the active profile when Core is not selected): adapter protocol epoch,
    projected Core schema, required Core capabilities, and projected registered
    central components. Do not compare the global release-set hash or a maximum
    Core package patch for v2 artifacts.
 6. For each local-source receipt, validate its ownership boundary and source identity. A startup check may report source drift. An explicit bulk update may rerun the recorded source installer only when drift exists; unchanged local sources are no-ops.
-7. Skip untracked, project-local, and environment-override adapters with an explicit warning. Never guess ownership from a manifest path.
+7. Replace a pre-receipt user adapter only with a compatible signed catalog release. Include every destination in the transaction before mutation. Skip project-local and environment-override adapters. Block malformed receipts and modified receipt-owned files.
 8. If any installed adapter cannot be retained or replaced by a release
    compatible with the target Core, block the whole update before downloads.
    `--core-only` leaves adapter bytes unchanged but does not bypass this proof;
@@ -301,7 +301,9 @@ The official installers must begin writing `~/.ldgr/core-installation-receipt.js
 
 Package-manager installations must declare `managed_by` and are check-only. The updater prints the package-manager-specific update command when known.
 
-For pre-receipt official installations, v1 may offer one-time adoption only when both binaries are siblings, the directory is user-owned and writable, the platform is supported, the live compatibility handshake succeeds, and the path is not a recognized package-manager root such as Cargo’s bin directory. Interactive adoption requires confirmation; non-interactive adoption requires `--yes`. Otherwise application stops and directs the user to rerun the official installer.
+For pre-receipt official installations, v1 offers one-time adoption only when both binaries are siblings, the directory is user-owned and writable, the platform is supported, the live compatibility handshake succeeds, and the path is not a recognized package-manager root such as Cargo’s bin directory. Plain interactive `ldgr update` includes adoption in its single plan confirmation. Non-interactive application requires `--yes`. Successful activation replaces the provisional adoption record with an official signed-release receipt.
+
+A pre-receipt adapter under the canonical user adapter root follows the same plan confirmation. The updater resolves a compatible signed release, stages and verifies it, snapshots the legacy bundle and every replacement destination, and activates the signed release transactionally. Users do not remove adapter directories or reinstall adapters manually. A malformed receipt or modified receipt-owned installation remains blocked.
 
 ### Unix activation
 
@@ -432,7 +434,7 @@ No update code should depend on a project database being present.
 - Startup foreground command succeeds immediately while a fake slow/offline catalog worker times out independently.
 - Startup notices use stderr only and never corrupt JSON stdout.
 - Startup hook recursion is impossible for adapter dispatch, check workers, and finalizers.
-- All receipt-managed adapters are included; project, environment override, untracked, and modified adapters are skipped or blocked as specified.
+- All receipt-managed adapters are included. Safe pre-receipt user adapters are migrated automatically. Project and environment overrides are skipped. Malformed or modified installations are blocked.
 - The existing `ldgr adapter update <name>` fixtures pass through the refactored library without behavioral regression.
 
 ### Artifact and security tests

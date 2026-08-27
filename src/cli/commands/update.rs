@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::env;
+use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -16,8 +17,8 @@ use crate::cli::args::UpdateArgs;
 use crate::harness_config::UpdateChannel;
 use crate::release_index::{AdapterReleaseIndex, ReleaseKeyring};
 use crate::update::apply::{
-    apply_staged_update_plan, stage_verified_update_plan, PlanStagingOwnership, StagedUpdatePlan,
-    VerifiedStagingCatalogs,
+    apply_staged_update_plan, stage_verified_update_plan, AdapterOwnershipReceipt,
+    AdapterStagingOwnership, PlanStagingOwnership, StagedUpdatePlan, VerifiedStagingCatalogs,
 };
 use crate::update::catalog::{
     fetch_signed_adapter_update_catalog, fetch_signed_core_update_catalog, AdapterCatalogFetch,
@@ -25,7 +26,7 @@ use crate::update::catalog::{
     VerifiedAdapterUpdateCatalog, VerifiedCoreUpdateCatalog,
 };
 use crate::update::installation::{
-    resolve_current_core_installation, CoreInstallationOwnership, LegacyAdoptionAuthorization,
+    legacy_adoption_receipt, resolve_current_core_installation, CoreInstallationOwnership,
     LegacyAdoptionConsent,
 };
 use crate::update::network::UpdateNetworkClient;
@@ -388,7 +389,7 @@ fn adapter_catalog_required(args: &UpdateArgs, inventory: &UpdateInventory) -> b
         return inventory.adapters.iter().any(|adapter| {
             matches!(
                 adapter.installation,
-                AdapterInstallationKind::Release { .. }
+                AdapterInstallationKind::Release { .. } | AdapterInstallationKind::LegacyNoReceipt
             )
         });
     }
@@ -398,7 +399,7 @@ fn adapter_catalog_required(args: &UpdateArgs, inventory: &UpdateInventory) -> b
     inventory.adapters.iter().any(|adapter| {
         matches!(
             adapter.installation,
-            AdapterInstallationKind::Release { .. }
+            AdapterInstallationKind::Release { .. } | AdapterInstallationKind::LegacyNoReceipt
         ) && (args.adapters.is_empty() || args.adapters.iter().any(|name| name == &adapter.slug))
     })
 }
@@ -407,12 +408,20 @@ fn inspect_inventory(
     home: &Path,
     yes: bool,
 ) -> anyhow::Result<(UpdateInventory, PlanStagingOwnership)> {
-    let ownership =
-        resolve_current_core_installation(home, LegacyAdoptionConsent::NonInteractive { yes })?;
+    let consent = if yes {
+        LegacyAdoptionConsent::NonInteractive { yes: true }
+    } else {
+        LegacyAdoptionConsent::InteractivePending
+    };
+    let ownership = resolve_current_core_installation(home, consent)?;
     let core_receipt = match &ownership {
         CoreInstallationOwnership::OfficialInstall(receipt) => Some(receipt.clone()),
+        CoreInstallationOwnership::LegacyAdoption(candidate) => {
+            Some(legacy_adoption_receipt(candidate)?)
+        }
         _ => None,
     };
+    let legacy_adoption = matches!(ownership, CoreInstallationOwnership::LegacyAdoption(_));
     let core = core_snapshot(ownership);
     let registry = AdapterRegistry::discover();
     let mut discovery_warnings = registry
@@ -420,6 +429,12 @@ fn inspect_inventory(
         .iter()
         .map(|warning| format!("adapter discovery warning: {}", warning.message))
         .collect::<Vec<_>>();
+    if legacy_adoption {
+        discovery_warnings.push(
+            "Core predates installation receipts; this update will adopt the verified user installation"
+                .to_owned(),
+        );
+    }
     let roots = AdapterRoots::discover(home)?;
     let mut adapters = Vec::new();
     let mut adapter_ownership = BTreeMap::new();
@@ -444,24 +459,49 @@ fn inspect_inventory(
                 });
                 continue;
             };
-            match crate::update::adapter::inspect_adapter_for_bulk(installed, home, user_root) {
-                Ok((snapshot, owned)) => {
-                    adapter_ownership.insert(installed.slug.clone(), owned);
-                    snapshot
-                }
+            let receipt_path = installed.root_path.join("installation-receipt.json");
+            let receipt_missing = match fs::symlink_metadata(&receipt_path) {
+                Ok(_) => false,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => true,
                 Err(error) => {
-                    let detail = format!("{error:#}");
-                    let reason = if detail.contains("modified") {
-                        "receipt-owned files are modified"
-                    } else {
-                        "receipt ownership validation failed"
-                    };
-                    discovery_warnings.push(format!(
-                        "adapter `{}` is not eligible: {reason}",
-                        installed.slug
-                    ));
-                    AdapterInstallationKind::Untracked {
-                        reason: reason.to_owned(),
+                    return Err(error).with_context(|| {
+                        format!(
+                            "failed to inspect adapter receipt {}",
+                            receipt_path.display()
+                        )
+                    });
+                }
+            };
+            if receipt_missing {
+                adapter_ownership.insert(
+                    installed.slug.clone(),
+                    AdapterStagingOwnership {
+                        install_root: installed.root_path.clone(),
+                        user_adapter_root: user_root.to_path_buf(),
+                        receipt: AdapterOwnershipReceipt::LegacyNoReceipt,
+                    },
+                );
+                AdapterInstallationKind::LegacyNoReceipt
+            } else {
+                match crate::update::adapter::inspect_adapter_for_bulk(installed, home, user_root) {
+                    Ok((snapshot, owned)) => {
+                        adapter_ownership.insert(installed.slug.clone(), owned);
+                        snapshot
+                    }
+                    Err(error) => {
+                        let detail = format!("{error:#}");
+                        let reason = if detail.contains("modified") {
+                            "receipt-owned files are modified"
+                        } else {
+                            "receipt ownership validation failed"
+                        };
+                        discovery_warnings.push(format!(
+                            "adapter `{}` is not eligible: {reason}",
+                            installed.slug
+                        ));
+                        AdapterInstallationKind::Untracked {
+                            reason: reason.to_owned(),
+                        }
                     }
                 }
             }
@@ -552,13 +592,7 @@ fn core_snapshot(ownership: CoreInstallationOwnership) -> CoreInstallationSnapsh
         CoreInstallationOwnership::LegacyAdoption(candidate) => CoreInstallationSnapshot {
             current_core: candidate.evidence.core_version,
             current_agentctl: candidate.evidence.agentctl_version,
-            ownership: if candidate.authorization == LegacyAdoptionAuthorization::Approved {
-                CorePlanOwnership::ReceiptManaged
-            } else {
-                CorePlanOwnership::Unmanaged {
-                    reason: "legacy installation adoption requires confirmation".to_owned(),
-                }
-            },
+            ownership: CorePlanOwnership::ReceiptManaged,
         },
         CoreInstallationOwnership::Unmanaged { reason } => CoreInstallationSnapshot {
             current_core: env!("CARGO_PKG_VERSION").to_owned(),
