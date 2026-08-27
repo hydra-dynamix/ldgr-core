@@ -710,7 +710,7 @@ impl UpdateStateStore {
             state.phase
         );
         state.phase = StagingPhase::Applying;
-        state.updated_at_unix_ms = now_ms()?;
+        advance_state_timestamp(&mut state)?;
         atomic_json(&self.stage_dir(plan_id)?.join(STATE), &state)
     }
 
@@ -731,7 +731,7 @@ impl UpdateStateStore {
             "finalizer payload can only be bound to staged plans"
         );
         state.finalizer_payload_sha256 = Some(sha256.to_owned());
-        state.updated_at_unix_ms = now_ms()?;
+        advance_state_timestamp(&mut state)?;
         atomic_json(&self.stage_dir(plan_id)?.join(STATE), &state)
     }
 
@@ -750,7 +750,7 @@ impl UpdateStateStore {
             "staged plan is already terminal"
         );
         state.phase = outcome.phase();
-        state.updated_at_unix_ms = now_ms()?;
+        advance_state_timestamp(&mut state)?;
         state.components = components;
         state.error = error;
         atomic_json(&self.stage_dir(plan_id)?.join(STATE), &state)?;
@@ -778,7 +778,7 @@ impl UpdateStateStore {
             "staged plan is already terminal"
         );
         state.phase = outcome.phase();
-        state.updated_at_unix_ms = now_ms()?;
+        advance_state_timestamp(&mut state)?;
         state.components = components;
         state.error = error;
         atomic_json(&self.stage_dir(plan_id)?.join(STATE), &state)?;
@@ -1202,6 +1202,13 @@ fn now_ms() -> anyhow::Result<u64> {
         .duration_since(UNIX_EPOCH)
         .context("clock before Unix epoch")?
         .as_millis() as u64)
+}
+
+fn advance_state_timestamp(state: &mut StagingState) -> anyhow::Result<()> {
+    state.updated_at_unix_ms = now_ms()?
+        .max(state.created_at_unix_ms)
+        .max(state.updated_at_unix_ms);
+    Ok(())
 }
 
 fn token() -> anyhow::Result<String> {
@@ -1776,6 +1783,28 @@ mod tests {
                 action: RecoveryAction::RollbackRequired,
             }]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn state_transitions_tolerate_wall_clock_rollback() -> anyhow::Result<()> {
+        let (_directory, store) = fixture()?;
+        let plan = plan(23);
+        let id = deterministic_plan_id(&plan)?;
+        let lock = store.acquire_lock(UpdateMode::Apply, Some(&id), Duration::from_secs(60))?;
+        store.stage_plan(&lock, &plan)?;
+
+        let mut state = store.load_staging_state(&id)?;
+        state.created_at_unix_ms += 60_000;
+        state.updated_at_unix_ms = state.created_at_unix_ms;
+        atomic_json(&store.stage_dir(&id)?.join(STATE), &state)?;
+
+        store.mark_applying(&lock, &id)?;
+        let applying = store.load_staging_state(&id)?;
+        assert_eq!(applying.updated_at_unix_ms, applying.created_at_unix_ms);
+        let history =
+            store.complete_plan(&lock, &id, TerminalOutcome::Applied, Vec::new(), None)?;
+        assert!(history.finished_at_unix_ms >= history.started_at_unix_ms);
         Ok(())
     }
 

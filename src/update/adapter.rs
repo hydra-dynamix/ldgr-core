@@ -149,6 +149,21 @@ pub(crate) fn inspect_adapter_installation(
     })
 }
 
+fn validate_release_receipt_schema(receipt: &InstallationReceipt) -> anyhow::Result<()> {
+    match receipt.schema_version {
+        1 => anyhow::ensure!(
+            receipt.compatibility.is_none() && receipt.compatibility_sha256.is_none(),
+            "release receipt schema 1 cannot contain compatibility-v2 metadata"
+        ),
+        2 => anyhow::ensure!(
+            receipt.compatibility.is_some() && receipt.compatibility_sha256.is_some(),
+            "release receipt schema 2 requires compatibility-v2 metadata"
+        ),
+        schema => anyhow::bail!("unsupported release receipt schema {schema}; expected 1 or 2"),
+    }
+    Ok(())
+}
+
 pub(crate) fn inspect_adapter_for_bulk(
     installed: &DiscoveredAdapter,
     home: &Path,
@@ -160,10 +175,7 @@ pub(crate) fn inspect_adapter_for_bulk(
         .context("installed adapter has no tracked installation receipt")?;
     match parse_installation_receipt(value)? {
         AdapterInstallationReceipt::Release(receipt) => {
-            anyhow::ensure!(
-                receipt.schema_version == 1,
-                "unsupported release receipt schema"
-            );
+            validate_release_receipt_schema(&receipt)?;
             anyhow::ensure!(
                 receipt.domain == installed.slug,
                 "release receipt domain does not match the discovered adapter"
@@ -709,6 +721,28 @@ mod tests {
             binary_sha256: None,
             owned_resources: Vec::new(),
         }
+    }
+
+    #[test]
+    fn release_receipt_schema_matches_compatibility_generation() -> anyhow::Result<()> {
+        let legacy = release_receipt("1.0.0");
+        validate_release_receipt_schema(&legacy)?;
+
+        let mut compatibility_v2 = legacy.clone();
+        compatibility_v2.schema_version = 2;
+        compatibility_v2.core_compatibility.clear();
+        compatibility_v2.compatibility = Some(serde_json::from_value(serde_json::json!({
+            "adapter_protocol_epoch": 1,
+            "minimum_core_schema": 5,
+            "required_core_capabilities": ["work.v1"],
+            "central_components": []
+        }))?);
+        compatibility_v2.compatibility_sha256 = Some(format!("sha256:{}", "0".repeat(64)));
+        validate_release_receipt_schema(&compatibility_v2)?;
+
+        compatibility_v2.schema_version = 1;
+        assert!(validate_release_receipt_schema(&compatibility_v2).is_err());
+        Ok(())
     }
 
     fn release_index() -> AdapterReleaseIndex {
