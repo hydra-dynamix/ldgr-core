@@ -338,9 +338,9 @@ jobs:
           HOME="$root/home" LDGR_INSTALL_DIR="$previous_install" LDGR_VERSION="$previous" \
             LDGR_CORE_UPDATE_INDEX="$catalog" LDGR_CORE_CATALOG_HELPER="$helper" \
             LDGR_CORE_RELEASE_KEYRING="$keyring" sh scripts/install.sh
-          if [ "$previous" = "0.1.14" ] || [ "$previous" = "0.1.15" ]; then
-            # Core 0.1.16 fixes pre-receipt update activation. Older binaries
-            # require the signed installer for this one-time bootstrap.
+          if [ "$previous" = "0.1.14" ] || [ "$previous" = "0.1.15" ] || [ "$previous" = "0.1.16" ]; then
+            # Core 0.1.17 completes pre-receipt update finalization. Older
+            # binaries require the signed installer for this one-time bootstrap.
             HOME="$root/home" LDGR_INSTALL_DIR="$previous_install" \
               LDGR_VERSION="$TARGET_VERSION" LDGR_CORE_UPDATE_INDEX="$catalog" \
               LDGR_CORE_CATALOG_HELPER="$helper" LDGR_CORE_RELEASE_KEYRING="$keyring" \
@@ -379,9 +379,9 @@ jobs:
           $env:LDGR_CORE_CATALOG_HELPER = $helper.AbsoluteUri
           $env:LDGR_CORE_RELEASE_KEYRING = $keyring.AbsoluteUri
           & scripts/install.ps1
-          if ($previous -eq "0.1.14" -or $previous -eq "0.1.15") {
-            # Core 0.1.16 fixes pre-receipt update activation. Older binaries
-            # require the signed installer for this one-time bootstrap.
+          if ($previous -eq "0.1.14" -or $previous -eq "0.1.15" -or $previous -eq "0.1.16") {
+            # Core 0.1.17 completes pre-receipt update finalization. Older
+            # binaries require the signed installer for this one-time bootstrap.
             $env:LDGR_INSTALL_DIR = $previousInstall
             $env:LDGR_VERSION = $env:TARGET_VERSION
             & scripts/install.ps1
