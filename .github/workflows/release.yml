@@ -355,9 +355,9 @@ jobs:
           TARGET_VERSION: ${{ needs.metadata.outputs.version }}
         run: |
           $root = Join-Path $env:RUNNER_TEMP "ldgr-release-gate"
-          $catalog = [Uri](Resolve-Path "candidate/candidate/core-index.json")
-          $helper = [Uri](Resolve-Path "scripts/core-catalog.py")
-          $keyring = [Uri](Resolve-Path "candidate/candidate/release-keyring.json")
+          $catalog = [Uri]((Resolve-Path "candidate/candidate/core-index.json").Path)
+          $helper = [Uri]((Resolve-Path "scripts/core-catalog.py").Path)
+          $keyring = [Uri]((Resolve-Path "candidate/candidate/release-keyring.json").Path)
           $previous = (Get-Content -Raw "candidate/candidate/previous-version.txt").Trim()
           $env:HOME = Join-Path $root "home"
           $env:USERPROFILE = $env:HOME
