@@ -334,13 +334,14 @@ jobs:
           catalog="file://$PWD/candidate/candidate/core-index.json"
           helper="file://$PWD/scripts/core-catalog.py"
           keyring="file://$PWD/candidate/candidate/release-keyring.json"
-          HOME="$root/home" LDGR_INSTALL_DIR="$root/previous" LDGR_VERSION="$previous" \
+          previous_install="$root/home/.local/bin"
+          HOME="$root/home" LDGR_INSTALL_DIR="$previous_install" LDGR_VERSION="$previous" \
             LDGR_CORE_UPDATE_INDEX="$catalog" LDGR_CORE_CATALOG_HELPER="$helper" \
             LDGR_CORE_RELEASE_KEYRING="$keyring" sh scripts/install.sh
           HOME="$root/home" LDGR_CORE_UPDATE_INDEX="$catalog" \
             LDGR_CORE_RELEASE_KEYRING="$keyring" \
-            "$root/previous/ldgr" update --core-only --yes
-          test "$("$root/previous/ldgr" --version)" = "ldgr $TARGET_VERSION"
+            "$previous_install/ldgr" update --core-only --yes
+          test "$("$previous_install/ldgr" --version)" = "ldgr $TARGET_VERSION"
           HOME="$root/current-home" LDGR_INSTALL_DIR="$root/current" \
             LDGR_VERSION="$TARGET_VERSION" LDGR_CORE_UPDATE_INDEX="$catalog" \
             LDGR_CORE_CATALOG_HELPER="$helper" LDGR_CORE_RELEASE_KEYRING="$keyring" \
@@ -361,17 +362,18 @@ jobs:
           $previous = (Get-Content -Raw "candidate/candidate/previous-version.txt").Trim()
           $env:HOME = Join-Path $root "home"
           $env:USERPROFILE = $env:HOME
-          $env:LDGR_INSTALL_DIR = Join-Path $root "previous"
+          $previousInstall = Join-Path $env:HOME ".local\bin"
+          $env:LDGR_INSTALL_DIR = $previousInstall
           $env:LDGR_VERSION = $previous
           $env:LDGR_CORE_UPDATE_INDEX = $catalog.AbsoluteUri
           $env:LDGR_CORE_CATALOG_HELPER = $helper.AbsoluteUri
           $env:LDGR_CORE_RELEASE_KEYRING = $keyring.AbsoluteUri
           & scripts/install.ps1
-          & "$env:LDGR_INSTALL_DIR/ldgr.exe" update --core-only --yes
+          & "$previousInstall/ldgr.exe" update --core-only --yes
           $deadline = [DateTime]::UtcNow.AddSeconds(30)
           do {
             Start-Sleep -Milliseconds 250
-            $installed = (& "$env:LDGR_INSTALL_DIR/ldgr.exe" --version).Trim()
+            $installed = (& "$previousInstall/ldgr.exe" --version).Trim()
           } while ($installed -ne "ldgr $env:TARGET_VERSION" -and [DateTime]::UtcNow -lt $deadline)
           if ($installed -ne "ldgr $env:TARGET_VERSION") { throw "Previous-version update did not finalize." }
           $env:HOME = Join-Path $root "current-home"
