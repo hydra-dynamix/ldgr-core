@@ -2427,7 +2427,8 @@ mod tests {
 
     struct CoreFixture {
         _files: tempfile::TempDir,
-        home: tempfile::TempDir,
+        _home: tempfile::TempDir,
+        home_path: PathBuf,
         plan: UpdatePlan,
         core_catalog: VerifiedCoreUpdateCatalog,
         adapter_catalog: VerifiedAdapterUpdateCatalog,
@@ -2505,9 +2506,11 @@ mod tests {
     fn core_fixture() -> anyhow::Result<CoreFixture> {
         let files = tempfile::tempdir()?;
         let home = tempfile::tempdir()?;
+        let files_path = fs::canonicalize(files.path())?;
+        let home_path = fs::canonicalize(home.path())?;
         let platform = "windows-x86_64";
         let archive_root = "ldgr-core-0.2.0";
-        let archive = files.path().join("core.tar.gz");
+        let archive = files_path.join("core.tar.gz");
         let signature = files.path().join("core.tar.gz.sig");
         let key = SigningKey::from_bytes(&[23; 32]);
         let keyring = ReleaseKeyring {
@@ -2591,9 +2594,9 @@ mod tests {
             catalog_signing_key_id: String::new(),
             archive_keyring: keyring.clone(),
         };
-        let install_root = home.path().join("bin");
+        let install_root = home_path.join("bin");
         fs::create_dir_all(&install_root)?;
-        fs::create_dir_all(home.path().join(".ldgr"))?;
+        fs::create_dir_all(home_path.join(".ldgr"))?;
         let installed_core = install_root.join("ldgr.exe");
         let installed_agentctl = install_root.join("agentctl.exe");
         fs::write(&installed_core, "old-core")?;
@@ -2644,14 +2647,15 @@ mod tests {
             platform,
         )?;
         let ownership = PlanStagingOwnership {
-            home: home.path().to_path_buf(),
+            home: home_path.clone(),
             core: Some(receipt),
             adapters: BTreeMap::new(),
             adapter_roots: BTreeMap::new(),
         };
         Ok(CoreFixture {
             _files: files,
-            home,
+            _home: home,
+            home_path,
             plan,
             core_catalog,
             adapter_catalog,
@@ -2687,7 +2691,7 @@ mod tests {
     fn stage_core_fixture(
         fixture: &CoreFixture,
     ) -> anyhow::Result<(UpdateStateStore, UpdateLock, StagedUpdatePlan)> {
-        let store = UpdateStateStore::open(fixture.home.path().join(".ldgr"))?;
+        let store = UpdateStateStore::open(fixture.home_path.join(".ldgr"))?;
         let lock = store.acquire_lock(
             UpdateMode::Apply,
             Some(fixture.plan.plan_id()),
@@ -2745,7 +2749,7 @@ mod tests {
             "old-agentctl"
         );
         let receipt: CoreInstallationReceipt = serde_json::from_slice(&fs::read(
-            core_installation_receipt_path(fixture.home.path()),
+            core_installation_receipt_path(&fixture.home_path),
         )?)?;
         assert_eq!(receipt.core_version, "0.2.0");
         assert_eq!(receipt.agentctl_version, "0.2.0");
@@ -2834,7 +2838,7 @@ mod tests {
             );
             assert!(!previous_path(&fixture.installed_core)?.exists());
             assert!(!previous_path(&fixture.installed_agentctl)?.exists());
-            assert!(!core_installation_receipt_path(fixture.home.path()).exists());
+            assert!(!core_installation_receipt_path(&fixture.home_path).exists());
             assert!(!fixture
                 .ownership
                 .core
@@ -2939,7 +2943,7 @@ mod tests {
     #[test]
     fn verified_staging_persists_plan_and_snapshots_before_activation() -> anyhow::Result<()> {
         let fixture = core_fixture()?;
-        let store = UpdateStateStore::open(fixture.home.path().join(".ldgr"))?;
+        let store = UpdateStateStore::open(fixture.home_path.join(".ldgr"))?;
         let lock = store.acquire_lock(
             UpdateMode::Apply,
             Some(fixture.plan.plan_id()),
@@ -2997,7 +3001,7 @@ mod tests {
     fn tampered_artifact_fails_before_first_snapshot_or_target_mutation() -> anyhow::Result<()> {
         let fixture = core_fixture()?;
         fs::write(&fixture.archive, "tampered")?;
-        let store = UpdateStateStore::open(fixture.home.path().join(".ldgr"))?;
+        let store = UpdateStateStore::open(fixture.home_path.join(".ldgr"))?;
         let lock = store.acquire_lock(
             UpdateMode::Apply,
             Some(fixture.plan.plan_id()),
@@ -3093,10 +3097,10 @@ mod tests {
             &fixture.adapter_catalog.archive_keyring,
         )?;
         fs::write(
-            fixture.home.path().join(".ldgr/config.json"),
+            fixture.home_path.join(".ldgr/config.json"),
             serde_json::to_vec(&crate::harness_config::HarnessConfig::default())?,
         )?;
-        let user_adapter_root = fixture.home.path().join(".ldgr/adapters");
+        let user_adapter_root = fixture.home_path.join(".ldgr/adapters");
         let install_root = user_adapter_root.join("fixture");
         fs::create_dir_all(&install_root)?;
         let empty_digest = format!("{:x}", Sha256::digest([]));
@@ -3171,7 +3175,7 @@ mod tests {
             },
         );
         fs::write(&adapter_archive, "tampered-later-artifact")?;
-        let store = UpdateStateStore::open(fixture.home.path().join(".ldgr"))?;
+        let store = UpdateStateStore::open(fixture.home_path.join(".ldgr"))?;
         let lock = store.acquire_lock(
             UpdateMode::Apply,
             Some(plan.plan_id()),
