@@ -383,6 +383,32 @@ pub fn resolve_core_installation_ownership(
     ))
 }
 
+pub fn legacy_adoption_receipt(
+    candidate: &LegacyAdoptionCandidate,
+) -> anyhow::Result<CoreInstallationReceipt> {
+    let receipt = CoreInstallationReceipt {
+        schema_version: CORE_INSTALLATION_RECEIPT_SCHEMA_VERSION,
+        installer_kind: CoreInstallerKind::LegacyAdopted,
+        managed_by: None,
+        core_version: candidate.evidence.core_version.clone(),
+        agentctl_version: candidate.evidence.agentctl_version.clone(),
+        archive: None,
+        install_root: candidate.install_root.clone(),
+        core_binary_path: candidate.core_binary_path.clone(),
+        agentctl_binary_path: candidate.agentctl_binary_path.clone(),
+        core_binary_sha256: digest_file(&candidate.core_binary_path)?,
+        agentctl_binary_sha256: digest_file(&candidate.agentctl_binary_path)?,
+        compatibility_schema: candidate.evidence.compatibility_schema.clone(),
+        previous_successful_plan_id: None,
+        installed_at_unix_seconds: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("system clock is before Unix epoch")?
+            .as_secs(),
+    };
+    validate_receipt(&receipt)?;
+    Ok(receipt)
+}
+
 pub fn write_official_installation_receipt(
     input: &OfficialReceiptInput,
 ) -> anyhow::Result<CoreInstallationReceipt> {
@@ -939,6 +965,11 @@ mod tests {
             candidate.authorization,
             LegacyAdoptionAuthorization::ConfirmationRequired
         );
+        let receipt = legacy_adoption_receipt(&candidate)?;
+        assert_eq!(receipt.installer_kind, CoreInstallerKind::LegacyAdopted);
+        assert_eq!(receipt.install_root, candidate.install_root);
+        assert_eq!(receipt.core_binary_sha256, digest_file(&core)?);
+        validate_receipt(&receipt)?;
 
         let denied = context(
             home.path(),

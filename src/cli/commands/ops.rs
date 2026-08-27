@@ -1393,6 +1393,7 @@ pub(crate) fn stage_and_apply_resolved_index_release(
         home,
         transaction,
         false,
+        false,
     )
 }
 
@@ -1403,6 +1404,7 @@ pub(crate) fn apply_staged_resolved_index_release(
     home: &Path,
     transaction: &mut InstallTransaction,
     quiet: bool,
+    migrate_legacy: bool,
 ) -> anyhow::Result<()> {
     if resolved.release.compatibility.is_some() {
         validate_adapter_bundle_contract(extracted, &resolved.adapter.domain)?;
@@ -1410,10 +1412,28 @@ pub(crate) fn apply_staged_resolved_index_release(
     } else {
         validate_legacy_adapter_bundle_contract(extracted, &resolved.adapter.domain)?;
     }
+    if migrate_legacy {
+        let receipt = install_root.join("installation-receipt.json");
+        match fs::symlink_metadata(&receipt) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to inspect legacy adapter receipt {}", receipt.display())
+                });
+            }
+            Ok(_) => bail!(
+                "legacy adapter gained an installation receipt before activation; resolve the new ownership state and retry"
+            ),
+        }
+    }
     let binary_source = extracted
         .join(&resolved.platform.platform)
         .join(&resolved.platform.binary);
-    let previous_receipt = read_release_update_receipt(install_root, &resolved.adapter.domain)?;
+    let previous_receipt = if migrate_legacy {
+        None
+    } else {
+        read_release_update_receipt(install_root, &resolved.adapter.domain)?
+    };
     let resource_plan =
         typed_harness_resource_plan(extracted, home, &resolved.platform.resource_manifest)?;
     let resource_targets = resource_plan
@@ -1431,7 +1451,10 @@ pub(crate) fn apply_staged_resolved_index_release(
         })
         .unwrap_or_default();
     for target in &resource_targets {
-        if target.exists() && !previously_owned.iter().any(|owned| owned == target) {
+        if !migrate_legacy
+            && target.exists()
+            && !previously_owned.iter().any(|owned| owned == target)
+        {
             bail!(
                 "refusing to overwrite unowned harness resource {}; remove it or choose a different harness resource path",
                 target.display()

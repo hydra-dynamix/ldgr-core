@@ -95,6 +95,7 @@ pub enum AdapterInstallationKind {
         current_source_sha256: String,
         source_changed: bool,
     },
+    LegacyNoReceipt,
     Untracked {
         reason: String,
     },
@@ -723,6 +724,29 @@ fn plan_adapter_for_core_update(
     coordinated_updates_allowed: bool,
 ) -> anyhow::Result<(UpdatePlanComponent, bool, Vec<String>)> {
     if adapter.origin == AdapterOrigin::User {
+        if matches!(
+            adapter.installation,
+            AdapterInstallationKind::LegacyNoReceipt
+        ) {
+            if !coordinated_updates_allowed {
+                return Ok((
+                    blocked_adapter_optional(&adapter.slug, None, None),
+                    true,
+                    vec![format!(
+                        "adapter `{}` predates receipts and requires signed migration; remove --core-only to migrate it with Core",
+                        adapter.slug
+                    )],
+                ));
+            }
+            return plan_legacy_adapter_migration(
+                adapter,
+                catalog,
+                target_core,
+                platform,
+                channel,
+                offline,
+            );
+        }
         if let AdapterInstallationKind::Untracked { reason } = &adapter.installation {
             return Ok((
                 blocked_adapter_optional(&adapter.slug, None, None),
@@ -963,6 +987,9 @@ fn plan_adapter(
         ));
     }
     match &adapter.installation {
+        AdapterInstallationKind::LegacyNoReceipt => {
+            plan_legacy_adapter_migration(adapter, catalog, target_core, platform, channel, offline)
+        }
         AdapterInstallationKind::Untracked { reason } => Ok((
             skipped_adapter(&adapter.slug, None),
             false,
@@ -1040,6 +1067,71 @@ fn plan_adapter(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn plan_legacy_adapter_migration(
+    adapter: &AdapterInstallationSnapshot,
+    catalog: &AdapterReleaseIndex,
+    target_core: &Version,
+    platform: &str,
+    channel: UpdateChannel,
+    offline: bool,
+) -> anyhow::Result<(UpdatePlanComponent, bool, Vec<String>)> {
+    match resolve_release(
+        catalog,
+        &adapter.slug,
+        target_core,
+        platform,
+        None,
+        channel == UpdateChannel::Prerelease,
+    ) {
+        Ok(resolved) => {
+            let mut release = resolved.release.clone();
+            release
+                .platforms
+                .sort_by(|left, right| left.platform.cmp(&right.platform));
+            let artifact = AdapterReleaseArtifact {
+                domain: resolved.adapter.domain.clone(),
+                version: resolved.version.to_string(),
+                release,
+                platform: resolved.platform.clone(),
+            };
+            if offline && !adapter_artifact_is_offline(&artifact.platform) {
+                return Ok((
+                    blocked_adapter_optional(&adapter.slug, None, Some(&artifact.version)),
+                    true,
+                    vec![format!(
+                        "adapter `{}` migration requires remote artifacts that are unavailable in offline mode",
+                        adapter.slug
+                    )],
+                ));
+            }
+            Ok((
+                UpdatePlanComponent::Adapter {
+                    name: adapter.slug.clone(),
+                    current: None,
+                    target: Some(artifact.version.clone()),
+                    action: UpdateAction::Update,
+                    compatibility: UpdateCompatibility::Compatible,
+                    release: Some(artifact),
+                    local_source: None,
+                },
+                false,
+                vec![format!(
+                    "adapter `{}` predates installation receipts; this update will replace it with a verified signed release",
+                    adapter.slug
+                )],
+            ))
+        }
+        Err(error) => Ok((
+            blocked_adapter_optional(&adapter.slug, None, None),
+            true,
+            vec![format!(
+                "adapter `{}` predates receipts and has no compatible signed migration release: {error}",
+                adapter.slug
+            )],
+        )),
+    }
+}
+
 fn plan_release_adapter(
     adapter: &AdapterInstallationSnapshot,
     version: &str,
@@ -1187,7 +1279,9 @@ fn installed_adapter_identity(installation: &AdapterInstallationKind) -> Option<
             installed_source_sha256,
             ..
         } => Some(installed_source_sha256.clone()),
-        AdapterInstallationKind::Untracked { .. } => None,
+        AdapterInstallationKind::LegacyNoReceipt | AdapterInstallationKind::Untracked { .. } => {
+            None
+        }
     }
 }
 
@@ -1446,6 +1540,17 @@ mod tests {
         }
     }
 
+    fn legacy_install(slug: &str) -> AdapterInstallationSnapshot {
+        AdapterInstallationSnapshot {
+            slug: slug.to_owned(),
+            origin: AdapterOrigin::User,
+            installation: AdapterInstallationKind::LegacyNoReceipt,
+            compatibility: InstalledAdapterCompatibility::V2 {
+                sidecar: compatible_sidecar(slug),
+            },
+        }
+    }
+
     fn plan(
         request: UpdatePlanRequest,
         core_releases: Vec<CoreRelease>,
@@ -1463,6 +1568,49 @@ mod tests {
             &Version::parse("1.0.0")?,
             PLATFORM,
         )
+    }
+
+    #[test]
+    fn legacy_adapter_is_migrated_with_core_without_manual_removal() -> anyhow::Result<()> {
+        let migration_plan = plan(
+            UpdatePlanRequest::default(),
+            vec![core_release("1.1.0", ReleaseChannel::Stable)],
+            vec![adapter_product(
+                "research",
+                vec![adapter_release_v2("research", "1.1.0")],
+            )],
+            inventory(vec![legacy_install("research")]),
+        )?;
+
+        assert!(!migration_plan.blocked());
+        assert_eq!(migration_plan.components().len(), 2);
+        assert!(migration_plan
+            .components()
+            .iter()
+            .all(|component| component.action() == UpdateAction::Update));
+        assert!(migration_plan.warnings().iter().any(|warning| {
+            warning.contains("predates installation receipts")
+                && warning.contains("verified signed release")
+        }));
+
+        let core_only = plan(
+            UpdatePlanRequest {
+                core_only: true,
+                ..UpdatePlanRequest::default()
+            },
+            vec![core_release("1.1.0", ReleaseChannel::Stable)],
+            vec![adapter_product(
+                "research",
+                vec![adapter_release_v2("research", "1.1.0")],
+            )],
+            inventory(vec![legacy_install("research")]),
+        )?;
+        assert!(core_only.blocked());
+        assert!(core_only
+            .warnings()
+            .iter()
+            .any(|warning| warning.contains("remove --core-only")));
+        Ok(())
     }
 
     #[test]

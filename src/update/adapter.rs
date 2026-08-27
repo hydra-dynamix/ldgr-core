@@ -359,6 +359,7 @@ fn apply_staged_release(
         &ownership.home,
         transaction,
         quiet,
+        matches!(owned.receipt, AdapterOwnershipReceipt::LegacyNoReceipt),
     )
 }
 

@@ -1548,6 +1548,41 @@ fn update_check_skips_a_modified_receipt_owned_adapter() -> anyhow::Result<()> {
 }
 
 #[test]
+fn update_apply_migrates_a_legacy_adapter_without_manual_removal() -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    let fixture = write_update_check_fixture(project.path())?;
+    materialize_update_apply_fixture(project.path(), &fixture)?;
+    fs::remove_file(fixture.adapter_root.join("installation-receipt.json"))?;
+
+    let mut apply = isolated_command(project.path())?;
+    apply
+        .env("LDGR_ADAPTER_INDEX", &fixture.index)
+        .env("LDGR_ADAPTER_RELEASE_KEYRING", &fixture.keyring)
+        .args(["update", "--json", "--adapters-only", "--offline", "--yes"]);
+    let output = apply.output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(result["status"], "applied");
+    assert_eq!(result["components"][0]["action"], "applied");
+    assert!(fixture
+        .adapter_root
+        .join("installation-receipt.json")
+        .is_file());
+    let receipt: serde_json::Value = serde_json::from_slice(&fs::read(
+        fixture.adapter_root.join("installation-receipt.json"),
+    )?)?;
+    assert_eq!(receipt["domain"], "fixture");
+    assert!(receipt["schema_version"]
+        .as_u64()
+        .is_some_and(|value| value > 0));
+    Ok(())
+}
+
+#[test]
 fn update_apply_never_mutates_project_or_environment_override_adapters() -> anyhow::Result<()> {
     let project = TempDir::new()?;
     let home = project.path().join(".ldgr/test-empty-home");

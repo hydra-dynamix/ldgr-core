@@ -66,6 +66,7 @@ pub struct VerifiedStagingCatalogs<'a> {
 pub enum AdapterOwnershipReceipt {
     Release(InstallationReceipt),
     LocalSource(SourceInstallationReceipt),
+    LegacyNoReceipt,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -319,8 +320,16 @@ fn apply_core_bundle(
         .context("selected Core update has no installation receipt")?;
     validate_receipt(receipt)?;
     ensure!(
-        receipt.installer_kind == CoreInstallerKind::Official,
-        "only an official receipt-managed Core installation may self-update"
+        matches!(
+            receipt.installer_kind,
+            CoreInstallerKind::Official | CoreInstallerKind::LegacyAdopted
+        ),
+        "only an official or safely adopted Core installation may self-update"
+    );
+    ensure!(
+        file_sha256(&receipt.core_binary_path)? == receipt.core_binary_sha256
+            && file_sha256(&receipt.agentctl_binary_path)? == receipt.agentctl_binary_sha256,
+        "Core or agentctl changed after update planning"
     );
     let staged = manifest
         .artifacts
@@ -1355,18 +1364,27 @@ fn adapter_release_targets(
     extracted_root: &Path,
     owned: &AdapterStagingOwnership,
 ) -> anyhow::Result<Vec<OwnedTarget>> {
-    let AdapterOwnershipReceipt::Release(receipt) = &owned.receipt else {
-        bail!("adapter `{name}` plan expects signed-release ownership");
+    let receipt = match &owned.receipt {
+        AdapterOwnershipReceipt::Release(receipt) => {
+            ensure!(
+                receipt.domain == name,
+                "adapter receipt domain differs from resolved plan"
+            );
+            crate::cli::commands::ops::inspect_release_installation_for_update(
+                &owned.install_root,
+                home,
+                receipt,
+            )?;
+            Some(receipt)
+        }
+        AdapterOwnershipReceipt::LegacyNoReceipt => {
+            ensure_legacy_adapter_receipt_absent(&owned.install_root)?;
+            None
+        }
+        AdapterOwnershipReceipt::LocalSource(_) => {
+            bail!("adapter `{name}` plan expects signed-release ownership")
+        }
     };
-    ensure!(
-        receipt.domain == name,
-        "adapter receipt domain differs from resolved plan"
-    );
-    crate::cli::commands::ops::inspect_release_installation_for_update(
-        &owned.install_root,
-        home,
-        receipt,
-    )?;
     let mut targets = adapter_common_targets(home, name, owned)?;
     let platform_binary = extracted_root
         .join(&artifact.platform.platform)
@@ -1375,13 +1393,13 @@ fn adapter_release_targets(
         let binary_root = absolute_lexical(&home.join(".local/bin"))?;
         let binary_target = binary_root.join(&artifact.platform.binary);
         let previously_owned_binary = receipt
-            .binary_path
-            .as_deref()
+            .and_then(|receipt| receipt.binary_path.as_deref())
             .map(Path::new)
             .map(absolute_lexical)
             .transpose()?;
         ensure!(
-            !binary_target.exists()
+            receipt.is_none()
+                || !binary_target.exists()
                 || previously_owned_binary
                     .as_ref()
                     .is_some_and(|owned| paths_equal(owned, &binary_target)),
@@ -1401,10 +1419,15 @@ fn adapter_release_targets(
         &artifact.platform.resource_manifest,
     )?;
     let previously_owned = receipt
-        .owned_resources
-        .iter()
-        .map(|resource| absolute_lexical(Path::new(&resource.path)))
-        .collect::<anyhow::Result<Vec<_>>>()?;
+        .map(|receipt| {
+            receipt
+                .owned_resources
+                .iter()
+                .map(|resource| absolute_lexical(Path::new(&resource.path)))
+                .collect::<anyhow::Result<Vec<_>>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
     let allowed_roots = crate::cli::commands::ops::source_allowed_resource_roots(home)?;
     for (_, target) in resources {
         let target = absolute_lexical(&target)?;
@@ -1420,13 +1443,28 @@ fn adapter_release_targets(
                 )
             })?;
         ensure!(
-            !target.exists() || previously_owned.iter().any(|owned| paths_equal(owned, &target)),
+            receipt.is_none()
+                || !target.exists()
+                || previously_owned.iter().any(|owned| paths_equal(owned, &target)),
             "refusing to overwrite unowned harness resource {}; remove it or choose a different harness resource path",
             target.display()
         );
         targets.push(OwnedTarget::new(name, "harness_resource", boundary, target));
     }
     Ok(targets)
+}
+
+fn ensure_legacy_adapter_receipt_absent(install_root: &Path) -> anyhow::Result<()> {
+    let receipt = install_root.join("installation-receipt.json");
+    match fs::symlink_metadata(&receipt) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| {
+            format!("failed to inspect legacy adapter receipt {}", receipt.display())
+        }),
+        Ok(_) => bail!(
+            "legacy adapter gained an installation receipt after planning; resolve the new ownership state and retry"
+        ),
+    }
 }
 
 fn adapter_common_targets(
@@ -1454,9 +1492,10 @@ fn adapter_common_targets(
             marker_root.join(name),
         ),
     ];
-    let resources = match &owned.receipt {
+    let resources: &[_] = match &owned.receipt {
         AdapterOwnershipReceipt::Release(receipt) => &receipt.owned_resources,
         AdapterOwnershipReceipt::LocalSource(receipt) => &receipt.owned_resources,
+        AdapterOwnershipReceipt::LegacyNoReceipt => &[],
     };
     if let AdapterOwnershipReceipt::Release(receipt) = &owned.receipt {
         if let Some(binary) = receipt.binary_path.as_deref() {
@@ -2623,8 +2662,8 @@ mod tests {
             install_root: install_root.clone(),
             core_binary_path: installed_core.clone(),
             agentctl_binary_path: installed_agentctl.clone(),
-            core_binary_sha256: "0".repeat(64),
-            agentctl_binary_sha256: "0".repeat(64),
+            core_binary_sha256: file_sha256(&installed_core)?,
+            agentctl_binary_sha256: file_sha256(&installed_agentctl)?,
             compatibility_schema: LAUNCHER_COMPATIBILITY_SCHEMA.to_owned(),
             previous_successful_plan_id: None,
             installed_at_unix_seconds: 0,
@@ -2778,6 +2817,42 @@ mod tests {
         let history = store.read_history()?;
         assert_eq!(history[0].outcome, TerminalOutcome::Applied);
         assert_eq!(history[0].components[0].status, "applied");
+        lock.release()?;
+        Ok(())
+    }
+
+    #[test]
+    fn safely_adopted_legacy_core_applies_and_becomes_official() -> anyhow::Result<()> {
+        let mut fixture = core_fixture()?;
+        let receipt = fixture.ownership.core.as_mut().context("fixture receipt")?;
+        receipt.installer_kind = CoreInstallerKind::LegacyAdopted;
+        receipt.archive = None;
+        let (store, lock, staged) = stage_core_fixture(&fixture)?;
+        let StagedUpdatePlan {
+            manifest,
+            mut transaction,
+        } = staged;
+        store.mark_applying(&lock, fixture.plan.plan_id())?;
+
+        let components = apply_staged_update_plan_with_services(
+            &fixture.plan,
+            &manifest,
+            &fixture.adapter_catalog,
+            &fixture.ownership,
+            &mut transaction,
+            true,
+            &FixedCoreProbe,
+            &NoopActivationHook,
+        )?;
+
+        assert_eq!(components[0].status, "applied");
+        assert_eq!(fs::read_to_string(&fixture.installed_core)?, "new-core");
+        let receipt: CoreInstallationReceipt = serde_json::from_slice(&fs::read(
+            core_installation_receipt_path(&fixture.home_path),
+        )?)?;
+        assert_eq!(receipt.installer_kind, CoreInstallerKind::Official);
+        assert_eq!(receipt.core_version, "0.2.0");
+        transaction.commit()?;
         lock.release()?;
         Ok(())
     }
