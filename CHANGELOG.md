@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.17] - 2026-08-27
+
+### Fixed
+
+- Keep staged update timestamps monotonic when the system wall clock moves backward during an update.
+- Retain update ownership for compatibility-v2 adapters that write schema-2 installation receipts.
+
 ## [0.1.16] - 2026-08-27
 
 ### Fixed
