@@ -2506,7 +2506,13 @@ mod tests {
     fn core_fixture() -> anyhow::Result<CoreFixture> {
         let files = tempfile::tempdir()?;
         let home = tempfile::tempdir()?;
+        #[cfg(windows)]
+        let files_path = files.path().to_path_buf();
+        #[cfg(not(windows))]
         let files_path = fs::canonicalize(files.path())?;
+        #[cfg(windows)]
+        let home_path = home.path().to_path_buf();
+        #[cfg(not(windows))]
         let home_path = fs::canonicalize(home.path())?;
         let platform = "windows-x86_64";
         let archive_root = "ldgr-core-0.2.0";
