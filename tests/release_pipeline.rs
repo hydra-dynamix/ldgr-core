@@ -135,6 +135,13 @@ fn release_workflow_runs_actionlint_and_signed_installer_fixtures() -> anyhow::R
     ensure!(workflow.contains("default: false"));
     ensure!(workflow.matches("dtolnay/rust-toolchain@stable").count() >= 4);
     ensure!(workflow.contains("tests/install_catalog.ps1"));
+    for path in [
+        "candidate/candidate/core-index.json",
+        "scripts/core-catalog.py",
+        "candidate/candidate/release-keyring.json",
+    ] {
+        ensure!(workflow.contains(&format!("[Uri]((Resolve-Path \"{path}\").Path)")));
+    }
     let shell = fs::read_to_string(repository().join("scripts/install.sh"))?;
     let powershell = fs::read_to_string(repository().join("scripts/install.ps1"))?;
     for installer in [&shell, &powershell] {
@@ -147,6 +154,10 @@ fn release_workflow_runs_actionlint_and_signed_installer_fixtures() -> anyhow::R
         ensure!(!installer.contains("api.github.com/repos"));
         ensure!(!installer.contains("falling back to cargo"));
     }
+    ensure!(
+        !shell.contains('\r'),
+        "POSIX installer must use LF line endings"
+    );
     ensure!(shell.contains("[ \"$OFFLINE\" = \"1\" ] || require curl"));
     ensure!(shell.contains("--proto-redir '=https'"));
     ensure!(powershell.contains("$handler.AllowAutoRedirect = $false"));
