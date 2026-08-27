@@ -53,6 +53,9 @@ fn release_workflow_catalog_publication_is_last_and_matrix_gated() -> anyhow::Re
         "previous-version.txt",
         r#"previous_install="$root/home/.local/bin""#,
         r#"$previousInstall = Join-Path $env:HOME ".local\bin""#,
+        r#"if [ "$previous" = "0.1.14" ]; then"#,
+        r#"if ($previous -eq "0.1.14")"#,
+        "The reviewed paired bootstrap archive predates the public update command.",
         "injected_failure_after_each_paired_activation_checkpoint_restores_every_target",
         "core-index.json.sig",
     ] {
