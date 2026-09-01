@@ -31,6 +31,7 @@ pub struct UpdatePlanRequest {
     pub adapters: Vec<String>,
     pub channel: UpdateChannel,
     pub offline: bool,
+    pub local_store: bool,
 }
 
 /// Catalogs accepted after the caller has authenticated one immutable snapshot of each.
@@ -525,6 +526,7 @@ pub fn build_update_plan(
         let (action, compatibility) = if !update_available {
             (UpdateAction::None, UpdateCompatibility::Compatible)
         } else if request.offline
+            && !request.local_store
             && artifact
                 .as_ref()
                 .is_some_and(|value| !core_artifact_is_offline(&value.platform))
@@ -593,7 +595,7 @@ pub fn build_update_plan(
                     candidate_adapter_compatibility,
                     platform,
                     request.channel,
-                    request.offline,
+                    request.offline && !request.local_store,
                     !request.core_only,
                 )?;
             blocked |= component_blocked;
@@ -620,7 +622,7 @@ pub fn build_update_plan(
                 &resolved_target_core,
                 platform,
                 request.channel,
-                request.offline,
+                request.offline && !request.local_store,
             )?;
             blocked |= component_blocked;
             warnings.append(&mut component_warnings);

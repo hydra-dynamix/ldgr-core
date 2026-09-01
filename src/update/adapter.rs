@@ -2,13 +2,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context};
-use semver::{Version, VersionReq};
+use semver::Version;
 
 use crate::adapter_registry::{AdapterRegistry, DiscoveredAdapter};
 use crate::harness_config::UpdateChannel;
 use crate::release_index::{
-    AdapterPlatformRelease, AdapterRelease, AdapterReleaseProduct, InstallationReceipt,
-    ResolvedAdapterRelease, SourceInstallationReceipt,
+    parse_adapter_installation_receipt, AdapterInstallationReceipt, AdapterPlatformRelease,
+    AdapterRelease, AdapterReleaseProduct, InstallationReceipt, ResolvedAdapterRelease,
+    SourceInstallationReceipt,
 };
 use crate::update::apply::{
     AdapterOwnershipReceipt, AdapterStagingOwnership, PlanStagingOwnership, StagedArtifact,
@@ -25,11 +26,20 @@ pub(crate) struct AdapterInstallationInspection {
     slug: String,
     install_root: PathBuf,
     home: PathBuf,
-    receipt: AdapterInstallationReceipt,
+    receipt: InspectedAdapterInstallationReceipt,
+}
+
+impl AdapterInstallationInspection {
+    pub(crate) fn is_release(&self) -> bool {
+        matches!(
+            self.receipt,
+            InspectedAdapterInstallationReceipt::Release(_)
+        )
+    }
 }
 
 #[derive(Debug)]
-enum AdapterInstallationReceipt {
+enum InspectedAdapterInstallationReceipt {
     Release(InstallationReceipt),
     Source {
         receipt: SourceInstallationReceipt,
@@ -116,7 +126,7 @@ pub(crate) fn inspect_adapter_installation(
         .clone()
         .context("installed adapter has no tracked installation receipt; reinstall it first")?;
     let home = home_dir()?;
-    let receipt = match parse_installation_receipt(value)? {
+    let receipt = match parse_adapter_installation_receipt(value)? {
         AdapterInstallationReceipt::Release(receipt) => {
             anyhow::ensure!(
                 receipt.domain == installed.slug,
@@ -124,16 +134,16 @@ pub(crate) fn inspect_adapter_installation(
                 receipt.domain,
                 installed.slug
             );
-            AdapterInstallationReceipt::Release(receipt)
+            InspectedAdapterInstallationReceipt::Release(receipt)
         }
-        AdapterInstallationReceipt::Source { receipt, .. } => {
+        AdapterInstallationReceipt::Source(receipt) => {
             let (source_root, source_sha256, source_changed) =
                 crate::cli::commands::ops::inspect_source_installation_for_update(
                     &installed.root_path,
                     &home,
                     &receipt,
                 )?;
-            AdapterInstallationReceipt::Source {
+            InspectedAdapterInstallationReceipt::Source {
                 receipt,
                 source_root,
                 source_sha256,
@@ -173,23 +183,13 @@ pub(crate) fn inspect_adapter_for_bulk(
         .installation_receipt
         .clone()
         .context("installed adapter has no tracked installation receipt")?;
-    match parse_installation_receipt(value)? {
+    match parse_adapter_installation_receipt(value)? {
         AdapterInstallationReceipt::Release(receipt) => {
             validate_release_receipt_schema(&receipt)?;
             anyhow::ensure!(
                 receipt.domain == installed.slug,
                 "release receipt domain does not match the discovered adapter"
             );
-            Version::parse(&receipt.version).context("release receipt version is invalid")?;
-            if receipt.compatibility.is_none() {
-                VersionReq::parse(&receipt.core_compatibility)
-                    .context("legacy release receipt Core compatibility is invalid")?;
-            } else {
-                anyhow::ensure!(
-                    receipt.core_compatibility.is_empty(),
-                    "v2 release receipt must not contain a legacy Core compatibility range"
-                );
-            }
             crate::cli::commands::ops::inspect_release_installation_for_update(
                 &installed.root_path,
                 home,
@@ -208,7 +208,7 @@ pub(crate) fn inspect_adapter_for_bulk(
                 },
             ))
         }
-        AdapterInstallationReceipt::Source { receipt, .. } => {
+        AdapterInstallationReceipt::Source(receipt) => {
             anyhow::ensure!(
                 receipt.domain == installed.slug,
                 "source receipt domain does not match the discovered adapter"
@@ -442,9 +442,10 @@ pub(crate) fn plan_adapter_update(
     inspection: AdapterInstallationInspection,
     target_core_version: &Version,
     channel: UpdateChannel,
+    release_index: Option<&crate::release_index::AdapterReleaseIndex>,
 ) -> anyhow::Result<AdapterUpdatePlan> {
     match inspection.receipt {
-        AdapterInstallationReceipt::Source {
+        InspectedAdapterInstallationReceipt::Source {
             receipt,
             source_root,
             source_sha256,
@@ -465,8 +466,15 @@ pub(crate) fn plan_adapter_update(
                 source_changed,
             })
         }
-        AdapterInstallationReceipt::Release(receipt) => {
-            let index = crate::release_index::load_configured_release_index()?;
+        InspectedAdapterInstallationReceipt::Release(receipt) => {
+            let configured_index;
+            let index = match release_index {
+                Some(index) => index,
+                None => {
+                    configured_index = crate::release_index::load_configured_release_index()?;
+                    &configured_index
+                }
+            };
             let platform_tag = platform_tag()?;
             plan_release_update(
                 inspection.slug,
@@ -475,7 +483,7 @@ pub(crate) fn plan_adapter_update(
                 receipt,
                 target_core_version,
                 channel,
-                &index,
+                index,
                 &platform_tag,
             )
         }
@@ -519,6 +527,8 @@ fn plan_release_update(
 
 pub(crate) fn stage_and_apply_adapter_update(
     plan: &AdapterUpdatePlan,
+    archive_keyring: Option<&crate::release_index::ReleaseKeyring>,
+    local_store: Option<&crate::update::local_store::LocalReleaseStore>,
     transaction: &mut InstallTransaction,
 ) -> anyhow::Result<()> {
     match plan {
@@ -550,11 +560,21 @@ pub(crate) fn stage_and_apply_adapter_update(
                 target_version, platform.platform
             );
             println!("\u{251c}\u{2500} Install root {}", install_root.display());
+            let configured_keyring;
+            let archive_keyring = match archive_keyring {
+                Some(keyring) => keyring,
+                None => {
+                    configured_keyring = configured_adapter_release_keyring(home)?;
+                    &configured_keyring
+                }
+            };
             crate::cli::commands::ops::stage_and_apply_resolved_index_release(
                 &resolved,
+                archive_keyring,
                 install_root,
                 home,
-                false,
+                local_store.is_some(),
+                local_store,
                 &staging_root,
                 transaction,
             )?;
@@ -585,92 +605,16 @@ pub(crate) fn stage_and_apply_adapter_update(
     }
 }
 
-fn parse_installation_receipt(
-    value: serde_json::Value,
-) -> anyhow::Result<AdapterInstallationReceipt> {
-    if value
-        .get("install_kind")
-        .and_then(serde_json::Value::as_str)
-        == Some("local_source")
-    {
-        let receipt: SourceInstallationReceipt =
-            serde_json::from_value(value).context("source installation receipt is invalid")?;
-        validate_source_receipt_shape(&receipt)?;
-        Ok(AdapterInstallationReceipt::Source {
-            receipt,
-            source_root: PathBuf::new(),
-            source_sha256: String::new(),
-            source_changed: false,
-        })
-    } else {
-        Ok(AdapterInstallationReceipt::Release(
-            serde_json::from_value(value).context("release installation receipt is invalid")?,
-        ))
-    }
-}
-
-fn validate_source_receipt_shape(receipt: &SourceInstallationReceipt) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        receipt.schema_version == 1,
-        "unsupported source installation receipt schema {}; expected 1",
-        receipt.schema_version
-    );
-    anyhow::ensure!(
-        receipt.install_kind == "local_source",
-        "source installation receipt kind must be `local_source`"
-    );
-    anyhow::ensure!(
-        !receipt.verified_release,
-        "local source receipt must not claim verified release provenance"
-    );
-    anyhow::ensure!(
-        !receipt.ownership.source_checkout_owned,
-        "local source receipt must not claim ownership of the source checkout"
-    );
-    anyhow::ensure!(
-        receipt.ownership.generated_paths == ["source-target"],
-        "source receipt generated paths must be exactly `source-target`"
-    );
-    let namespace = receipt
-        .source
-        .package
-        .strip_prefix("ldgr-")
-        .unwrap_or(&receipt.source.package)
-        .strip_suffix("-adapter")
-        .unwrap_or_else(|| {
-            receipt
-                .source
-                .package
-                .strip_prefix("ldgr-")
-                .unwrap_or(&receipt.source.package)
-        });
-    anyhow::ensure!(
-        namespace == receipt.domain,
-        "source receipt package `{}` does not own adapter `{}`",
-        receipt.source.package,
-        receipt.domain
-    );
-    let installed_manifest = receipt
-        .installed_files
-        .iter()
-        .find(|file| file.path == "adapter.toml")
-        .context("source receipt must track installed adapter.toml")?;
-    anyhow::ensure!(
-        installed_manifest.sha256 == receipt.manifest_digests.installed_adapter_manifest_sha256,
-        "source receipt installed adapter manifest digests disagree"
-    );
-    if let Some(expected) = &receipt.manifest_digests.installed_resource_manifest_sha256 {
-        let installed_resource_manifest = receipt
-            .installed_files
-            .iter()
-            .find(|file| file.path == "adapter-resources.json")
-            .context("source receipt resource digest has no installed resource manifest file")?;
-        anyhow::ensure!(
-            &installed_resource_manifest.sha256 == expected,
-            "source receipt installed resource manifest digests disagree"
-        );
-    }
-    Ok(())
+fn configured_adapter_release_keyring(
+    home: &Path,
+) -> anyhow::Result<crate::release_index::ReleaseKeyring> {
+    let path = std::env::var_os(crate::release_index::ADAPTER_RELEASE_KEYRING_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".ldgr/release-keyring.json"));
+    let text = fs::read_to_string(&path)
+        .with_context(|| format!("failed to read adapter release keyring {}", path.display()))?;
+    crate::release_index::parse_release_keyring(&text)
+        .with_context(|| format!("invalid adapter release keyring {}", path.display()))
 }
 
 fn platform_tag() -> anyhow::Result<String> {
@@ -698,13 +642,15 @@ fn home_dir() -> anyhow::Result<PathBuf> {
 mod tests {
     use super::*;
     use crate::release_index::{
-        AdapterClassification, AdapterReleaseIndex, OwnedResource, ReleaseChannel,
-        SourceInstallIdentity, SourceManifestDigests, SourceOwnershipBoundaries,
+        validate_source_installation_receipt, AdapterClassification, AdapterReleaseIndex,
+        OwnedResource, ReleaseChannel, SourceInstallIdentity, SourceManifestDigests,
+        SourceOwnershipBoundaries, LEGACY_ADAPTER_INSTALLATION_RECEIPT_SCHEMA_VERSION,
+        SOURCE_ADAPTER_INSTALLATION_RECEIPT_SCHEMA_VERSION,
     };
 
     fn release_receipt(version: &str) -> InstallationReceipt {
         InstallationReceipt {
-            schema_version: 1,
+            schema_version: LEGACY_ADAPTER_INSTALLATION_RECEIPT_SCHEMA_VERSION,
             domain: "fixture".to_owned(),
             version: version.to_owned(),
             source_url: "file:///old.tar.gz".to_owned(),
@@ -859,7 +805,7 @@ mod tests {
 
     fn source_receipt(verified_release: bool) -> SourceInstallationReceipt {
         SourceInstallationReceipt {
-            schema_version: 1,
+            schema_version: SOURCE_ADAPTER_INSTALLATION_RECEIPT_SCHEMA_VERSION,
             install_kind: "local_source".to_owned(),
             domain: "fixture".to_owned(),
             installed_at_unix_seconds: 0,
@@ -896,7 +842,7 @@ mod tests {
 
     #[test]
     fn local_source_plan_preserves_provenance_and_channel_rules() -> anyhow::Result<()> {
-        assert!(validate_source_receipt_shape(&source_receipt(true))
+        assert!(validate_source_installation_receipt(&source_receipt(true))
             .unwrap_err()
             .to_string()
             .contains("must not claim verified release provenance"));
@@ -904,7 +850,7 @@ mod tests {
             slug: "fixture".to_owned(),
             install_root: PathBuf::from("C:/installed"),
             home: PathBuf::from("C:/home"),
-            receipt: AdapterInstallationReceipt::Source {
+            receipt: InspectedAdapterInstallationReceipt::Source {
                 receipt: source_receipt(false),
                 source_root: PathBuf::from("C:/source"),
                 source_sha256: "planned".to_owned(),
@@ -915,6 +861,7 @@ mod tests {
             inspection(false),
             &Version::parse("0.2.0")?,
             UpdateChannel::Stable,
+            None,
         )?;
         assert!(!stable.update_available());
         assert!(stable.should_apply_for_single_adapter_command());
@@ -922,6 +869,7 @@ mod tests {
             inspection(true),
             &Version::parse("0.2.0")?,
             UpdateChannel::Prerelease,
+            None,
         )
         .unwrap_err()
         .to_string()

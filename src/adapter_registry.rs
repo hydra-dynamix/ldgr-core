@@ -634,8 +634,19 @@ fn load_adapter_manifest(manifest_path: &Path) -> anyhow::Result<DiscoveredAdapt
     let receipt_path = manifest_dir.join("installation-receipt.json");
     let (installation_receipt, installation_receipt_error) = match fs::read_to_string(&receipt_path)
     {
-        Ok(text) => match serde_json::from_str(&text) {
-            Ok(value) => (Some(value), None),
+        Ok(text) => match serde_json::from_str::<Value>(&text) {
+            Ok(value) => {
+                match crate::release_index::parse_adapter_installation_receipt(value.clone()) {
+                    Ok(_) => (Some(value), None),
+                    Err(error) => (
+                        None,
+                        Some(format!(
+                            "invalid installation receipt {}: {error:#}",
+                            receipt_path.display()
+                        )),
+                    ),
+                }
+            }
             Err(error) => (
                 None,
                 Some(format!(

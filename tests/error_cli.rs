@@ -10,7 +10,10 @@ fn command(project: &TempDir) -> anyhow::Result<Command> {
         .arg("--db")
         .arg(project.path().join(".ldgr/ldgr.db"))
         .arg("--artifact-root")
-        .arg(project.path().join(".ldgr/artifacts"));
+        .arg(project.path().join(".ldgr/artifacts"))
+        .env("HOME", project.path().join(".ldgr/test-empty-home"))
+        .env("USERPROFILE", project.path().join(".ldgr/test-empty-home"))
+        .env("LDGR_NO_AUTOMATIC_TELEMETRY", "1");
     Ok(command)
 }
 

@@ -134,6 +134,8 @@ enum Command {
         #[arg(long, hide = true)]
         token: String,
     },
+    #[command(name = "__telemetry-flush-worker", hide = true)]
+    TelemetryFlushWorker,
     #[cfg(windows)]
     #[command(name = "__update-finalizer", hide = true)]
     UpdateFinalizer {
@@ -243,6 +245,8 @@ where
     crate::recovery::repair_process_home()?;
     let args = args.into_iter().map(Into::into).collect::<Vec<_>>();
     let args = normalize_command_aliases(args);
+    let _telemetry_session = should_start_automatic_telemetry(&args)
+        .then(crate::telemetry::automation::AutomaticTelemetrySession::start);
     let cli = match Cli::try_parse_from(args.clone()) {
         Ok(cli) => cli,
         Err(error)
@@ -290,6 +294,14 @@ where
     handle_cli(cli)
 }
 
+fn should_start_automatic_telemetry(args: &[OsString]) -> bool {
+    first_command_arg_index(args).is_none_or(|index| {
+        args.get(index)
+            .and_then(|argument| argument.to_str())
+            .is_none_or(|command| command != "telemetry" && !command.starts_with("__"))
+    })
+}
+
 fn should_run_startup_update_hook(cli: &Cli, args: &[OsString]) -> bool {
     if cli.full
         || args.iter().any(|argument| {
@@ -309,6 +321,7 @@ fn should_run_startup_update_hook(cli: &Cli, args: &[OsString]) -> bool {
         cli.command,
         None | Some(Command::Update(_))
             | Some(Command::UpdateCheckWorker { .. })
+            | Some(Command::TelemetryFlushWorker)
             | Some(Command::RecordCoreInstallation { .. })
     )
 }
@@ -510,6 +523,7 @@ fn handle_cli(cli: Cli) -> anyhow::Result<()> {
         Command::UpdateCheckWorker { token } => {
             commands::update::handle_startup_check_worker(&token)
         }
+        Command::TelemetryFlushWorker => crate::telemetry::automation::run_flush_worker(),
         #[cfg(windows)]
         Command::UpdateFinalizer {
             parent_pid,
@@ -1327,4 +1341,39 @@ pub(crate) fn checked_limit(limit: i64) -> anyhow::Result<i64> {
         bail!("--limit must not be negative");
     }
     Ok(limit)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsString;
+
+    use super::should_start_automatic_telemetry;
+
+    #[test]
+    fn automatic_telemetry_wraps_normal_commands_only() {
+        let args = |values: &[&str]| values.iter().map(OsString::from).collect::<Vec<_>>();
+
+        assert!(should_start_automatic_telemetry(&args(&["ldgr", "status"])));
+        assert!(should_start_automatic_telemetry(&args(&[
+            "ldgr",
+            "--db",
+            "ledger.db",
+            "context"
+        ])));
+        assert!(!should_start_automatic_telemetry(&args(&[
+            "ldgr",
+            "telemetry",
+            "disable"
+        ])));
+        assert!(!should_start_automatic_telemetry(&args(&[
+            "ldgr",
+            "__telemetry-flush-worker"
+        ])));
+        assert!(!should_start_automatic_telemetry(&args(&[
+            "ldgr",
+            "__update-check-worker",
+            "--token",
+            "token"
+        ])));
+    }
 }

@@ -21,7 +21,7 @@ pub enum TelemetryInstallChoice {
 
 #[derive(Debug, Args)]
 #[command(
-    after_help = "Examples:\n  ldgr install\n  ldgr install --harness pi --harness claude --adapter conduct --yes --telemetry disable\n  ldgr install --yes --no-agentctl\n  ldgr install adapter code --yes\n\nPrivacy-minimized anonymous construction telemetry is enabled by default and can be opted out with --telemetry disable or `ldgr telemetry disable`. Experience donation is a separate opt-in. Without --harness, the installer asks interactively and defaults to Pi. Multiple harnesses may be selected. In interactive mode the installer also offers adapter bundle selection. The selected harness config is recorded in ~/.ldgr/config.toml with a legacy config.json compatibility mirror. agentctl is installed when missing unless --no-agentctl is passed."
+    after_help = "Examples:\n  ldgr install\n  ldgr install --harness pi --harness claude --adapter conduct --yes --telemetry disable\n  ldgr install --adapter research --store ./store --yes\n  ldgr install --yes --no-agentctl\n  ldgr install adapter code --yes\n\nPrivacy-minimized anonymous construction telemetry is enabled by default and can be opted out with --telemetry disable or `ldgr telemetry disable`. Experience donation is a separate opt-in. Without --harness, the installer asks interactively and defaults to Pi. Multiple harnesses may be selected. In interactive mode the installer also offers adapter bundle selection. --store installs selected signed adapter releases without network access. The selected harness config is recorded in ~/.ldgr/config.toml with a legacy config.json compatibility mirror. agentctl is installed when missing unless --no-agentctl is passed."
 )]
 pub struct InstallArgs {
     #[command(subcommand)]
@@ -50,6 +50,10 @@ pub struct InstallArgs {
     /// Adapter bundle to install after harness setup. Repeatable.
     #[arg(long)]
     pub adapter: Vec<String>,
+
+    /// Read requested adapter releases from this signed local release store.
+    #[arg(long, value_name = "DIRECTORY")]
+    pub store: Option<PathBuf>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -79,6 +83,10 @@ pub struct InstallAdapterArgs {
 
     #[arg(long)]
     pub offline: bool,
+
+    /// Read the signed adapter release from this local release store.
+    #[arg(long, value_name = "DIRECTORY", conflicts_with = "source_root")]
+    pub store: Option<PathBuf>,
 
     /// Accept defaults and do not prompt.
     #[arg(long)]

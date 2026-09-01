@@ -73,7 +73,17 @@ ldgr adapter install example --source-root <checkout>
 ldgr adapter install example --source-root <checkout>/ldgr-example-adapter
 ```
 
-The older `ldgr install adapter <slug>` path remains a compatibility alias for source-checkout installs.
+The older `ldgr install adapter <slug>` path remains a compatibility alias.
+
+For network-free signed installs, pass a local release store. The store layout and trust rules are defined in [LDGR self-update and adapter-update specification](self-update.md#local-release-store).
+
+```bash
+ldgr adapter install research --store ./store --yes
+ldgr install adapter research --store ./store --yes
+ldgr install --adapter research --store ./store --yes
+```
+
+`--store` implies offline mode. LDGR still verifies the signed adapter catalog, archive signature, checksum, compatibility metadata, platform, and ownership boundaries. It never falls back to a built-in network or Git installer when a store is incomplete.
 
 ### Local source receipts and lifecycle
 
@@ -168,8 +178,10 @@ backup, while adapter-local stores remain adapter-owned and are not opened by
 Core preflight. Interrupted activation resumes or rolls back from the same
 journal on the next startup.
 
-`--offline` forbids network access and therefore requires local catalog,
-signature, keyring, and artifact references. `--prerelease` opts into
+`--offline` forbids network access and therefore requires configured local catalog,
+signature, keyring, and artifact references. `--store <directory>` supplies those
+files through the portable local-store layout and also forbids network access.
+`--prerelease` opts into
 prerelease targets but never bypasses compatibility. `--json` emits the
 schema-versioned result document on stdout while warnings and failures remain on
 stderr. Check mode does not fetch archive or archive-signature payloads and does

@@ -37,9 +37,9 @@ pub struct TelemetryDonationArgs {
 pub enum TelemetryDonationCommand {
     /// Show whether experience donation has been explicitly enabled.
     Status,
-    /// Explicitly opt in to user-selected, locally previewed experience donation.
+    /// Opt in to automatic rich episode donation and durable delivery.
     Enable,
-    /// Disable experience donation. Anonymous construction telemetry is unchanged.
+    /// Disable donation and delete unsent rich episodes. Anonymous telemetry is unchanged.
     Disable,
 }
 

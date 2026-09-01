@@ -143,6 +143,167 @@ fn cli_transmit_captures_actual_tls_wire_headers_without_identifying_metadata() 
 }
 
 #[test]
+fn automatic_worker_recovers_pending_telemetry_on_next_startup() -> anyhow::Result<()> {
+    let project = tempfile::tempdir()?;
+    let ldgr_home = cli_ldgr_home(project.path());
+    enable(&ldgr_home)?;
+    queue_protocol(&ldgr_home, &CORE_WORK_V1, COMPLETED_NEGATIVE)?;
+
+    let ca_path = project.path().join("telemetry-capture-ca.pem");
+    fs::write(&ca_path, CAPTURE_CA_PEM)?;
+    let server = CaptureServer::start(vec![ResponsePlan::status(204)])?;
+    let mut command = automatic_telemetry_command(project.path(), &server, &ca_path)?;
+    command.args(["compatibility", "--agentctl-version", "0.1.2", "--json"]);
+    let output = command.output()?;
+    let requests = server.finish()?;
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].body, b"[0,1,4]");
+    wait_for_empty_pending_route(&ldgr_home, "core-work/v1")?;
+    Ok(())
+}
+
+#[test]
+fn automatic_worker_sends_sequence_queued_during_normal_shutdown() -> anyhow::Result<()> {
+    let project = tempfile::tempdir()?;
+    let ldgr_home = cli_ldgr_home(project.path());
+    enable(&ldgr_home)?;
+
+    run_cli(project.path(), ["init"])?;
+    run_cli(
+        project.path(),
+        [
+            "work",
+            "create",
+            "automatic-shutdown",
+            "--title",
+            "Automatic shutdown",
+            "--description",
+            "Queue one terminal sequence.",
+        ],
+    )?;
+    let start = run_cli(
+        project.path(),
+        ["run", "start", "automatic-shutdown", "--command", "fixture"],
+    )?;
+    let run_id = String::from_utf8(start.stdout)?
+        .split_whitespace()
+        .nth(2)
+        .context("run start did not print a run ID")?
+        .to_owned();
+
+    let ca_path = project.path().join("telemetry-capture-ca.pem");
+    fs::write(&ca_path, CAPTURE_CA_PEM)?;
+    let server = CaptureServer::start(vec![ResponsePlan::status(204)])?;
+    let mut close = automatic_telemetry_command(project.path(), &server, &ca_path)?;
+    close.args([
+        "run",
+        "close",
+        &run_id,
+        "--status",
+        "success",
+        "--outcome",
+        "stop",
+        "--rationale",
+        "fixture complete",
+    ]);
+    let output = close.output()?;
+    let requests = server.finish()?;
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].body, b"[0,1,3]");
+    wait_for_empty_pending_route(&ldgr_home, "core-work/v1")?;
+    Ok(())
+}
+
+#[test]
+fn opted_in_rich_episode_is_captured_and_sent_automatically_after_shutdown() -> anyhow::Result<()> {
+    let project = tempfile::tempdir()?;
+    let ldgr_home = cli_ldgr_home(project.path());
+    enable_donation(&ldgr_home)?;
+
+    run_cli(project.path(), ["init"])?;
+    run_cli(
+        project.path(),
+        [
+            "work",
+            "create",
+            "automatic-donation",
+            "--title",
+            "Automatic rich donation",
+            "--description",
+            "Preserve exact evidence for memory research.",
+        ],
+    )?;
+    let start = run_cli(
+        project.path(),
+        [
+            "run",
+            "start",
+            "automatic-donation",
+            "--command",
+            "capture rich episode",
+        ],
+    )?;
+    let run_id = String::from_utf8(start.stdout)?
+        .split_whitespace()
+        .nth(2)
+        .context("run start did not print a run ID")?
+        .to_owned();
+    run_cli(
+        project.path(),
+        [
+            "observation",
+            "add",
+            &run_id,
+            "--body",
+            "Exact opted-in evidence",
+        ],
+    )?;
+
+    let ca_path = project.path().join("telemetry-capture-ca.pem");
+    fs::write(&ca_path, CAPTURE_CA_PEM)?;
+    let server = CaptureServer::start(vec![ResponsePlan::status(204)])?;
+    let mut close = automatic_telemetry_command(project.path(), &server, &ca_path)?;
+    close.args([
+        "run",
+        "close",
+        &run_id,
+        "--status",
+        "success",
+        "--outcome",
+        "stop",
+        "--rationale",
+        "rich fixture complete",
+    ]);
+    let output = close.output()?;
+    let requests = server.finish()?;
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].request_line,
+        "POST /donations/experiences/v1 HTTP/1.1"
+    );
+    assert_privacy_preserving_wire_headers(&requests[0]);
+    let donation: serde_json::Value = serde_json::from_slice(&requests[0].body)?;
+    assert_eq!(donation["consent"]["decision"], "enabled");
+    assert_eq!(donation["episode"]["schema"], "ldgr-work-episode/v1");
+    assert_eq!(
+        donation["episode"]["material"]["work_item"]["title"],
+        "Automatic rich donation"
+    );
+    assert_eq!(
+        donation["episode"]["material"]["observations"][0]["body"],
+        "Exact opted-in evidence"
+    );
+    wait_for_empty_donation_queue(&ldgr_home)?;
+    Ok(())
+}
+
+#[test]
 fn failed_capture_response_retains_exact_payload_for_next_transmit() -> anyhow::Result<()> {
     let home = tempfile::tempdir()?;
     enable(home.path())?;
@@ -246,6 +407,15 @@ fn disable(home: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn enable_donation(home: &Path) -> anyhow::Result<()> {
+    save_telemetry_consent(
+        home,
+        &TelemetryConsent::current(TelemetryConsentDecision::Disabled)
+            .with_donation(TelemetryConsentDecision::Enabled),
+    )?;
+    Ok(())
+}
+
 fn queue(home: &Path, terminal: u16) -> anyhow::Result<()> {
     queue_protocol(home, &CORE_WORK_V1, terminal)
 }
@@ -293,6 +463,36 @@ fn pending_file_count_for(home: &Path, route: &str) -> anyhow::Result<usize> {
         .count())
 }
 
+fn wait_for_empty_donation_queue(home: &Path) -> anyhow::Result<()> {
+    let route = home.join("experience-donation-pending/experiences/v1");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let pending = if route.exists() {
+            fs::read_dir(&route)?.count()
+        } else {
+            0
+        };
+        if pending == 0 {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!("timed out waiting for automatic donation cleanup");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn wait_for_empty_pending_route(home: &Path, route: &str) -> anyhow::Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while pending_file_count_for(home, route)? != 0 {
+        if Instant::now() >= deadline {
+            bail!("timed out waiting for automatic telemetry cleanup");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    Ok(())
+}
+
 fn unused_loopback_https_origin() -> anyhow::Result<String> {
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let address = listener.local_addr()?;
@@ -306,6 +506,7 @@ fn telemetry_command(project: &Path) -> anyhow::Result<Command> {
         .current_dir(project)
         .env("HOME", project.join(".ldgr/test-empty-home"))
         .env("LDGR_HOME", project.join(".ldgr/test-empty-ldgr-home"))
+        .env("LDGR_NO_AUTOMATIC_TELEMETRY", "1")
         .env(
             "LDGR_ADAPTER_PATH",
             project.join(".ldgr/test-empty-adapters"),
@@ -313,6 +514,36 @@ fn telemetry_command(project: &Path) -> anyhow::Result<Command> {
         .env_remove("LDGR_TELEMETRY")
         .env_remove("LDGR_TELEMETRY_COLLECTOR");
     Ok(command)
+}
+
+fn automatic_telemetry_command(
+    project: &Path,
+    server: &CaptureServer,
+    ca_path: &Path,
+) -> anyhow::Result<Command> {
+    let mut command = telemetry_command(project)?;
+    command
+        .env_remove("LDGR_NO_AUTOMATIC_TELEMETRY")
+        .env("LDGR_TELEMETRY_COLLECTOR", &server.origin)
+        .env("LDGR_AUTOMATIC_TELEMETRY_ROOT_CA_PEM", ca_path)
+        .env("LDGR_AUTOMATIC_TELEMETRY_MAX_DELAY_MS", "0")
+        .env("LDGR_AUTOMATIC_TELEMETRY_TIMEOUT_MS", "3000");
+    Ok(command)
+}
+
+fn run_cli<const ARG_COUNT: usize>(
+    project: &Path,
+    args: [&str; ARG_COUNT],
+) -> anyhow::Result<std::process::Output> {
+    let output = telemetry_command(project)?.args(args).output()?;
+    if !output.status.success() {
+        bail!(
+            "ldgr fixture command failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(output)
 }
 
 fn cli_ldgr_home(project: &Path) -> PathBuf {
@@ -581,7 +812,8 @@ fn read_http_request(
     let body_start = header_end + 4;
     while bytes.len().saturating_sub(body_start) < content_length {
         read_more(stream, &mut bytes)?;
-        if bytes.len() - body_start > 1024 {
+        if bytes.len() - body_start > ldgr_core::telemetry::donation::MAX_EXPERIENCE_DONATION_BYTES
+        {
             bail!("telemetry request body exceeded test limit");
         }
     }

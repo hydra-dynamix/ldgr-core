@@ -7,8 +7,10 @@ use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 
 pub mod adapter_conformance;
+pub mod automation;
 pub mod buffer;
 pub mod command_experience;
+pub mod donation;
 pub mod serializer;
 pub mod transition;
 pub mod transmission;

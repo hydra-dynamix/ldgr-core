@@ -43,6 +43,7 @@ fn queue_core_work_run_terminal(
     };
     let terminal = core_terminal_for_run(connection, run_id, run_status, decision_outcome)?;
     best_effort_record_command_experience(connection, run_id, terminal);
+    best_effort_queue_experience_donation(connection, run_id);
     queue_core_work_terminal_before_event(connection, work_item_id, terminal_event_id, terminal)
 }
 
@@ -61,6 +62,7 @@ fn queue_core_work_completion(
         {
             let terminal = core_terminal_for_run(connection, run_id, run_status, decision_outcome)?;
             best_effort_record_command_experience(connection, run_id, terminal);
+            best_effort_queue_experience_donation(connection, run_id);
             return queue_core_work_terminal_before_event(
                 connection,
                 work_item_id,
@@ -75,6 +77,13 @@ fn queue_core_work_completion(
         _ => COMPLETED_POSITIVE,
     };
     queue_core_work_item_terminal(connection, work_item_id, "finish", terminal)
+}
+
+fn best_effort_queue_experience_donation(connection: &Connection, run_id: i64) {
+    let Some(ldgr_home) = telemetry_ldgr_home() else {
+        return;
+    };
+    let _ = crate::telemetry::donation::queue_completed_run(connection, &ldgr_home, run_id);
 }
 
 fn best_effort_record_command_experience(

@@ -16,7 +16,16 @@ use crate::recovery::{
     print_startup_recovery_report, project_root_for_db, reconcile_startup, ExecutionAttempt,
     FailureKind,
 };
+use crate::release_index::{
+    adapter_installation_receipt_schema_version, parse_adapter_installation_receipt,
+    validate_release_installation_receipt, validate_source_installation_receipt,
+    AdapterInstallationReceipt, SOURCE_ADAPTER_INSTALLATION_RECEIPT_SCHEMA_VERSION,
+};
 use crate::store::{doctor_schema, open_store_with_migration_info, read_context};
+use crate::telemetry::automation::acquire_delivery_lock;
+use crate::telemetry::donation::{
+    clear_unsent_experience_donations, pending_experience_donation_count,
+};
 use crate::telemetry::transmission::{
     preview_pending_sequences, TransmissionClient, TransmissionReport,
 };
@@ -159,7 +168,7 @@ pub fn handle_install(args: InstallArgs) -> anyhow::Result<()> {
     for harness in &harnesses {
         installed.push(install_harness(*harness, &home)?);
     }
-    let agentctl = ensure_agentctl_dependency(args.no_agentctl)?;
+    let agentctl = ensure_agentctl_dependency(args.no_agentctl, args.store.is_some())?;
     let agentctl_config = install_agentctl_config(&home, &harnesses)?;
 
     let config = serde_json::json!({
@@ -230,7 +239,8 @@ pub fn handle_install(args: InstallArgs) -> anyhow::Result<()> {
                 install_root: None,
                 version: None,
                 prerelease: false,
-                offline: false,
+                offline: args.store.is_some(),
+                store: args.store.clone(),
                 yes: args.yes,
             })?;
         }
@@ -274,12 +284,14 @@ pub fn handle_telemetry(args: TelemetryArgs) -> anyhow::Result<()> {
             match donation.command {
                 TelemetryDonationCommand::Status => {}
                 TelemetryDonationCommand::Enable => {
+                    print_experience_donation_scope();
                     consent = consent.with_donation(TelemetryConsentDecision::Enabled);
                     save_telemetry_consent(&ldgr_home, &consent)?;
                 }
                 TelemetryDonationCommand::Disable => {
                     consent = consent.with_donation(TelemetryConsentDecision::Disabled);
                     save_telemetry_consent(&ldgr_home, &consent)?;
+                    clear_unsent_experience_donations(&ldgr_home)?;
                 }
             }
             println!(
@@ -301,6 +313,12 @@ pub fn handle_telemetry(args: TelemetryArgs) -> anyhow::Result<()> {
             Ok(())
         }
     }
+}
+
+fn print_experience_donation_scope() {
+    println!("experience donation includes exact work titles, descriptions, commands, notes, observations, artifact paths and descriptions, decisions, linked errors, timestamps, project identity, and provenance");
+    println!("after opt-in, completed runs are captured and sent automatically until `ldgr telemetry donation disable`");
+    println!("experience donation is non-anonymous and can contain private or identifying content; do not record credentials in opted-in runs");
 }
 
 fn print_telemetry_status(ldgr_home: &Path) -> anyhow::Result<()> {
@@ -388,10 +406,18 @@ fn print_telemetry_preview(ldgr_home: &Path) -> anyhow::Result<()> {
             "unreadable pending payloads: {unreadable} (not shown; transmission will retain them)"
         );
     }
+    println!(
+        "pending experience donations: {}",
+        pending_experience_donation_count(ldgr_home)?
+    );
     Ok(())
 }
 
 fn transmit_telemetry(ldgr_home: &Path, args: TelemetryTransmitArgs) -> anyhow::Result<()> {
+    let Some(_lock) = acquire_delivery_lock(ldgr_home)? else {
+        println!("telemetry transmission: another local transmission is already running");
+        return Ok(());
+    };
     let release = crate::telemetry::command_experience::release_eligible_constructions(ldgr_home)?;
     println!(
         "local construction release: eligible={} queued={} rare_suppressed={} cap_suppressed={}",
@@ -430,12 +456,26 @@ fn transmit_telemetry(ldgr_home: &Path, args: TelemetryTransmitArgs) -> anyhow::
         total.retained += report.retained;
         total.invalid_dropped += report.invalid_dropped;
     }
+    let anonymous_disabled = total.disabled;
+    let donation = client.transmit_pending_donations(ldgr_home);
+    println!(
+        "protocol /donations/experiences/v1: attempted={} accepted={} retained={} invalid_dropped={} disabled={}",
+        donation.attempted,
+        donation.accepted,
+        donation.retained,
+        donation.invalid_dropped,
+        donation.disabled
+    );
+    total.attempted += donation.attempted;
+    total.accepted += donation.accepted;
+    total.retained += donation.retained;
+    total.invalid_dropped += donation.invalid_dropped;
 
     println!(
         "telemetry transmission: attempted={} accepted={} retained={} invalid_dropped={}",
         total.attempted, total.accepted, total.retained, total.invalid_dropped
     );
-    if total.disabled {
+    if anonymous_disabled && donation.disabled {
         println!("effective collection: disabled; no further telemetry was attempted");
     }
     Ok(())
@@ -497,6 +537,7 @@ pub(crate) fn print_current_sequence_collection_status_summary(prefix: &str) -> 
 pub(crate) fn handle_interactive_adapter_install(
     source_root: Option<PathBuf>,
     install_root: Option<PathBuf>,
+    store: Option<PathBuf>,
     yes: bool,
 ) -> anyhow::Result<()> {
     if yes || !stdin_is_terminal() {
@@ -519,7 +560,8 @@ pub(crate) fn handle_interactive_adapter_install(
             install_root: None,
             version: None,
             prerelease: false,
-            offline: false,
+            offline: store.is_some(),
+            store: store.clone(),
             yes,
         })?;
     }
@@ -531,29 +573,43 @@ pub(crate) fn handle_install_adapter(args: &InstallAdapterArgs) -> anyhow::Resul
         return install_adapter_from_catalog(args);
     }
 
+    let local_store = args
+        .store
+        .as_ref()
+        .map(crate::update::local_store::LocalReleaseStore::open)
+        .transpose()
+        .context("failed to open local release store")?;
+    let offline = args.offline || local_store.is_some();
     let configured_source = std::env::var(crate::release_index::ADAPTER_RELEASE_INDEX_ENV).ok();
     let source = configured_source
         .as_deref()
         .unwrap_or(crate::release_index::DEFAULT_ADAPTER_RELEASE_INDEX_URL);
-    if args.offline && source.starts_with("http") {
+    if offline && local_store.is_none() && source.starts_with("http") {
         bail!("--offline requires LDGR_ADAPTER_INDEX to reference a local file");
     }
     let signed_index = (|| {
-        let sources = crate::update::catalog::AdapterCatalogSources::configured(args.offline)?;
-        let client = crate::update::network::UpdateNetworkClient::new(args.offline)?;
+        let sources = match &local_store {
+            Some(store) => store.adapter_catalog_sources()?,
+            None => crate::update::catalog::AdapterCatalogSources::configured(offline)?,
+        };
+        let client = match local_store.clone() {
+            Some(store) => crate::update::network::UpdateNetworkClient::with_local_store(store)?,
+            None => crate::update::network::UpdateNetworkClient::new(offline)?,
+        };
         match crate::update::catalog::fetch_signed_adapter_update_catalog(&client, &sources, None)?
         {
-            crate::update::catalog::AdapterCatalogFetch::Modified { verified, .. } => {
-                Ok(verified.catalog)
-            }
+            crate::update::catalog::AdapterCatalogFetch::Modified { verified, .. } => Ok(verified),
             crate::update::catalog::AdapterCatalogFetch::NotModified { .. } => {
                 bail!("adapter release index unexpectedly returned not-modified")
             }
         }
     })();
     match signed_index {
-        Ok(index) => install_adapter_from_index(args, &index),
-        Err(index_error) if default_catalog_fallback_allowed(args, configured_source.is_some()) => {
+        Ok(index) => install_adapter_from_index(args, &index, local_store.as_ref()),
+        Err(index_error)
+            if local_store.is_none()
+                && default_catalog_fallback_allowed(args, configured_source.is_some()) =>
+        {
             eprintln!(
                 "warning: {index_error:#}; falling back to the built-in release/git installer for `{}`",
                 args.name
@@ -615,15 +671,43 @@ fn install_adapter_from_catalog(args: &InstallAdapterArgs) -> anyhow::Result<()>
 }
 
 pub(crate) fn handle_update_adapter(args: &AdapterUpdateArgs) -> anyhow::Result<()> {
+    let local_store = args
+        .store
+        .as_ref()
+        .map(crate::update::local_store::LocalReleaseStore::open)
+        .transpose()
+        .context("failed to open local release store")?;
     let inspection = crate::update::adapter::inspect_adapter_installation(&args.name)?;
+    let verified_catalog = match &local_store {
+        Some(store) if inspection.is_release() => {
+            let sources = store.adapter_catalog_sources()?;
+            let client =
+                crate::update::network::UpdateNetworkClient::with_local_store(store.clone())?;
+            match crate::update::catalog::fetch_signed_adapter_update_catalog(
+                &client, &sources, None,
+            )? {
+                crate::update::catalog::AdapterCatalogFetch::Modified { verified, .. } => {
+                    Some(verified)
+                }
+                crate::update::catalog::AdapterCatalogFetch::NotModified { .. } => {
+                    bail!("adapter release index unexpectedly returned not-modified")
+                }
+            }
+        }
+        _ => None,
+    };
     let target_core_version = semver::Version::parse(env!("CARGO_PKG_VERSION"))?;
     let channel = if args.prerelease {
         UpdateChannel::Prerelease
     } else {
         UpdateChannel::Stable
     };
-    let plan =
-        crate::update::adapter::plan_adapter_update(inspection, &target_core_version, channel)?;
+    let plan = crate::update::adapter::plan_adapter_update(
+        inspection,
+        &target_core_version,
+        channel,
+        verified_catalog.as_ref().map(|verified| &verified.catalog),
+    )?;
     plan.print_status();
     if args.check || !plan.should_apply_for_single_adapter_command() {
         return Ok(());
@@ -635,7 +719,14 @@ pub(crate) fn handle_update_adapter(args: &AdapterUpdateArgs) -> anyhow::Result<
     ))?;
     remove_path_if_exists(&temp)?;
     let mut transaction = InstallTransaction::new(temp.join("rollback"))?;
-    crate::update::adapter::stage_and_apply_adapter_update(&plan, &mut transaction)?;
+    crate::update::adapter::stage_and_apply_adapter_update(
+        &plan,
+        verified_catalog
+            .as_ref()
+            .map(|verified| &verified.archive_keyring),
+        local_store.as_ref(),
+        &mut transaction,
+    )?;
     transaction.commit()?;
     remove_path_if_exists(&temp)
 }
@@ -796,96 +887,6 @@ fn reconcile_installed_adapters(home: &Path, requested: Option<&str>) -> anyhow:
             "reconciled adapter={} resources={}",
             adapter.slug,
             receipt.owned_resources.len()
-        );
-    }
-    Ok(())
-}
-
-enum AdapterInstallationReceipt {
-    Release(crate::release_index::InstallationReceipt),
-    Source(crate::release_index::SourceInstallationReceipt),
-}
-
-fn parse_adapter_installation_receipt(
-    value: serde_json::Value,
-) -> anyhow::Result<AdapterInstallationReceipt> {
-    if value
-        .get("install_kind")
-        .and_then(serde_json::Value::as_str)
-        == Some("local_source")
-    {
-        let receipt: crate::release_index::SourceInstallationReceipt =
-            serde_json::from_value(value).context("source installation receipt is invalid")?;
-        validate_source_receipt_shape(&receipt)?;
-        Ok(AdapterInstallationReceipt::Source(receipt))
-    } else {
-        Ok(AdapterInstallationReceipt::Release(
-            serde_json::from_value(value).context("release installation receipt is invalid")?,
-        ))
-    }
-}
-
-fn validate_source_receipt_shape(
-    receipt: &crate::release_index::SourceInstallationReceipt,
-) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        receipt.schema_version == 1,
-        "unsupported source installation receipt schema {}; expected 1",
-        receipt.schema_version
-    );
-    anyhow::ensure!(
-        receipt.install_kind == "local_source",
-        "source installation receipt kind must be `local_source`"
-    );
-    anyhow::ensure!(
-        !receipt.verified_release,
-        "local source receipt must not claim verified release provenance"
-    );
-    anyhow::ensure!(
-        !receipt.ownership.source_checkout_owned,
-        "local source receipt must not claim ownership of the source checkout"
-    );
-    anyhow::ensure!(
-        receipt.ownership.generated_paths == ["source-target"],
-        "source receipt generated paths must be exactly `source-target`"
-    );
-    let namespace = receipt
-        .source
-        .package
-        .strip_prefix("ldgr-")
-        .unwrap_or(&receipt.source.package)
-        .strip_suffix("-adapter")
-        .unwrap_or_else(|| {
-            receipt
-                .source
-                .package
-                .strip_prefix("ldgr-")
-                .unwrap_or(&receipt.source.package)
-        });
-    anyhow::ensure!(
-        namespace == receipt.domain,
-        "source receipt package `{}` does not own adapter `{}`",
-        receipt.source.package,
-        receipt.domain
-    );
-    let installed_manifest = receipt
-        .installed_files
-        .iter()
-        .find(|file| file.path == "adapter.toml")
-        .context("source receipt must track installed adapter.toml")?;
-    anyhow::ensure!(
-        installed_manifest.sha256 == receipt.manifest_digests.installed_adapter_manifest_sha256,
-        "source receipt installed adapter manifest digests disagree"
-    );
-    if let Some(expected) = &receipt.manifest_digests.installed_resource_manifest_sha256 {
-        let installed_resource_manifest = receipt
-            .installed_files
-            .iter()
-            .find(|file| file.path == "adapter-resources.json")
-            .context("source receipt resource digest has no installed resource manifest file")?;
-        anyhow::ensure!(
-            &installed_resource_manifest.sha256 == expected,
-            "source receipt installed resource manifest digests disagree"
         );
     }
     Ok(())
@@ -1111,7 +1112,7 @@ fn verify_source_receipt_boundaries(
     home: &Path,
     receipt: &crate::release_index::SourceInstallationReceipt,
 ) -> anyhow::Result<()> {
-    validate_source_receipt_shape(receipt)?;
+    validate_source_installation_receipt(receipt)?;
     anyhow::ensure!(
         Path::new(&receipt.ownership.install_root).is_absolute()
             && Path::new(&receipt.ownership.marker_path).is_absolute()
@@ -1236,8 +1237,10 @@ fn absolute_path(path: &Path) -> anyhow::Result<PathBuf> {
 
 fn install_adapter_from_index(
     args: &InstallAdapterArgs,
-    index: &crate::release_index::AdapterReleaseIndex,
+    verified: &crate::update::catalog::VerifiedAdapterUpdateCatalog,
+    local_store: Option<&crate::update::local_store::LocalReleaseStore>,
 ) -> anyhow::Result<()> {
+    let index = &verified.catalog;
     use semver::Version;
 
     let requested = normalize_adapter_name(&args.name);
@@ -1270,6 +1273,7 @@ fn install_adapter_from_index(
         args.prerelease,
     )?;
     if args.offline
+        && local_store.is_none()
         && (!resolved.platform.asset_url.starts_with("file://")
             || !resolved.platform.signature_url.starts_with("file://"))
     {
@@ -1283,7 +1287,14 @@ fn install_adapter_from_index(
     println!("◇ Installing LDGR adapter `{}`", adapter.domain);
     println!("├─ Resolved version {} for {platform}", resolved.version);
     println!("├─ Install root {}", install_root.display());
-    install_resolved_index_release(&resolved, &install_root, &home, args.offline)?;
+    install_resolved_index_release(
+        &resolved,
+        &verified.archive_keyring,
+        &install_root,
+        &home,
+        args.offline || local_store.is_some(),
+        local_store,
+    )?;
     println!(
         "└─ Installed adapter `{}`. Try `ldgr {} --help` or `ldgr adapter show {}`.",
         adapter.domain, adapter.domain, adapter.domain
@@ -1293,9 +1304,11 @@ fn install_adapter_from_index(
 
 fn install_resolved_index_release(
     resolved: &crate::release_index::ResolvedAdapterRelease<'_>,
+    archive_keyring: &crate::release_index::ReleaseKeyring,
     install_root: &Path,
     home: &Path,
     offline: bool,
+    local_store: Option<&crate::update::local_store::LocalReleaseStore>,
 ) -> anyhow::Result<()> {
     let temp = canonical_temp_path(format!(
         "ldgr-adapter-index-install-{}-{}",
@@ -1307,9 +1320,11 @@ fn install_resolved_index_release(
     let mut transaction = InstallTransaction::new(temp.join("rollback"))?;
     stage_and_apply_resolved_index_release(
         resolved,
+        archive_keyring,
         install_root,
         home,
         offline,
+        local_store,
         &temp,
         &mut transaction,
     )?;
@@ -1320,14 +1335,19 @@ fn install_resolved_index_release(
 
 pub(crate) fn stage_and_apply_resolved_index_release(
     resolved: &crate::release_index::ResolvedAdapterRelease<'_>,
+    archive_keyring: &crate::release_index::ReleaseKeyring,
     install_root: &Path,
     home: &Path,
     offline: bool,
+    local_store: Option<&crate::update::local_store::LocalReleaseStore>,
     staging_root: &Path,
     transaction: &mut InstallTransaction,
 ) -> anyhow::Result<()> {
     let archive = staging_root.join("adapter.tar.gz");
-    let update_client = crate::update::network::UpdateNetworkClient::new(offline)?;
+    let update_client = match local_store.cloned() {
+        Some(store) => crate::update::network::UpdateNetworkClient::with_local_store(store)?,
+        None => crate::update::network::UpdateNetworkClient::new(offline)?,
+    };
     update_client.download_artifact(
         &resolved.platform.asset_url,
         &archive,
@@ -1340,12 +1360,14 @@ pub(crate) fn stage_and_apply_resolved_index_release(
         &signature,
         crate::update::network::MAX_UPDATE_SIGNATURE_BYTES,
     )?;
-    let keyring = configured_release_keyring(home)?;
-    crate::release_index::verify_detached_release_signature(
-        &archive,
-        &signature,
-        &keyring,
+    let envelope =
+        crate::release_index::parse_detached_signature(&fs::read_to_string(&signature)?)?;
+    crate::release_index::verify_detached_signature_bytes(
+        &fs::read(&archive)?,
+        &envelope,
+        archive_keyring,
         &resolved.platform.signing_key_id,
+        "adapter release archive",
     )?;
     crate::release_index::extract_safe_tar_gz(
         &archive,
@@ -1561,20 +1583,6 @@ fn read_release_update_receipt(
     Ok(Some(receipt))
 }
 
-fn configured_release_keyring(home: &Path) -> anyhow::Result<PathBuf> {
-    let keyring = std::env::var_os(crate::release_index::ADAPTER_RELEASE_KEYRING_ENV)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".ldgr").join(LDGR_RELEASE_KEYRING_FILE));
-    if !keyring.is_file() {
-        bail!(
-            "trusted adapter release keyring not found at {}; run `ldgr install` first or set {}",
-            keyring.display(),
-            crate::release_index::ADAPTER_RELEASE_KEYRING_ENV
-        );
-    }
-    Ok(keyring)
-}
-
 fn write_installation_receipt(
     install_root: &Path,
     resolved: &crate::release_index::ResolvedAdapterRelease<'_>,
@@ -1586,11 +1594,7 @@ fn write_installation_receipt(
         .context("system clock is before Unix epoch")?
         .as_secs();
     let receipt = crate::release_index::InstallationReceipt {
-        schema_version: if resolved.release.compatibility.is_some() {
-            2
-        } else {
-            1
-        },
+        schema_version: adapter_installation_receipt_schema_version(resolved.release),
         domain: resolved.adapter.domain.clone(),
         version: resolved.version.to_string(),
         source_url: resolved.platform.asset_url.clone(),
@@ -1615,6 +1619,7 @@ fn write_installation_receipt(
             })
             .collect::<anyhow::Result<Vec<_>>>()?,
     };
+    validate_release_installation_receipt(&receipt)?;
     fs::write(
         install_root.join("installation-receipt.json"),
         format!("{}\n", serde_json::to_string_pretty(&receipt)?),
@@ -2482,7 +2487,7 @@ fn write_source_installation_receipt(
     let source_resource_manifest = source.bundle_root.join("adapter-resources.json");
     let installed_resource_manifest = install_root.join("adapter-resources.json");
     let receipt = crate::release_index::SourceInstallationReceipt {
-        schema_version: 1,
+        schema_version: SOURCE_ADAPTER_INSTALLATION_RECEIPT_SCHEMA_VERSION,
         install_kind: "local_source".to_owned(),
         domain: adapter.to_owned(),
         installed_at_unix_seconds,
@@ -2525,6 +2530,7 @@ fn write_source_receipt_file(
     install_root: &Path,
     receipt: &crate::release_index::SourceInstallationReceipt,
 ) -> anyhow::Result<()> {
+    validate_source_installation_receipt(receipt)?;
     fs::write(
         install_root.join("installation-receipt.json"),
         format!("{}\n", serde_json::to_string_pretty(receipt)?),
@@ -3433,7 +3439,10 @@ fn install_harness(harness: HarnessKind, home: &Path) -> anyhow::Result<serde_js
     install_harness_skill(harness, home)
 }
 
-fn ensure_agentctl_dependency(skip: bool) -> anyhow::Result<serde_json::Value> {
+fn ensure_agentctl_dependency(
+    skip: bool,
+    network_forbidden: bool,
+) -> anyhow::Result<serde_json::Value> {
     if skip {
         println!("├─ Skipped agentctl install (--no-agentctl)");
         return Ok(serde_json::json!({
@@ -3453,6 +3462,11 @@ fn ensure_agentctl_dependency(skip: bool) -> anyhow::Result<serde_json::Value> {
             "command": "agentctl",
             "version": AGENTCTL_VERSION
         }));
+    }
+    if network_forbidden {
+        bail!(
+            "local release store mode forbids downloading agentctl; install the paired Core/agentctl bundle first or rerun with --no-agentctl"
+        );
     }
 
     println!("├─ Installing agentctl {AGENTCTL_VERSION} from {AGENTCTL_REPO}");
@@ -4528,6 +4542,7 @@ mod tests {
             no_agentctl: true,
             interview_depth: None,
             adapter: Vec::new(),
+            store: None,
         }
     }
 
@@ -4689,6 +4704,7 @@ mod tests {
             version: None,
             prerelease: false,
             offline: false,
+            store: None,
             yes: true,
         };
         let base = make_args();
@@ -5010,7 +5026,7 @@ argv = ["ldgr-example-adapter", "manifest-summary"]
         std::fs::write(install_root.path().join("adapter.toml"), "[adapter]\n")?;
         let outside = tempfile::NamedTempFile::new()?;
         let receipt = crate::release_index::SourceInstallationReceipt {
-            schema_version: 1,
+            schema_version: SOURCE_ADAPTER_INSTALLATION_RECEIPT_SCHEMA_VERSION,
             install_kind: "local_source".to_owned(),
             domain: "example".to_owned(),
             installed_at_unix_seconds: 0,

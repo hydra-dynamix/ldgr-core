@@ -93,16 +93,20 @@ retained adapter.
 
 LDGR can share privacy-minimized numerical constructions for research.
 Anonymous construction telemetry is enabled by default and can be opted out at
-any time. Installation never prompts for telemetry and `--telemetry disable`
+any time. Installation never prompts for telemetry. `ldgr telemetry disable`
 records an opt-out. Experience donation is separate, non-anonymous, disabled by
-default, and requires `ldgr telemetry donation enable`.
+default, and requires `ldgr telemetry donation enable`. After opt-in, Core
+captures completed rich work episodes automatically. The detached shutdown and
+startup-retry worker drains both queues. Donation disablement removes unsent
+rich episodes without changing anonymous consent.
 
 Core maps raw local command/run data immediately into a finite ontology and
 stores only consolidated numerical construction keys and bucketed counts. A
 `command-experience/v1` construction is suppressed below local support five,
 released once per seven-day window, and subject to a 20-construction window cap.
-Pending wire payloads remain bare JSON integer arrays under
-`~/.ldgr/telemetry-pending/<protocol>/`.
+Pending anonymous payloads remain bare JSON integer arrays under
+`~/.ldgr/telemetry-pending/<protocol>/`. Opted-in rich episodes use the separate
+`~/.ldgr/experience-donation-pending/experiences/v1/` queue.
 
 ```sh
 ldgr telemetry status
@@ -117,9 +121,19 @@ ldgr telemetry donation status
 `preview` performs the release check and prints exact raw arrays, endpoints, and
 decoded command constructions without sending them. `transmit` is best-effort,
 HTTPS-only, and resolves its origin from the flag, environment, then
-`https://ldgr.run`. Failed sends are retained and never affect ordinary commands.
-`disable` requires no network request, deletes pending payloads and local
-construction aggregates, and sends no final event.
+`https://ldgr.run`.
+
+Core also schedules a detached transmission worker after each normal CLI exit.
+If a process exits unexpectedly, the pending files remain durable. The next
+valid CLI startup detects the files and schedules the worker. One local lock
+serializes automatic and explicit transmission. Automatic delivery uses
+`LDGR_TELEMETRY_COLLECTOR`, then `https://ldgr.run`. Private collectors can set
+`LDGR_AUTOMATIC_TELEMETRY_ROOT_CA_PEM` to one additional PEM trust anchor.
+
+Failed sends remain pending and never affect ordinary commands. Set
+`LDGR_NO_AUTOMATIC_TELEMETRY=1` to suppress detached delivery without changing
+collection consent. `disable` requires no network request, deletes pending
+payloads and local construction aggregates, and sends no final event.
 
 Already-ingested sequences cannot be individually located for deletion because
 the collector intentionally receives and stores no user, installation, request,

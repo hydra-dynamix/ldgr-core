@@ -4,6 +4,7 @@ use assert_cmd::Command;
 fn compatibility_report_accepts_paired_agentctl() {
     let output = Command::cargo_bin("ldgr")
         .expect("ldgr")
+        .env("LDGR_NO_AUTOMATIC_TELEMETRY", "1")
         .args(["compatibility", "--agentctl-version", "0.1.2", "--json"])
         .output()
         .expect("compatibility");
@@ -21,6 +22,7 @@ fn compatibility_report_accepts_paired_agentctl() {
 fn compatibility_report_rejects_old_agentctl() {
     Command::cargo_bin("ldgr")
         .expect("ldgr")
+        .env("LDGR_NO_AUTOMATIC_TELEMETRY", "1")
         .args(["compatibility", "--agentctl-version", "0.1.1", "--json"])
         .assert()
         .failure()

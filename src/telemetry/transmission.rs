@@ -9,6 +9,10 @@ use reqwest::header::{ACCEPT, CONTENT_TYPE};
 use reqwest::redirect::Policy;
 use reqwest::{Certificate, Url};
 
+use super::donation::{
+    experience_donation_is_eligible, validate_experience_donation_payload,
+    EXPERIENCE_DONATION_ENDPOINT, EXPERIENCE_DONATION_PENDING_DIRECTORY,
+};
 use super::serializer::parse_exact_sequence;
 use super::transition::NumericalProtocol;
 use super::{anonymous_collection_is_eligible, TELEMETRY_PENDING_DIRECTORY};
@@ -107,6 +111,79 @@ impl TransmissionClient {
             additional_root_certificates: &self.additional_root_certificates,
         };
         self.transmit_with(ldgr_home, protocol, &transport)
+    }
+
+    /// Best-effort delivery of consented rich experience donations.
+    pub fn transmit_pending_donations(&self, ldgr_home: &Path) -> TransmissionReport {
+        let transport = HttpSequenceTransport {
+            timeout: self.timeout,
+            additional_root_certificates: &self.additional_root_certificates,
+        };
+        self.transmit_donations_with_delay(ldgr_home, &transport, random_delay)
+    }
+
+    fn transmit_donations_with_delay<T, D>(
+        &self,
+        ldgr_home: &Path,
+        transport: &T,
+        mut delay: D,
+    ) -> TransmissionReport
+    where
+        T: SequenceTransport,
+        D: FnMut(Duration),
+    {
+        let mut report = TransmissionReport::default();
+        if !experience_donation_is_eligible(ldgr_home) {
+            report.disabled = true;
+            return report;
+        }
+        let directory = ldgr_home
+            .join(EXPERIENCE_DONATION_PENDING_DIRECTORY)
+            .join("experiences/v1");
+        let pending = match real_pending_files(&directory) {
+            Ok(mut values) => {
+                values.sort();
+                values
+            }
+            Err(_) => return report,
+        };
+        let endpoint = match self.collector_origin.join(EXPERIENCE_DONATION_ENDPOINT) {
+            Ok(endpoint) => endpoint,
+            Err(_) => return report,
+        };
+        for path in pending {
+            if !experience_donation_is_eligible(ldgr_home) {
+                report.disabled = true;
+                break;
+            }
+            let payload = match fs::read(&path) {
+                Ok(payload) if validate_experience_donation_payload(&payload).is_ok() => payload,
+                Ok(_) => {
+                    if fs::remove_file(&path).is_ok() {
+                        report.invalid_dropped += 1;
+                    } else {
+                        report.retained += 1;
+                    }
+                    continue;
+                }
+                Err(_) => {
+                    report.retained += 1;
+                    continue;
+                }
+            };
+            delay(self.max_delay);
+            report.attempted += 1;
+            if transport.post(&endpoint, &payload) {
+                if fs::remove_file(&path).is_ok() {
+                    report.accepted += 1;
+                } else {
+                    report.retained += 1;
+                }
+            } else {
+                report.retained += 1;
+            }
+        }
+        report
     }
 
     fn transmit_with<T: SequenceTransport>(
@@ -378,6 +455,51 @@ mod tests {
         Ok(())
     }
 
+    fn enable_donation(home: &Path) -> anyhow::Result<()> {
+        save_telemetry_consent(
+            home,
+            &TelemetryConsent::current(TelemetryConsentDecision::Disabled)
+                .with_donation(TelemetryConsentDecision::Enabled),
+        )?;
+        Ok(())
+    }
+
+    fn queue_donation_fixture(home: &Path) -> anyhow::Result<Vec<u8>> {
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "schema": "experience-donation/v1",
+            "consent": {
+                "program": "experience-donation",
+                "decision": "enabled",
+                "policy_version": 1
+            },
+            "source": {"system": "ldgr-core", "system_version": "0.1.14"},
+            "episode": {
+                "schema": "ldgr-work-episode/v1",
+                "episode_id": "WEP-test",
+                "source_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "material": {
+                    "source_schema_version": 5,
+                    "source_schema_fingerprint": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "project_id": "PRJ-test",
+                    "work_item": {"id": 1},
+                    "run": {"id": 2},
+                    "events": [],
+                    "observations": [],
+                    "artifacts": [],
+                    "decisions": [],
+                    "errors": [],
+                    "terminal_status": "success"
+                }
+            }
+        }))?;
+        let route = home
+            .join(EXPERIENCE_DONATION_PENDING_DIRECTORY)
+            .join("experiences/v1");
+        fs::create_dir_all(&route)?;
+        fs::write(route.join("donation"), &payload)?;
+        Ok(payload)
+    }
+
     fn queue(home: &Path, terminal: StateCode) -> anyhow::Result<()> {
         let mut buffer = LocalSequenceBuffer::begin_after_commit(home, &CORE_WORK_V1)?
             .expect("consent is enabled");
@@ -521,6 +643,34 @@ mod tests {
             .lock()
             .expect("capture lock poisoned")
             .is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn opted_in_donation_uses_the_rich_endpoint_and_removes_accepted_payload() -> anyhow::Result<()>
+    {
+        let _guard = telemetry_environment_lock()
+            .lock()
+            .expect("environment lock poisoned");
+        let home = tempfile::tempdir()?;
+        enable_donation(home.path())?;
+        let payload = queue_donation_fixture(home.path())?;
+        let transport = CaptureTransport {
+            accept: true,
+            ..CaptureTransport::default()
+        };
+        let report =
+            zero_delay_client()?.transmit_donations_with_delay(home.path(), &transport, |_| {});
+        assert_eq!(report.attempted, 1);
+        assert_eq!(report.accepted, 1);
+        assert!(!report.disabled);
+        let requests = transport.requests.lock().expect("capture lock poisoned");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].0.as_str(),
+            "https://collector.example/donations/experiences/v1"
+        );
+        assert_eq!(requests[0].1, payload);
         Ok(())
     }
 
