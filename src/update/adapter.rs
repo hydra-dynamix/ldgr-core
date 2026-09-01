@@ -568,7 +568,7 @@ pub(crate) fn stage_and_apply_adapter_update(
                     &configured_keyring
                 }
             };
-            crate::cli::commands::ops::stage_and_apply_resolved_index_release(
+            let result = crate::cli::commands::ops::stage_and_apply_resolved_index_release(
                 &resolved,
                 archive_keyring,
                 install_root,
@@ -577,8 +577,8 @@ pub(crate) fn stage_and_apply_adapter_update(
                 local_store,
                 &staging_root,
                 transaction,
-            )?;
-            let _ = fs::remove_dir_all(&staging_root);
+            );
+            finish_adapter_staging(&staging_root, result)?;
             println!(
                 "\u{2514}\u{2500} Installed adapter `{slug}`. Try `ldgr {slug} --help` or `ldgr adapter show {slug}`."
             );
@@ -602,6 +602,20 @@ pub(crate) fn stage_and_apply_adapter_update(
             transaction,
             false,
         ),
+    }
+}
+
+fn finish_adapter_staging(staging_root: &Path, result: anyhow::Result<()>) -> anyhow::Result<()> {
+    match fs::remove_dir_all(staging_root) {
+        Ok(()) => result,
+        Err(cleanup) if cleanup.kind() == std::io::ErrorKind::NotFound => result,
+        Err(cleanup) => match result {
+            Ok(()) => Err(cleanup).context("failed to clean adapter update staging"),
+            Err(error) => Err(error.context(format!(
+                "adapter update failed and staging cleanup also failed at {}: {cleanup}",
+                staging_root.display()
+            ))),
+        },
     }
 }
 
@@ -667,6 +681,24 @@ mod tests {
             binary_sha256: None,
             owned_resources: Vec::new(),
         }
+    }
+
+    #[test]
+    fn failed_adapter_update_removes_ephemeral_staging() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let staging = root.path().join("staging");
+        fs::create_dir_all(&staging)?;
+        fs::write(staging.join("archive.tar.gz"), "fixture")?;
+        let error = finish_adapter_staging(
+            &staging,
+            Err(anyhow::anyhow!("injected adapter update failure")),
+        )
+        .expect_err("operation failure must remain visible");
+        assert!(error
+            .to_string()
+            .contains("injected adapter update failure"));
+        assert!(!staging.exists());
+        Ok(())
     }
 
     #[test]

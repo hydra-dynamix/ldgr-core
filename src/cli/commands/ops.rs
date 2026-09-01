@@ -719,16 +719,15 @@ pub(crate) fn handle_update_adapter(args: &AdapterUpdateArgs) -> anyhow::Result<
     ))?;
     remove_path_if_exists(&temp)?;
     let mut transaction = InstallTransaction::new(temp.join("rollback"))?;
-    crate::update::adapter::stage_and_apply_adapter_update(
+    let result = crate::update::adapter::stage_and_apply_adapter_update(
         &plan,
         verified_catalog
             .as_ref()
             .map(|verified| &verified.archive_keyring),
         local_store.as_ref(),
         &mut transaction,
-    )?;
-    transaction.commit()?;
-    remove_path_if_exists(&temp)
+    );
+    finish_ephemeral_installation(transaction, &temp, result)
 }
 
 pub(crate) fn handle_uninstall_adapter(args: &AdapterUninstallArgs) -> anyhow::Result<()> {
@@ -1315,10 +1314,10 @@ fn install_resolved_index_release(
         resolved.adapter.domain,
         std::process::id()
     ))?;
-    let _ = fs::remove_dir_all(&temp);
+    remove_path_if_exists(&temp)?;
     fs::create_dir_all(&temp)?;
     let mut transaction = InstallTransaction::new(temp.join("rollback"))?;
-    stage_and_apply_resolved_index_release(
+    let result = stage_and_apply_resolved_index_release(
         resolved,
         archive_keyring,
         install_root,
@@ -1327,10 +1326,8 @@ fn install_resolved_index_release(
         local_store,
         &temp,
         &mut transaction,
-    )?;
-    transaction.commit()?;
-    let _ = fs::remove_dir_all(&temp);
-    Ok(())
+    );
+    finish_ephemeral_installation(transaction, &temp, result)
 }
 
 pub(crate) fn stage_and_apply_resolved_index_release(
@@ -1451,11 +1448,15 @@ pub(crate) fn apply_staged_resolved_index_release(
     let binary_source = extracted
         .join(&resolved.platform.platform)
         .join(&resolved.platform.binary);
+    let fresh_install = !install_root.exists();
     let previous_receipt = if migrate_legacy {
         None
     } else {
         read_release_update_receipt(install_root, &resolved.adapter.domain)?
     };
+    if fresh_install {
+        ensure_adapter_harness_config(home, transaction, quiet)?;
+    }
     let resource_plan =
         typed_harness_resource_plan(extracted, home, &resolved.platform.resource_manifest)?;
     let resource_targets = resource_plan
@@ -1691,6 +1692,37 @@ fn collect_digest_files(
     Ok(())
 }
 
+fn finish_ephemeral_installation<T>(
+    mut transaction: InstallTransaction,
+    temp: &Path,
+    result: anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    match result {
+        Ok(value) => {
+            transaction.commit()?;
+            remove_path_if_exists(temp)
+                .context("failed to clean successful adapter transaction")?;
+            Ok(value)
+        }
+        Err(error) => {
+            if let Err(rollback) = transaction.rollback() {
+                return Err(error.context(format!(
+                    "adapter transaction rollback failed and recovery data was retained at {}: {rollback:#}",
+                    temp.display()
+                )));
+            }
+            drop(transaction);
+            if let Err(cleanup) = remove_path_if_exists(temp) {
+                return Err(error.context(format!(
+                    "adapter transaction rolled back but staging cleanup failed at {}: {cleanup:#}",
+                    temp.display()
+                )));
+            }
+            Err(error)
+        }
+    }
+}
+
 fn canonical_temp_path(name: impl AsRef<Path>) -> anyhow::Result<PathBuf> {
     let root = fs::canonicalize(std::env::temp_dir())
         .context("failed to resolve the canonical system temporary directory")?;
@@ -1742,9 +1774,7 @@ pub(crate) fn typed_harness_resource_plan(
     use crate::harness_config::HarnessResourceKind;
     use crate::release_index::AdapterResourceKind;
 
-    let config = read_ldgr_harness_config(home).context(
-        "typed adapter resources require a valid ~/.ldgr/config.json; run `ldgr install` first",
-    )?;
+    let (config, _) = effective_adapter_harness_config(home)?;
     let manifest = crate::release_index::parse_resource_manifest(
         &fs::read_to_string(bundle.join(manifest_path)).with_context(|| {
             format!("adapter bundle is missing resource manifest `{manifest_path}`")
@@ -2210,7 +2240,7 @@ fn install_adapter_from_source_root_with_package(
     ))?;
     remove_path_if_exists(&temp)?;
     let mut transaction = InstallTransaction::new(temp.join("rollback"))?;
-    apply_source_adapter_update(
+    let result = apply_source_adapter_update(
         adapter,
         package,
         source_root,
@@ -2219,9 +2249,8 @@ fn install_adapter_from_source_root_with_package(
         None,
         &mut transaction,
         false,
-    )?;
-    transaction.commit()?;
-    remove_path_if_exists(&temp)
+    );
+    finish_ephemeral_installation(transaction, &temp, result)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2263,6 +2292,9 @@ pub(crate) fn apply_source_adapter_update(
         for resource in &previous.owned_resources {
             transaction.snapshot(Path::new(&resource.path))?;
         }
+    }
+    if previous_receipt.is_none() {
+        ensure_adapter_harness_config(home, transaction, quiet)?;
     }
     let anticipated_resources = source_harness_resource_plan(&source.bundle_root, home)?;
     let previously_owned = previous_receipt
@@ -3106,6 +3138,60 @@ fn read_ldgr_harness_config(home: &Path) -> Option<crate::harness_config::Harnes
     }
     let text = fs::read_to_string(home.join(".ldgr/config.json")).ok()?;
     crate::harness_config::parse_harness_config_json(&text).ok()
+}
+
+fn default_adapter_harness_config(home: &Path) -> HarnessConfig {
+    HarnessConfig {
+        default_harness: Some("pi".to_owned()),
+        selected_harnesses: vec!["pi".to_owned()],
+        installed: vec![crate::harness_config::InstalledHarness {
+            harness: "pi".to_owned(),
+            prompt_paths: vec![home.join(".ldgr/prompts")],
+            skill_paths: vec![home.join(".pi/agent/skills")],
+            extension_paths: vec![home.join(".pi/agent/extensions")],
+            command_paths: Vec::new(),
+            extensions: Default::default(),
+        }],
+        ..HarnessConfig::default()
+    }
+}
+
+fn effective_adapter_harness_config(home: &Path) -> anyhow::Result<(HarnessConfig, bool)> {
+    if let Some(config) = read_ldgr_harness_config(home) {
+        return Ok((config, false));
+    }
+    let toml_path = home.join(".ldgr/config.toml");
+    let json_path = home.join(".ldgr/config.json");
+    anyhow::ensure!(
+        !toml_path.exists() && !json_path.exists(),
+        "adapter installation found an unreadable or invalid LDGR harness config; repair {} or {} before retrying",
+        toml_path.display(),
+        json_path.display()
+    );
+    Ok((default_adapter_harness_config(home), true))
+}
+
+fn ensure_adapter_harness_config(
+    home: &Path,
+    transaction: &mut InstallTransaction,
+    quiet: bool,
+) -> anyhow::Result<HarnessConfig> {
+    let (config, needs_write) = effective_adapter_harness_config(home)?;
+    if needs_write {
+        let toml_path = home.join(".ldgr/config.toml");
+        let json_path = home.join(".ldgr/config.json");
+        transaction.snapshot(&toml_path)?;
+        transaction.snapshot(&json_path)?;
+        let (toml_path, json_path) = write_harness_config_files(home, &config)?;
+        if !quiet {
+            println!(
+                "├─ Created default Pi harness config {} and {}",
+                toml_path.display(),
+                json_path.display()
+            );
+        }
+    }
+    Ok(config)
 }
 
 fn write_harness_config_files(
@@ -4848,6 +4934,77 @@ prompt_stdin = true
             "prompt"
         );
         assert!(!home.path().join(".ldgr/prompts/research-loop.md").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn standalone_adapter_config_is_transactional_and_uses_bounded_pi_defaults(
+    ) -> anyhow::Result<()> {
+        let home = tempfile::tempdir()?;
+        let failed_temp = home.path().join("failed-transaction");
+        let mut failed_transaction = InstallTransaction::new(failed_temp.join("rollback"))?;
+        let failed_result: anyhow::Result<()> = (|| {
+            let config = ensure_adapter_harness_config(home.path(), &mut failed_transaction, true)?;
+            assert_eq!(config.default_harness.as_deref(), Some("pi"));
+            assert_eq!(config.selected_harnesses, ["pi"]);
+            assert_eq!(config.installed.len(), 1);
+            assert_eq!(config.installed[0].harness, "pi");
+            assert_eq!(
+                config.installed[0].prompt_paths,
+                [home.path().join(".ldgr/prompts")]
+            );
+            assert_eq!(
+                config.installed[0].skill_paths,
+                [home.path().join(".pi/agent/skills")]
+            );
+            assert_eq!(
+                config.installed[0].extension_paths,
+                [home.path().join(".pi/agent/extensions")]
+            );
+            anyhow::bail!("injected post-config installation failure")
+        })();
+        assert!(
+            finish_ephemeral_installation(failed_transaction, &failed_temp, failed_result).is_err()
+        );
+        assert!(!failed_temp.exists());
+        assert!(!home.path().join(".ldgr/config.toml").exists());
+        assert!(!home.path().join(".ldgr/config.json").exists());
+
+        let successful_temp = home.path().join("successful-transaction");
+        let mut successful_transaction = InstallTransaction::new(successful_temp.join("rollback"))?;
+        ensure_adapter_harness_config(home.path(), &mut successful_transaction, true)?;
+        finish_ephemeral_installation(successful_transaction, &successful_temp, Ok(()))?;
+        assert!(!successful_temp.exists());
+        let toml_config = crate::harness_config::parse_harness_config_toml(&fs::read_to_string(
+            home.path().join(".ldgr/config.toml"),
+        )?)?;
+        let json_config = crate::harness_config::parse_harness_config_json(&fs::read_to_string(
+            home.path().join(".ldgr/config.json"),
+        )?)?;
+        assert_eq!(toml_config.selected_harnesses, ["pi"]);
+        assert_eq!(
+            json_config.selected_harnesses,
+            toml_config.selected_harnesses
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn standalone_adapter_config_never_replaces_invalid_existing_config() -> anyhow::Result<()> {
+        let home = tempfile::tempdir()?;
+        let config_path = home.path().join(".ldgr/config.json");
+        fs::create_dir_all(config_path.parent().expect("config has parent"))?;
+        fs::write(&config_path, "{invalid")?;
+        let temp = home.path().join("transaction");
+        let mut transaction = InstallTransaction::new(temp.join("rollback"))?;
+        let error = ensure_adapter_harness_config(home.path(), &mut transaction, true)
+            .expect_err("invalid config must block installation");
+        assert!(error.to_string().contains("unreadable or invalid"));
+        finish_ephemeral_installation::<()>(transaction, &temp, Err(error))
+            .expect_err("invalid config remains an installation error");
+        assert_eq!(fs::read_to_string(config_path)?, "{invalid");
+        assert!(!home.path().join(".ldgr/config.toml").exists());
+        assert!(!temp.exists());
         Ok(())
     }
 

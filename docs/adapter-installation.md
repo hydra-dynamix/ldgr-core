@@ -32,6 +32,8 @@ ldgr adapter install research
 
 `ldgr adapter install list` shows installable adapters and where they come from. Core authenticates the release catalog, resolves a platform artifact against the active compatibility-v2 Core profile, verifies its signature/checksum and staged `adapter-compatibility.json`, then delegates resource setup to the adapter-owned installer. The adapter writes its bundle to `~/.ldgr/adapters/<adapter>`, installs adapter-owned prompts, skills, commands, and extensions into the paths declared by configured harness entries in canonical `~/.ldgr/config.toml`, and records license paths there when the adapter supports commercial licensing. Core also maintains `~/.ldgr/config.json` as a compatibility mirror for older adapters during migration.
 
+An explicit `ldgr adapter install <adapter>` works in a clean home without running the interactive harness installer first. When neither config file exists, Core transactionally creates a default Pi configuration in both `~/.ldgr/config.toml` and `~/.ldgr/config.json`, using bounded resource roots under `~/.ldgr`, `~/.pi/agent/skills`, and `~/.pi/agent/extensions`. A later `ldgr install` may replace that default and reconcile installed adapter resources. Existing valid configuration is preserved; unreadable or invalid configuration blocks installation rather than being overwritten.
+
 Ordinary v2 resolution and discovery compare the adapter protocol epoch,
 monotonic minimum Core schema, required Core capabilities, and optional
 registered central components. They do **not** require an exact Core package

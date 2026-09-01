@@ -1867,6 +1867,7 @@ fn local_release_store_drives_adapter_update_and_clean_install_without_network(
     materialize_update_apply_fixture(install_project.path(), &install_fixture)?;
     let install_store = materialize_local_adapter_store(install_project.path(), &install_fixture)?;
     fs::remove_dir_all(&install_fixture.adapter_root)?;
+    fs::remove_file(install_fixture.home.join(".ldgr/config.json"))?;
 
     let mut install = isolated_command(install_project.path())?;
     install.args([
@@ -1890,6 +1891,22 @@ fn local_release_store_drives_adapter_update_and_clean_install_without_network(
     )?)?;
     assert_eq!(receipt["version"], "1.2.4");
     assert!(String::from_utf8(output.stdout)?.contains("Installed adapter `fixture`"));
+    let config_toml = install_fixture.home.join(".ldgr/config.toml");
+    let config_json = install_fixture.home.join(".ldgr/config.json");
+    assert!(config_toml.is_file());
+    assert!(config_json.is_file());
+    let toml_config =
+        ldgr_core::harness_config::parse_harness_config_toml(&fs::read_to_string(&config_toml)?)?;
+    let json_config =
+        ldgr_core::harness_config::parse_harness_config_json(&fs::read_to_string(&config_json)?)?;
+    assert_eq!(toml_config.default_harness.as_deref(), Some("pi"));
+    assert_eq!(toml_config.selected_harnesses, ["pi"]);
+    assert_eq!(
+        json_config.selected_harnesses,
+        toml_config.selected_harnesses
+    );
+    assert_eq!(json_config.installed.len(), 1);
+    assert_eq!(json_config.installed[0].harness, "pi");
     Ok(())
 }
 
