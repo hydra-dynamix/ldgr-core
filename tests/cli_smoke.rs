@@ -1791,6 +1791,48 @@ fn update_apply_requires_yes_then_installs_and_reconciles_a_signed_adapter() -> 
 #[test]
 fn local_release_store_drives_adapter_update_and_clean_install_without_network(
 ) -> anyhow::Result<()> {
+    let single_update_project = TempDir::new()?;
+    let single_update_fixture = write_update_check_fixture(single_update_project.path())?;
+    materialize_update_apply_fixture(single_update_project.path(), &single_update_fixture)?;
+    let single_update_store =
+        materialize_local_adapter_store(single_update_project.path(), &single_update_fixture)?;
+
+    let mut single_check = isolated_command(single_update_project.path())?;
+    single_check.args([
+        "adapter",
+        "update",
+        "fixture",
+        "--check",
+        "--store",
+        single_update_store
+            .to_str()
+            .context("store path is not UTF-8")?,
+    ]);
+    single_check
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "latest_compatible=1.2.4 update_available=true",
+        ));
+
+    let mut single_update = isolated_command(single_update_project.path())?;
+    single_update.args([
+        "adapter",
+        "update",
+        "fixture",
+        "--store",
+        single_update_store
+            .to_str()
+            .context("store path is not UTF-8")?,
+    ]);
+    single_update.assert().success();
+    let single_receipt: serde_json::Value = serde_json::from_slice(&fs::read(
+        single_update_fixture
+            .adapter_root
+            .join("installation-receipt.json"),
+    )?)?;
+    assert_eq!(single_receipt["version"], "1.2.4");
+
     let update_project = TempDir::new()?;
     let update_fixture = write_update_check_fixture(update_project.path())?;
     materialize_update_apply_fixture(update_project.path(), &update_fixture)?;
@@ -1828,8 +1870,8 @@ fn local_release_store_drives_adapter_update_and_clean_install_without_network(
 
     let mut install = isolated_command(install_project.path())?;
     install.args([
-        "install",
         "adapter",
+        "install",
         "fixture",
         "--store",
         install_store.to_str().context("store path is not UTF-8")?,
