@@ -108,8 +108,39 @@ The default selection is the Core/`agentctl` pair plus all user adapters under t
 | `--adapter <slug>` | Select one adapter; repeatable. Implies adapters-only unless Core is selected by a future explicit flag. |
 | `--prerelease` | Permit prerelease Core and adapter targets. Stable remains the default channel. |
 | `--offline` | Use only configured local catalogs/artifacts and cached artifacts. Any required network access is an error. |
+| `--store <directory>` | Resolve signed catalogs and artifacts from one portable local release store. Implies offline mode. |
 
-`ldgr adapter update <name>` remains supported. It should use the same planner and applier for one adapter, keeping its current output compatible where practical.
+`ldgr adapter update <name>` remains supported. It uses the same authenticated catalog and artifact path. Pass `--store <directory>` to update one signed-release adapter from a local store.
+
+### Local release store
+
+A local store makes install and update testing independent of deployment:
+
+```text
+store/
+├── core-index.json
+├── core-index.json.sig
+├── index.json
+├── index.json.sig
+├── release-keyring.json
+└── artifacts/
+    ├── ldgr-core-<version>-<platform>.tar.gz
+    ├── ldgr-core-<version>-<platform>.tar.gz.sig
+    ├── <adapter>-<version>-<platform>.tar.gz
+    └── <adapter>-<version>-<platform>.tar.gz.sig
+```
+
+Only catalogs needed by the selected command are required. `release-keyring.json` is optional when the embedded trusted keyring verifies the catalogs and archives. Catalog and signature files must be direct store children. Artifacts may be direct children or direct children of `artifacts/`, but the same filename cannot exist in both locations.
+
+Catalog URLs remain signed metadata. In store mode LDGR takes each selected archive or signature filename from that authenticated URL and resolves exactly one matching local file. It then performs the normal catalog signature, archive signature, checksum, compatibility, platform, metadata, and ownership checks. Store directories and files cannot be symlinks, and no network fallback is attempted.
+
+```text
+ldgr update --store ./store --check
+ldgr update --store ./store --adapters-only --yes
+ldgr adapter update research --store ./store
+ldgr adapter install research --store ./store --yes
+ldgr install --adapter research --store ./store --yes
+```
 
 ### Result and exit behavior
 

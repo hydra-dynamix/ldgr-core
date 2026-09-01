@@ -1,6 +1,6 @@
 [package]
 name = "ldgr-core"
-version = "0.1.17"
+version = "0.1.18"
 edition = "2021"
 description = "A minimal durable investigation loop backed by SQLite."
 license = "Apache-2.0"
@@ -38,6 +38,7 @@ flate2 = "1.0"
 base64 = "0.22"
 clap = { version = "4.5", features = ["derive"] }
 dialoguer = { version = "0.11", default-features = false }
+fs2 = "0.4"
 getrandom = "0.2"
 libc = "0.2"
 rusqlite = { version = "0.31", features = ["backup", "bundled"] }

@@ -738,7 +738,7 @@ fn telemetry_controls_report_override_and_disable_without_network() -> anyhow::R
         ))
         .stdout(predicate::str::contains("effective collection: enabled"))
         .stdout(predicate::str::contains(
-            "eligible numerical protocols: core-work/v1, research-workflow/v1, command-experience/v1",
+            "eligible numerical protocols: core-work/v1, research-workflow/v1, command-experience/v1, conduct-orchestration/v1, example-adapter-lifecycle/v1, programbench-reproduction/v1, code-workflow/v1, security-workflow/v1, explore-workflow/v1, bench-workflow/v1, evidence-workflow/v1",
         ));
     assert!(!consent_path.exists());
 
@@ -803,7 +803,13 @@ fn experience_donation_is_separate_and_requires_explicit_opt_in() -> anyhow::Res
     enable
         .assert()
         .success()
-        .stdout(predicate::str::contains("experience donation: enabled"));
+        .stdout(predicate::str::contains("experience donation: enabled"))
+        .stdout(predicate::str::contains(
+            "completed runs are captured and sent automatically",
+        ))
+        .stdout(predicate::str::contains(
+            "non-anonymous and can contain private or identifying content",
+        ));
     let enabled: serde_json::Value = serde_json::from_str(&fs::read_to_string(&consent_path)?)?;
     assert_eq!(enabled["decision"], "enabled");
     assert_eq!(enabled["donation_decision"], "enabled");
@@ -814,6 +820,17 @@ fn experience_donation_is_separate_and_requires_explicit_opt_in() -> anyhow::Res
     let separated: serde_json::Value = serde_json::from_str(&fs::read_to_string(&consent_path)?)?;
     assert_eq!(separated["decision"], "disabled");
     assert_eq!(separated["donation_decision"], "enabled");
+
+    let donation_queue = home.join(".ldgr/experience-donation-pending/experiences/v1");
+    fs::create_dir_all(&donation_queue)?;
+    fs::write(donation_queue.join("pending"), "selected exact episode")?;
+    let mut disable_donation = isolated_command(project.path())?;
+    disable_donation.args(["telemetry", "donation", "disable"]);
+    disable_donation.assert().success();
+    assert!(!home.join(".ldgr/experience-donation-pending").exists());
+    let disabled: serde_json::Value = serde_json::from_str(&fs::read_to_string(&consent_path)?)?;
+    assert_eq!(disabled["decision"], "disabled");
+    assert_eq!(disabled["donation_decision"], "disabled");
     Ok(())
 }
 
@@ -825,13 +842,17 @@ fn telemetry_preview_shows_exact_raw_arrays_and_protocol_without_network_or_clea
     let ldgr_home = home.join(".ldgr");
     let route = ldgr_home.join("telemetry-pending/core-work/v1");
     let research_route = ldgr_home.join("telemetry-pending/research-workflow/v1");
+    let evidence_route = ldgr_home.join("telemetry-pending/evidence-workflow/v1");
     fs::create_dir_all(&route)?;
     fs::create_dir_all(&research_route)?;
+    fs::create_dir_all(&evidence_route)?;
     let valid = route.join("valid");
     let research_valid = research_route.join("valid");
+    let evidence_valid = evidence_route.join("valid");
     let invalid = route.join("invalid");
     fs::write(&valid, "[0,1,3]")?;
     fs::write(&research_valid, "[0,1,4]")?;
+    fs::write(&evidence_valid, "[0,1,9,3]")?;
     fs::write(&invalid, r#"{"project":"secret","sequence":[0,1,3]}"#)?;
 
     let mut preview = isolated_command(project.path())?;
@@ -839,12 +860,15 @@ fn telemetry_preview_shows_exact_raw_arrays_and_protocol_without_network_or_clea
     preview
         .assert()
         .success()
-        .stdout(predicate::str::contains("pending telemetry payloads: 2"))
+        .stdout(predicate::str::contains("pending telemetry payloads: 3"))
         .stdout(predicate::str::contains(
             "destination protocol: /sequences/core-work/v1",
         ))
         .stdout(predicate::str::contains(
             "destination protocol: /sequences/research-workflow/v1",
+        ))
+        .stdout(predicate::str::contains(
+            "destination protocol: /sequences/evidence-workflow/v1",
         ))
         .stdout(predicate::str::contains("raw array: [0,1,3]"))
         .stdout(predicate::str::contains("raw array: [0,1,4]"))
@@ -853,6 +877,7 @@ fn telemetry_preview_shows_exact_raw_arrays_and_protocol_without_network_or_clea
 
     assert!(valid.exists());
     assert!(research_valid.exists());
+    assert!(evidence_valid.exists());
     assert!(invalid.exists());
     Ok(())
 }
@@ -865,12 +890,16 @@ fn telemetry_transmit_is_best_effort_and_retains_core_and_adapter_payloads_when_
     let ldgr_home = home.join(".ldgr");
     let core_route = ldgr_home.join("telemetry-pending/core-work/v1");
     let research_route = ldgr_home.join("telemetry-pending/research-workflow/v1");
+    let evidence_route = ldgr_home.join("telemetry-pending/evidence-workflow/v1");
     fs::create_dir_all(&core_route)?;
     fs::create_dir_all(&research_route)?;
+    fs::create_dir_all(&evidence_route)?;
     let core_payload = core_route.join("core");
     let research_payload = research_route.join("research");
+    let evidence_payload = evidence_route.join("evidence");
     fs::write(&core_payload, "[0,1,4]")?;
     fs::write(&research_payload, "[0,1,4]")?;
+    fs::write(&evidence_payload, "[0,1,9,4]")?;
 
     let mut enable = isolated_command(project.path())?;
     enable.args(["telemetry", "enable"]);
@@ -897,10 +926,14 @@ fn telemetry_transmit_is_best_effort_and_retains_core_and_adapter_payloads_when_
             "protocol /sequences/research-workflow/v1: attempted=1 accepted=0 retained=1 invalid_dropped=0 disabled=false",
         ))
         .stdout(predicate::str::contains(
-            "telemetry transmission: attempted=2 accepted=0 retained=2 invalid_dropped=0",
+            "protocol /sequences/evidence-workflow/v1: attempted=1 accepted=0 retained=1 invalid_dropped=0 disabled=false",
+        ))
+        .stdout(predicate::str::contains(
+            "telemetry transmission: attempted=3 accepted=0 retained=3 invalid_dropped=0",
         ));
     assert!(core_payload.exists());
     assert!(research_payload.exists());
+    assert!(evidence_payload.exists());
 
     let mut killed = isolated_command(project.path())?;
     killed.env("LDGR_TELEMETRY", "off").args([
@@ -1473,6 +1506,82 @@ fn update_check_json_resolves_signed_catalogs_without_downloading_or_mutating_in
 }
 
 #[test]
+fn update_check_accepts_the_canonical_schema_v2_adapter_receipt() -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    let fixture = write_update_check_fixture(project.path())?;
+    let compatibility: ldgr_core::adapter_compatibility::CompatibilityRequirementsV2 =
+        serde_json::from_value(serde_json::json!({
+            "adapter_protocol_epoch": 1,
+            "minimum_core_schema": 5,
+            "required_core_capabilities": [],
+            "central_components": []
+        }))?;
+    let compatibility_sha256 = compatibility
+        .compatibility_sha256()
+        .map_err(anyhow::Error::new)?;
+
+    let receipt_path = fixture.adapter_root.join("installation-receipt.json");
+    let mut receipt: serde_json::Value = serde_json::from_slice(&fs::read(&receipt_path)?)?;
+    receipt["schema_version"] =
+        serde_json::json!(ldgr_core::release_index::ADAPTER_INSTALLATION_RECEIPT_SCHEMA_VERSION);
+    receipt
+        .as_object_mut()
+        .unwrap()
+        .remove("core_compatibility");
+    receipt["compatibility"] = serde_json::to_value(&compatibility)?;
+    receipt["compatibility_sha256"] = serde_json::json!(&compatibility_sha256);
+    fs::write(&receipt_path, serde_json::to_vec_pretty(&receipt)?)?;
+
+    let mut index: serde_json::Value = serde_json::from_slice(&fs::read(&fixture.index)?)?;
+    index["schema_version"] =
+        serde_json::json!(ldgr_core::release_index::ADAPTER_RELEASE_INDEX_SCHEMA_VERSION);
+    for release in index["adapters"][0]["releases"].as_array_mut().unwrap() {
+        release
+            .as_object_mut()
+            .unwrap()
+            .remove("core_compatibility");
+        release["compatibility"] = serde_json::to_value(&compatibility)?;
+        release["compatibility_sha256"] = serde_json::json!(&compatibility_sha256);
+    }
+    fs::write(&fixture.index, serde_json::to_vec_pretty(&index)?)?;
+    sign_adapter_catalog_fixture(
+        &fixture.index,
+        &SigningKey::from_bytes(&[73; 32]),
+        "fixture-update-key",
+    )?;
+
+    let mut command = isolated_command(project.path())?;
+    command
+        .env("LDGR_ADAPTER_INDEX", &fixture.index)
+        .env("LDGR_ADAPTER_RELEASE_KEYRING", &fixture.keyring)
+        .args([
+            "update",
+            "--check",
+            "--json",
+            "--adapters-only",
+            "--offline",
+        ]);
+    let output = command.output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(result["status"], "updates_available");
+    assert_eq!(result["components"][0]["name"], "fixture");
+    assert_eq!(result["components"][0]["current"], "1.2.3");
+    assert!(!result["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|warning| warning
+            .as_str()
+            .is_some_and(|text| text.contains("receipt"))));
+    Ok(())
+}
+
+#[test]
 fn update_check_rejects_an_untrusted_catalog_without_stdout() -> anyhow::Result<()> {
     let project = TempDir::new()?;
     let fixture = write_update_check_fixture(project.path())?;
@@ -1696,6 +1805,128 @@ fn update_apply_requires_yes_then_installs_and_reconciles_a_signed_adapter() -> 
 }
 
 #[test]
+fn local_release_store_drives_adapter_update_and_clean_install_without_network(
+) -> anyhow::Result<()> {
+    let single_update_project = TempDir::new()?;
+    let single_update_fixture = write_update_check_fixture(single_update_project.path())?;
+    materialize_update_apply_fixture(single_update_project.path(), &single_update_fixture)?;
+    let single_update_store =
+        materialize_local_adapter_store(single_update_project.path(), &single_update_fixture)?;
+
+    let mut single_check = isolated_command(single_update_project.path())?;
+    single_check.args([
+        "adapter",
+        "update",
+        "fixture",
+        "--check",
+        "--store",
+        single_update_store
+            .to_str()
+            .context("store path is not UTF-8")?,
+    ]);
+    single_check
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "latest_compatible=1.2.4 update_available=true",
+        ));
+
+    let mut single_update = isolated_command(single_update_project.path())?;
+    single_update.args([
+        "adapter",
+        "update",
+        "fixture",
+        "--store",
+        single_update_store
+            .to_str()
+            .context("store path is not UTF-8")?,
+    ]);
+    single_update.assert().success();
+    let single_receipt: serde_json::Value = serde_json::from_slice(&fs::read(
+        single_update_fixture
+            .adapter_root
+            .join("installation-receipt.json"),
+    )?)?;
+    assert_eq!(single_receipt["version"], "1.2.4");
+
+    let update_project = TempDir::new()?;
+    let update_fixture = write_update_check_fixture(update_project.path())?;
+    materialize_update_apply_fixture(update_project.path(), &update_fixture)?;
+    let update_store = materialize_local_adapter_store(update_project.path(), &update_fixture)?;
+
+    let mut update = isolated_command(update_project.path())?;
+    update.args([
+        "update",
+        "--json",
+        "--adapters-only",
+        "--store",
+        update_store.to_str().context("store path is not UTF-8")?,
+        "--yes",
+    ]);
+    let output = update.output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(result["status"], "applied");
+    let receipt: serde_json::Value = serde_json::from_slice(&fs::read(
+        update_fixture
+            .adapter_root
+            .join("installation-receipt.json"),
+    )?)?;
+    assert_eq!(receipt["version"], "1.2.4");
+
+    let install_project = TempDir::new()?;
+    let install_fixture = write_update_check_fixture(install_project.path())?;
+    materialize_update_apply_fixture(install_project.path(), &install_fixture)?;
+    let install_store = materialize_local_adapter_store(install_project.path(), &install_fixture)?;
+    fs::remove_dir_all(&install_fixture.adapter_root)?;
+    fs::remove_file(install_fixture.home.join(".ldgr/config.json"))?;
+
+    let mut install = isolated_command(install_project.path())?;
+    install.args([
+        "adapter",
+        "install",
+        "fixture",
+        "--store",
+        install_store.to_str().context("store path is not UTF-8")?,
+        "--yes",
+    ]);
+    let output = install.output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let receipt: serde_json::Value = serde_json::from_slice(&fs::read(
+        install_fixture
+            .adapter_root
+            .join("installation-receipt.json"),
+    )?)?;
+    assert_eq!(receipt["version"], "1.2.4");
+    assert!(String::from_utf8(output.stdout)?.contains("Installed adapter `fixture`"));
+    let config_toml = install_fixture.home.join(".ldgr/config.toml");
+    let config_json = install_fixture.home.join(".ldgr/config.json");
+    assert!(config_toml.is_file());
+    assert!(config_json.is_file());
+    let toml_config =
+        ldgr_core::harness_config::parse_harness_config_toml(&fs::read_to_string(&config_toml)?)?;
+    let json_config =
+        ldgr_core::harness_config::parse_harness_config_json(&fs::read_to_string(&config_json)?)?;
+    assert_eq!(toml_config.default_harness.as_deref(), Some("pi"));
+    assert_eq!(toml_config.selected_harnesses, ["pi"]);
+    assert_eq!(
+        json_config.selected_harnesses,
+        toml_config.selected_harnesses
+    );
+    assert_eq!(json_config.installed.len(), 1);
+    assert_eq!(json_config.installed[0].harness, "pi");
+    Ok(())
+}
+
+#[test]
 fn update_apply_rolls_back_every_adapter_when_a_later_activation_fails() -> anyhow::Result<()> {
     let project = TempDir::new()?;
     let fixture = write_update_check_fixture(project.path())?;
@@ -1813,11 +2044,16 @@ fn update_core_check_authenticates_catalog_but_never_fetches_the_archive() -> an
     let project = TempDir::new()?;
     let (index, keyring, archive, target_version) =
         write_core_update_check_fixture(project.path())?;
+    let store = materialize_local_core_store(project.path(), &index, &keyring)?;
     let mut command = isolated_command(project.path())?;
-    command
-        .env("LDGR_CORE_UPDATE_INDEX", &index)
-        .env("LDGR_CORE_RELEASE_KEYRING", &keyring)
-        .args(["update", "--check", "--json", "--core-only", "--offline"]);
+    command.args([
+        "update",
+        "--check",
+        "--json",
+        "--core-only",
+        "--store",
+        store.to_str().context("store path is not UTF-8")?,
+    ]);
     let output = command.output()?;
     assert!(!output.status.success());
     assert!(
@@ -2888,6 +3124,7 @@ fn context_exits_cleanly_when_stdout_pipe_is_closed() -> anyhow::Result<()> {
             project.path().join(".ldgr/test-empty-ldgr-home"),
         )
         .env("HOME", &isolated_home)
+        .env("LDGR_NO_AUTOMATIC_TELEMETRY", "1")
         .arg("--db")
         .arg(&db_path)
         .arg("--artifact-root")
@@ -5415,6 +5652,7 @@ fn web_cockpit_serves_context_artifact_viewer_and_loop_controls() -> anyhow::Res
     let port_text = port.to_string();
     let mut child = StdCommand::new(assert_cmd::cargo::cargo_bin("ldgr"))
         .current_dir(project.path())
+        .env("LDGR_NO_AUTOMATIC_TELEMETRY", "1")
         .arg("--db")
         .arg(&db_path)
         .arg("--artifact-root")
@@ -5698,6 +5936,7 @@ fn web_cockpit_prints_ephemeral_token_and_requires_it_for_loopback_posts() -> an
     let port_text = port.to_string();
     let mut child = StdCommand::new(assert_cmd::cargo::cargo_bin("ldgr"))
         .current_dir(project.path())
+        .env("LDGR_NO_AUTOMATIC_TELEMETRY", "1")
         .arg("--db")
         .arg(&db_path)
         .arg("--artifact-root")
@@ -5836,6 +6075,7 @@ fn artifact_paths_are_current_relative_and_web_raw_is_cwd_independent() -> anyho
     let port_text = port.to_string();
     let mut child = StdCommand::new(assert_cmd::cargo::cargo_bin("ldgr"))
         .current_dir(external_cwd.path())
+        .env("LDGR_NO_AUTOMATIC_TELEMETRY", "1")
         .arg("--db")
         .arg(&db_path)
         .arg("--artifact-root")
@@ -5879,6 +6119,7 @@ fn web_cockpit_rejects_fragile_or_unsafe_requests() -> anyhow::Result<()> {
     let port_text = port.to_string();
     let mut child = StdCommand::new(assert_cmd::cargo::cargo_bin("ldgr"))
         .current_dir(project.path())
+        .env("LDGR_NO_AUTOMATIC_TELEMETRY", "1")
         .arg("--db")
         .arg(&db_path)
         .arg("--artifact-root")
@@ -6804,6 +7045,7 @@ fn isolated_command(project: &Path) -> anyhow::Result<Command> {
         )
         .env("LDGR_HOME", project.join(".ldgr/test-empty-ldgr-home"))
         .env("LDGR_NO_UPDATE_CHECK", "1")
+        .env("LDGR_NO_AUTOMATIC_TELEMETRY", "1")
         .env("LOCALAPPDATA", project.join(".ldgr/test-state"))
         .env("XDG_STATE_HOME", project.join(".ldgr/test-state"))
         .env("HOME", project.join(".ldgr/test-empty-home"));
@@ -7005,6 +7247,60 @@ fn materialize_update_apply_fixture(
         }))?,
     )?;
     Ok(())
+}
+
+fn materialize_local_adapter_store(
+    project: &Path,
+    fixture: &UpdateCheckFixture,
+) -> anyhow::Result<std::path::PathBuf> {
+    let store = project.join("store");
+    let artifacts = store.join("artifacts");
+    fs::create_dir_all(&artifacts)?;
+    let stable_name = fixture
+        .stable_archive
+        .file_name()
+        .context("stable archive has no file name")?;
+    fs::copy(&fixture.stable_archive, artifacts.join(stable_name))?;
+    fs::copy(
+        format!("{}.sig", fixture.stable_archive.display()),
+        artifacts.join(format!("{}.sig", stable_name.to_string_lossy())),
+    )?;
+    fs::copy(&fixture.keyring, store.join("release-keyring.json"))?;
+
+    let mut index: serde_json::Value = serde_json::from_slice(&fs::read(&fixture.index)?)?;
+    for (release, archive) in index["adapters"][0]["releases"]
+        .as_array_mut()
+        .context("fixture releases are not an array")?
+        .iter_mut()
+        .zip([&fixture.stable_archive, &fixture.prerelease_archive])
+    {
+        let name = archive
+            .file_name()
+            .context("fixture archive has no file name")?
+            .to_string_lossy();
+        release["platforms"][0]["asset_url"] =
+            serde_json::json!(format!("https://store.invalid/releases/{name}"));
+        release["platforms"][0]["signature_url"] =
+            serde_json::json!(format!("https://store.invalid/releases/{name}.sig"));
+    }
+    let index_text = serde_json::to_string_pretty(&index)?;
+    let catalog = ldgr_core::release_index::parse_release_index(&index_text)?;
+    let index_path = store.join("index.json");
+    fs::write(&index_path, index_text)?;
+    let signing_key = SigningKey::from_bytes(&[73; 32]);
+    fs::write(
+        store.join("index.json.sig"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "algorithm": "Ed25519",
+            "key_id": "fixture-update-key",
+            "signature": STANDARD.encode(
+                signing_key
+                    .sign(&ldgr_core::update::catalog::canonical_adapter_catalog_bytes(&catalog)?)
+                    .to_bytes()
+            )
+        }))?,
+    )?;
+    Ok(store)
 }
 
 fn add_failing_second_update(
@@ -7416,6 +7712,22 @@ fn write_core_update_check_fixture(
         }))?,
     )?;
     Ok((index, keyring, archive, target_version))
+}
+
+fn materialize_local_core_store(
+    project: &Path,
+    index: &Path,
+    keyring: &Path,
+) -> anyhow::Result<std::path::PathBuf> {
+    let store = project.join("core-store");
+    fs::create_dir_all(&store)?;
+    fs::copy(index, store.join("core-index.json"))?;
+    fs::copy(
+        format!("{}.sig", index.display()),
+        store.join("core-index.json.sig"),
+    )?;
+    fs::copy(keyring, store.join("release-keyring.json"))?;
+    Ok(store)
 }
 
 fn write_startup_recovery_fixture(

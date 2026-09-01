@@ -22,11 +22,13 @@ pub fn handle_adapter(args: AdapterArgs, db_path: &std::path::Path) -> anyhow::R
                 version: args.version,
                 prerelease: args.prerelease,
                 offline: args.offline,
+                store: args.store,
                 yes: args.yes,
             }),
             None => super::ops::handle_interactive_adapter_install(
                 args.source_root,
                 args.install_root,
+                args.store,
                 args.yes,
             ),
         },

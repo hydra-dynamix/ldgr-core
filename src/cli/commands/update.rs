@@ -29,6 +29,7 @@ use crate::update::installation::{
     legacy_adoption_receipt, resolve_current_core_installation, CoreInstallationOwnership,
     LegacyAdoptionConsent,
 };
+use crate::update::local_store::LocalReleaseStore;
 use crate::update::network::UpdateNetworkClient;
 use crate::update::plan::{
     build_update_plan, AdapterInstallationKind, AdapterInstallationSnapshot, AdapterOrigin,
@@ -57,6 +58,7 @@ struct ResolvedUpdate {
     core_catalog: VerifiedCoreUpdateCatalog,
     adapter_catalog: VerifiedAdapterUpdateCatalog,
     ownership: PlanStagingOwnership,
+    local_store: Option<LocalReleaseStore>,
 }
 
 fn handle_check(args: UpdateArgs) -> anyhow::Result<()> {
@@ -123,7 +125,10 @@ fn handle_apply(args: UpdateArgs) -> anyhow::Result<()> {
     }
 
     confirm_application(&args, &resolved.plan)?;
-    let client = UpdateNetworkClient::new(args.offline)?;
+    let client = match resolved.local_store.clone() {
+        Some(store) => UpdateNetworkClient::with_local_store(store)?,
+        None => UpdateNetworkClient::new(args.offline)?,
+    };
     let catalogs = VerifiedStagingCatalogs {
         core: &resolved.core_catalog,
         adapters: &resolved.adapter_catalog,
@@ -254,6 +259,7 @@ pub fn handle_startup_check_worker(owner_token: &str) -> anyhow::Result<()> {
         adapters: Vec::new(),
         prerelease: config.channel == UpdateChannel::Prerelease,
         offline: false,
+        store: None,
     };
     let previous_cache = state.load_cache()?;
     run_check(
@@ -298,6 +304,13 @@ fn run_check(
 }
 
 fn resolve_update(args: &UpdateArgs, home: &Path) -> anyhow::Result<ResolvedUpdate> {
+    let local_store = args
+        .store
+        .as_ref()
+        .map(LocalReleaseStore::open)
+        .transpose()
+        .context("update.local-store-invalid: failed to open local release store")?;
+    let offline = args.offline || local_store.is_some();
     let request = UpdatePlanRequest {
         core_only: args.core_only,
         adapters_only: args.adapters_only,
@@ -307,15 +320,23 @@ fn resolve_update(args: &UpdateArgs, home: &Path) -> anyhow::Result<ResolvedUpda
         } else {
             UpdateChannel::Stable
         },
-        offline: args.offline,
+        offline,
+        local_store: local_store.is_some(),
     };
     let (inventory, ownership) = inspect_inventory(home, args.yes)
         .context("update.unmanaged-installation: failed to inspect installed ownership")?;
-    let client = UpdateNetworkClient::new(args.offline)?;
+    let client = match local_store.clone() {
+        Some(store) => UpdateNetworkClient::with_local_store(store)?,
+        None => UpdateNetworkClient::new(offline)?,
+    };
     let include_core = args.core_only || (!args.adapters_only && args.adapters.is_empty());
 
     let (core, core_etag) = if include_core {
-        let sources = CoreCatalogSources::configured(args.offline).map_err(catalog_error)?;
+        let sources = match &local_store {
+            Some(store) => store.core_catalog_sources(),
+            None => CoreCatalogSources::configured(offline),
+        }
+        .map_err(catalog_error)?;
         match fetch_signed_core_update_catalog(&client, &sources, None).map_err(catalog_error)? {
             CoreCatalogFetch::Modified { verified, etag } => (verified, etag),
             CoreCatalogFetch::NotModified { .. } => {
@@ -327,7 +348,11 @@ fn resolve_update(args: &UpdateArgs, home: &Path) -> anyhow::Result<ResolvedUpda
     };
 
     let adapter_catalog = if adapter_catalog_required(args, &inventory) {
-        let sources = AdapterCatalogSources::configured(args.offline).map_err(catalog_error)?;
+        let sources = match &local_store {
+            Some(store) => store.adapter_catalog_sources(),
+            None => AdapterCatalogSources::configured(offline),
+        }
+        .map_err(catalog_error)?;
         match fetch_signed_adapter_update_catalog(&client, &sources, None).map_err(catalog_error)? {
             AdapterCatalogFetch::Modified { verified, .. } => verified,
             AdapterCatalogFetch::NotModified { .. } => {
@@ -356,6 +381,7 @@ fn resolve_update(args: &UpdateArgs, home: &Path) -> anyhow::Result<ResolvedUpda
         core_catalog: core,
         adapter_catalog,
         ownership,
+        local_store,
     })
 }
 

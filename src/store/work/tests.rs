@@ -436,6 +436,27 @@ mod tests {
         Ok(())
     }
 
+    fn enable_experience_donation(home: &Path) -> anyhow::Result<()> {
+        crate::telemetry::save_telemetry_consent(
+            &home.join(".ldgr"),
+            &crate::telemetry::TelemetryConsent::current(
+                crate::telemetry::TelemetryConsentDecision::Disabled,
+            )
+            .with_donation(crate::telemetry::TelemetryConsentDecision::Enabled),
+        )?;
+        Ok(())
+    }
+
+    fn pending_experience_donations(home: &Path) -> anyhow::Result<Vec<serde_json::Value>> {
+        let route = home.join(".ldgr/experience-donation-pending/experiences/v1");
+        if !route.exists() {
+            return Ok(Vec::new());
+        }
+        fs::read_dir(route)?
+            .map(|entry| Ok(serde_json::from_slice(&fs::read(entry?.path())?)?))
+            .collect()
+    }
+
     fn core_telemetry_sequences(
         home: &Path,
     ) -> anyhow::Result<Vec<Vec<crate::telemetry::transition::StateCode>>> {
@@ -589,6 +610,58 @@ mod tests {
         assert_eq!(
             sequences,
             vec![vec![0, 1, 2, 1, 3], vec![0, 1, 6], vec![0, 1, 7]]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn opted_in_experience_donation_automatically_queues_rich_completed_run(
+    ) -> anyhow::Result<()> {
+        let _lock = crate::telemetry::telemetry_environment_lock()
+            .lock()
+            .expect("telemetry environment lock poisoned");
+        let home = TempDir::new()?;
+        let _env = TelemetryEnvGuard::install(home.path());
+        enable_experience_donation(home.path())?;
+
+        let (_temp, connection) = temp_store()?;
+        create_work_item(
+            &connection,
+            None,
+            "donated-work",
+            "Exact donated title",
+            "Exact donated description",
+        )?;
+        let run = start_run(&connection, "donated-work", Some("exact donated command"))?;
+        add_observation(&connection, run.id, "exact donated observation")?;
+        close_run(
+            &connection,
+            run.id,
+            RunStatus::Success,
+            Some("exact donated notes"),
+            DecisionOutcome::Stop,
+            "exact donated rationale",
+            None,
+        )?;
+
+        assert!(core_telemetry_sequences(home.path())?.is_empty());
+        let donations = pending_experience_donations(home.path())?;
+        assert_eq!(donations.len(), 1);
+        let donation = &donations[0];
+        assert_eq!(donation["schema"], "experience-donation/v1");
+        assert_eq!(donation["consent"]["decision"], "enabled");
+        assert_eq!(donation["episode"]["schema"], "ldgr-work-episode/v1");
+        assert_eq!(
+            donation["episode"]["material"]["work_item"]["title"],
+            "Exact donated title"
+        );
+        assert_eq!(
+            donation["episode"]["material"]["observations"][0]["body"],
+            "exact donated observation"
+        );
+        assert_eq!(
+            donation["episode"]["material"]["decisions"][0]["rationale"],
+            "exact donated rationale"
         );
         Ok(())
     }

@@ -28,6 +28,7 @@ fn command(project: &TempDir) -> anyhow::Result<Command> {
         .env("LOCALAPPDATA", project.path().join(".ldgr/test-state"))
         .env("XDG_STATE_HOME", project.path().join(".ldgr/test-state"))
         .env("HOME", project.path().join(".ldgr/test-empty-home"))
+        .env("LDGR_NO_AUTOMATIC_TELEMETRY", "1")
         .arg("--db")
         .arg(project.path().join(".ldgr/ldgr.db"))
         .arg("--artifact-root")

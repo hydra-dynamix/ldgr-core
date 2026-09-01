@@ -18,10 +18,22 @@ use crate::update::network::{CatalogFetch, UpdateNetworkClient};
 
 pub const LEGACY_ADAPTER_RELEASE_INDEX_SCHEMA_VERSION: u32 = 1;
 pub const ADAPTER_RELEASE_INDEX_SCHEMA_VERSION: u32 = 2;
+pub const LEGACY_ADAPTER_INSTALLATION_RECEIPT_SCHEMA_VERSION: u32 =
+    LEGACY_ADAPTER_RELEASE_INDEX_SCHEMA_VERSION;
+pub const ADAPTER_INSTALLATION_RECEIPT_SCHEMA_VERSION: u32 = ADAPTER_RELEASE_INDEX_SCHEMA_VERSION;
+pub const SOURCE_ADAPTER_INSTALLATION_RECEIPT_SCHEMA_VERSION: u32 = 1;
 pub const ADAPTER_RELEASE_INDEX_ENV: &str = "LDGR_ADAPTER_INDEX";
 pub const ADAPTER_RELEASE_KEYRING_ENV: &str = "LDGR_ADAPTER_RELEASE_KEYRING";
 pub const DEFAULT_ADAPTER_RELEASE_INDEX_URL: &str =
     "https://raw.githubusercontent.com/hydra-dynamix/ldgr-releases/main/index.json";
+
+pub fn adapter_installation_receipt_schema_version(release: &AdapterRelease) -> u32 {
+    if release.compatibility.is_some() {
+        ADAPTER_INSTALLATION_RECEIPT_SCHEMA_VERSION
+    } else {
+        LEGACY_ADAPTER_INSTALLATION_RECEIPT_SCHEMA_VERSION
+    }
+}
 
 pub fn load_configured_release_index() -> anyhow::Result<AdapterReleaseIndex> {
     let source = std::env::var(ADAPTER_RELEASE_INDEX_ENV)
@@ -496,6 +508,142 @@ pub struct SourceInstallationReceipt {
     pub owned_resources: Vec<OwnedResource>,
     pub ownership: SourceOwnershipBoundaries,
     pub verified_release: bool,
+}
+
+#[derive(Debug)]
+pub enum AdapterInstallationReceipt {
+    Release(InstallationReceipt),
+    Source(SourceInstallationReceipt),
+}
+
+pub fn parse_adapter_installation_receipt(
+    value: serde_json::Value,
+) -> anyhow::Result<AdapterInstallationReceipt> {
+    if value
+        .get("install_kind")
+        .and_then(serde_json::Value::as_str)
+        == Some("local_source")
+    {
+        let receipt: SourceInstallationReceipt =
+            serde_json::from_value(value).context("source installation receipt is invalid")?;
+        validate_source_installation_receipt(&receipt)?;
+        Ok(AdapterInstallationReceipt::Source(receipt))
+    } else {
+        let receipt: InstallationReceipt =
+            serde_json::from_value(value).context("release installation receipt is invalid")?;
+        validate_release_installation_receipt(&receipt)?;
+        Ok(AdapterInstallationReceipt::Release(receipt))
+    }
+}
+
+pub fn validate_release_installation_receipt(receipt: &InstallationReceipt) -> anyhow::Result<()> {
+    validate_identifier(&receipt.domain, "installation receipt domain")?;
+    Version::parse(&receipt.version).context("release receipt version is invalid")?;
+    match receipt.schema_version {
+        LEGACY_ADAPTER_INSTALLATION_RECEIPT_SCHEMA_VERSION => {
+            if receipt.compatibility.is_some() || receipt.compatibility_sha256.is_some() {
+                bail!("legacy release receipt contains schema-v2 compatibility fields");
+            }
+            require_text(
+                &receipt.core_compatibility,
+                "legacy release receipt core_compatibility",
+            )?;
+            VersionReq::parse(&receipt.core_compatibility)
+                .context("legacy release receipt Core compatibility is invalid")?;
+        }
+        ADAPTER_INSTALLATION_RECEIPT_SCHEMA_VERSION => {
+            if !receipt.core_compatibility.is_empty() {
+                bail!("schema-v2 release receipt contains a legacy Core compatibility range");
+            }
+            let compatibility = receipt
+                .compatibility
+                .as_ref()
+                .context("schema-v2 release receipt requires compatibility metadata")?;
+            compatibility
+                .validate()
+                .map_err(anyhow::Error::new)
+                .context("schema-v2 release receipt compatibility is invalid")?;
+            let expected = compatibility
+                .compatibility_sha256()
+                .map_err(anyhow::Error::new)?;
+            let actual = receipt
+                .compatibility_sha256
+                .as_deref()
+                .context("schema-v2 release receipt requires compatibility_sha256")?;
+            if actual != expected {
+                bail!(
+                    "schema-v2 release receipt compatibility_sha256 mismatch: expected {expected}, got {actual}"
+                );
+            }
+        }
+        schema_version => bail!(
+            "unsupported release installation receipt schema {schema_version}; expected {LEGACY_ADAPTER_INSTALLATION_RECEIPT_SCHEMA_VERSION} or {ADAPTER_INSTALLATION_RECEIPT_SCHEMA_VERSION}"
+        ),
+    }
+    Ok(())
+}
+
+pub fn validate_source_installation_receipt(
+    receipt: &SourceInstallationReceipt,
+) -> anyhow::Result<()> {
+    if receipt.schema_version != SOURCE_ADAPTER_INSTALLATION_RECEIPT_SCHEMA_VERSION {
+        bail!(
+            "unsupported source installation receipt schema {}; expected {}",
+            receipt.schema_version,
+            SOURCE_ADAPTER_INSTALLATION_RECEIPT_SCHEMA_VERSION
+        );
+    }
+    if receipt.install_kind != "local_source" {
+        bail!("source installation receipt kind must be `local_source`");
+    }
+    if receipt.verified_release {
+        bail!("local source receipt must not claim verified release provenance");
+    }
+    if receipt.ownership.source_checkout_owned {
+        bail!("local source receipt must not claim ownership of the source checkout");
+    }
+    if receipt.ownership.generated_paths != ["source-target"] {
+        bail!("source receipt generated paths must be exactly `source-target`");
+    }
+    let namespace = receipt
+        .source
+        .package
+        .strip_prefix("ldgr-")
+        .unwrap_or(&receipt.source.package)
+        .strip_suffix("-adapter")
+        .unwrap_or_else(|| {
+            receipt
+                .source
+                .package
+                .strip_prefix("ldgr-")
+                .unwrap_or(&receipt.source.package)
+        });
+    if namespace != receipt.domain {
+        bail!(
+            "source receipt package `{}` does not own adapter `{}`",
+            receipt.source.package,
+            receipt.domain
+        );
+    }
+    let installed_manifest = receipt
+        .installed_files
+        .iter()
+        .find(|file| file.path == "adapter.toml")
+        .context("source receipt must track installed adapter.toml")?;
+    if installed_manifest.sha256 != receipt.manifest_digests.installed_adapter_manifest_sha256 {
+        bail!("source receipt installed adapter manifest digests disagree");
+    }
+    if let Some(expected) = &receipt.manifest_digests.installed_resource_manifest_sha256 {
+        let installed_resource_manifest = receipt
+            .installed_files
+            .iter()
+            .find(|file| file.path == "adapter-resources.json")
+            .context("source receipt resource digest has no installed resource manifest file")?;
+        if &installed_resource_manifest.sha256 != expected {
+            bail!("source receipt installed resource manifest digests disagree");
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1052,13 +1200,16 @@ mod tests {
     };
 
     use super::{
-        extract_safe_tar_gz, load_release_index, parse_release_index, parse_resource_manifest,
-        resolve_release, resolve_release_with_profile,
-        validate_release_index_against_core_profiles, verify_detached_release_signature,
+        extract_safe_tar_gz, load_release_index, parse_adapter_installation_receipt,
+        parse_release_index, parse_resource_manifest, resolve_release,
+        resolve_release_with_profile, validate_release_index_against_core_profiles,
+        validate_release_installation_receipt, verify_detached_release_signature,
         verify_file_sha256, verify_resolved_v2_sidecar, AdapterClassification,
-        AdapterPlatformRelease, AdapterRelease, AdapterReleaseIndex, AdapterReleaseProduct,
-        DetachedSignature, ReleaseChannel, ReleaseKeyring, ReleasePublicKey,
-        ReleasedCoreCompatibilityV2,
+        AdapterInstallationReceipt, AdapterPlatformRelease, AdapterRelease, AdapterReleaseIndex,
+        AdapterReleaseProduct, DetachedSignature, InstallationReceipt, ReleaseChannel,
+        ReleaseKeyring, ReleasePublicKey, ReleasedCoreCompatibilityV2,
+        ADAPTER_INSTALLATION_RECEIPT_SCHEMA_VERSION, ADAPTER_RELEASE_INDEX_SCHEMA_VERSION,
+        LEGACY_ADAPTER_INSTALLATION_RECEIPT_SCHEMA_VERSION,
     };
 
     const OPEN_AND_COMMERCIAL: &str =
@@ -1113,7 +1264,7 @@ mod tests {
 
     fn v2_index(releases: Vec<AdapterRelease>) -> AdapterReleaseIndex {
         AdapterReleaseIndex {
-            schema_version: 2,
+            schema_version: ADAPTER_RELEASE_INDEX_SCHEMA_VERSION,
             adapters: vec![AdapterReleaseProduct {
                 domain: "example".to_owned(),
                 primary_namespace: "example".to_owned(),
@@ -1126,6 +1277,34 @@ mod tests {
         }
     }
 
+    fn release_installation_receipt(schema_version: u32) -> InstallationReceipt {
+        let compatibility = v2_requirements(1, 5, &["work.v1"], Vec::new());
+        let compatibility_sha256 = compatibility.compatibility_sha256().unwrap();
+        let legacy = schema_version == LEGACY_ADAPTER_INSTALLATION_RECEIPT_SCHEMA_VERSION;
+        InstallationReceipt {
+            schema_version,
+            domain: "example".to_owned(),
+            version: "1.2.3".to_owned(),
+            source_url: "https://example.invalid/example.tar.gz".to_owned(),
+            sha256: "0".repeat(64),
+            signing_key_id: "fixture-key".to_owned(),
+            core_compatibility: if legacy {
+                ">=0.1.0, <0.2.0".to_owned()
+            } else {
+                String::new()
+            },
+            compatibility: (!legacy).then_some(compatibility),
+            compatibility_sha256: (!legacy).then_some(compatibility_sha256),
+            platform: "linux-x86_64".to_owned(),
+            resource_manifest: "adapter-resources.json".to_owned(),
+            installed_at_unix_seconds: 1,
+            bundle_sha256: "1".repeat(64),
+            binary_path: None,
+            binary_sha256: None,
+            owned_resources: Vec::new(),
+        }
+    }
+
     fn core_profile(schema: i32) -> CoreCompatibilityProfileV2 {
         CoreCompatibilityProfileV2 {
             format: CORE_COMPATIBILITY_FORMAT_V2.to_owned(),
@@ -1134,6 +1313,40 @@ mod tests {
             core_capabilities: vec!["prompt.v1".to_owned(), "work.v1".to_owned()],
             central_components: Vec::<CentralComponentDescriptorV2>::new(),
         }
+    }
+
+    #[test]
+    fn installation_receipt_schema_contract_is_shared_and_fail_closed() -> anyhow::Result<()> {
+        let legacy =
+            release_installation_receipt(LEGACY_ADAPTER_INSTALLATION_RECEIPT_SCHEMA_VERSION);
+        validate_release_installation_receipt(&legacy)?;
+        let canonical = release_installation_receipt(ADAPTER_INSTALLATION_RECEIPT_SCHEMA_VERSION);
+        validate_release_installation_receipt(&canonical)?;
+        assert!(matches!(
+            parse_adapter_installation_receipt(serde_json::to_value(&canonical)?)?,
+            AdapterInstallationReceipt::Release(_)
+        ));
+
+        let mut mixed = canonical.clone();
+        mixed.core_compatibility = ">=0.1.0".to_owned();
+        assert!(validate_release_installation_receipt(&mixed)
+            .unwrap_err()
+            .to_string()
+            .contains("legacy Core compatibility"));
+
+        let mut stale_fingerprint = canonical.clone();
+        stale_fingerprint.compatibility_sha256 = Some(format!("sha256:{}", "0".repeat(64)));
+        assert!(validate_release_installation_receipt(&stale_fingerprint)
+            .unwrap_err()
+            .to_string()
+            .contains("compatibility_sha256 mismatch"));
+
+        let unknown = release_installation_receipt(ADAPTER_INSTALLATION_RECEIPT_SCHEMA_VERSION + 1);
+        assert!(validate_release_installation_receipt(&unknown)
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported release installation receipt schema"));
+        Ok(())
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use clap::{Args, Subcommand};
 
-const ADAPTER_HELP: &str = "Examples:\n  ldgr adapter install\n  ldgr adapter install list\n  ldgr adapter install conduct\n  ldgr adapter list\n  ldgr adapter show conduct\n  ldgr conduct --help\n  ldgr adapter dispatch conduct-batch-status\n\nAdapters are installed under ~/.ldgr/adapters/<adapter>/adapter.toml. Core dynamically dispatches installed adapter namespaces declared by adapter.toml.";
+const ADAPTER_HELP: &str = "Examples:\n  ldgr adapter install\n  ldgr adapter install list\n  ldgr adapter install conduct\n  ldgr adapter install research --store ./store --yes\n  ldgr adapter update research --store ./store\n  ldgr adapter list\n  ldgr adapter show conduct\n  ldgr conduct --help\n  ldgr adapter dispatch conduct-batch-status\n\nAdapters are installed under ~/.ldgr/adapters/<adapter>/adapter.toml. --store uses authenticated local catalogs and artifacts without network access. Core dynamically dispatches installed adapter namespaces declared by adapter.toml.";
 
 #[derive(Debug, Args)]
 #[command(after_help = ADAPTER_HELP)]
@@ -53,6 +53,10 @@ pub struct AdapterUpdateArgs {
     /// Allow prerelease versions during signed-release resolution.
     #[arg(long)]
     pub prerelease: bool,
+
+    /// Read the signed adapter release from this local release store.
+    #[arg(long, value_name = "DIRECTORY")]
+    pub store: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -79,6 +83,10 @@ pub struct AdapterInstallArgs {
     /// Require index, archive, signature, and keyring to be local files; never use network.
     #[arg(long)]
     pub offline: bool,
+
+    /// Read the signed adapter release from this local release store.
+    #[arg(long, value_name = "DIRECTORY", conflicts_with = "source_root")]
+    pub store: Option<std::path::PathBuf>,
 
     /// Accept defaults and do not prompt.
     #[arg(long)]

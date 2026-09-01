@@ -6,6 +6,8 @@ use std::time::Duration;
 
 use anyhow::{ensure, Context};
 use reqwest::blocking::{Client, Response};
+
+use super::local_store::LocalReleaseStore;
 use reqwest::header::{ETAG, IF_NONE_MATCH};
 use reqwest::redirect::Policy;
 use reqwest::{StatusCode, Url};
@@ -42,6 +44,7 @@ impl Default for UpdateClientConfig {
 pub struct UpdateNetworkClient {
     client: Client,
     config: UpdateClientConfig,
+    local_store: Option<LocalReleaseStore>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -61,6 +64,12 @@ impl UpdateNetworkClient {
             offline,
             ..UpdateClientConfig::default()
         })
+    }
+
+    pub fn with_local_store(store: LocalReleaseStore) -> anyhow::Result<Self> {
+        let mut client = Self::new(true)?;
+        client.local_store = Some(store);
+        Ok(client)
     }
 
     pub fn with_config(config: UpdateClientConfig) -> anyhow::Result<Self> {
@@ -98,7 +107,11 @@ impl UpdateNetworkClient {
             .user_agent(update_user_agent())
             .build()
             .context("failed to build bounded update network client")?;
-        Ok(Self { client, config })
+        Ok(Self {
+            client,
+            config,
+            local_store: None,
+        })
     }
 
     pub fn fetch_catalog(
@@ -194,7 +207,11 @@ impl UpdateNetworkClient {
                 destination.display()
             )
         })?;
-        let copied = match self.classify_source(source)? {
+        let resolved_source = match &self.local_store {
+            Some(store) => UpdateSource::Local(store.resolve_artifact_source(source)?),
+            None => self.classify_source(source)?,
+        };
+        let copied = match resolved_source {
             UpdateSource::Local(path) => {
                 let metadata = regular_file_metadata(&path, "update artifact")?;
                 ensure!(

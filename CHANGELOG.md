@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.18] - 2026-09-01
+
+### Added
+
+- Add signed local release-store support for offline Core and adapter update and installation workflows.
+- Add consent-gated experience donation telemetry with bounded automation and local fixture support.
+- Register every published adapter telemetry protocol for preview, explicit transmission, and automatic queue delivery.
+
+### Fixed
+
+- Initialize a bounded default Pi harness configuration when installing an adapter into a clean home.
+- Preserve valid existing harness configuration and clean ephemeral staging after successful rollback.
+
 ## [0.1.17] - 2026-08-27
 
 ### Fixed
