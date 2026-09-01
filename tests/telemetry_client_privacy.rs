@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context};
 use assert_cmd::Command;
+use ldgr_core::telemetry::adapter_protocols::EVIDENCE_WORKFLOW_V1;
 use ldgr_core::telemetry::buffer::LocalSequenceBuffer;
 use ldgr_core::telemetry::transition::{
     NumericalProtocol, COMPLETED_NEGATIVE, COMPLETED_POSITIVE, CORE_WORK_V1, RESEARCH_WORKFLOW_V1,
@@ -78,10 +79,19 @@ fn cli_transmit_captures_actual_tls_wire_headers_without_identifying_metadata() 
     enable(&ldgr_home)?;
     queue_protocol(&ldgr_home, &CORE_WORK_V1, COMPLETED_NEGATIVE)?;
     queue_protocol(&ldgr_home, &RESEARCH_WORKFLOW_V1, COMPLETED_NEGATIVE)?;
+    let mut evidence = LocalSequenceBuffer::begin_after_commit(&ldgr_home, &EVIDENCE_WORKFLOW_V1)?
+        .expect("enabled telemetry creates an adapter buffer");
+    evidence.submit_committed(RUNNING)?;
+    evidence.submit_committed(9)?;
+    evidence.submit_committed(COMPLETED_NEGATIVE)?;
 
     let ca_path = project.path().join("telemetry-capture-ca.pem");
     fs::write(&ca_path, CAPTURE_CA_PEM)?;
-    let server = CaptureServer::start(vec![ResponsePlan::status(204), ResponsePlan::status(204)])?;
+    let server = CaptureServer::start(vec![
+        ResponsePlan::status(204),
+        ResponsePlan::status(204),
+        ResponsePlan::status(204),
+    ])?;
 
     let mut command = telemetry_command(project.path())?;
     command
@@ -114,12 +124,18 @@ fn cli_transmit_captures_actual_tls_wire_headers_without_identifying_metadata() 
     );
     assert!(
         stdout.contains(
-            "telemetry transmission: attempted=2 accepted=2 retained=0 invalid_dropped=0"
+            "protocol /sequences/evidence-workflow/v1: attempted=1 accepted=1 retained=0 invalid_dropped=0 disabled=false"
+        ),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "telemetry transmission: attempted=3 accepted=3 retained=0 invalid_dropped=0"
         ),
         "{stdout}"
     );
 
-    assert_eq!(requests.len(), 2);
+    assert_eq!(requests.len(), 3);
     assert_eq!(
         requests
             .iter()
@@ -128,15 +144,22 @@ fn cli_transmit_captures_actual_tls_wire_headers_without_identifying_metadata() 
         vec![
             "POST /sequences/core-work/v1 HTTP/1.1",
             "POST /sequences/research-workflow/v1 HTTP/1.1",
+            "POST /sequences/evidence-workflow/v1 HTTP/1.1",
         ]
     );
+    assert_eq!(requests[0].body, b"[0,1,4]");
+    assert_eq!(requests[1].body, b"[0,1,4]");
+    assert_eq!(requests[2].body, b"[0,1,9,4]");
     for request in requests {
-        assert_eq!(request.body, b"[0,1,4]");
         assert_privacy_preserving_wire_headers(&request);
     }
     assert_eq!(pending_file_count_for(&ldgr_home, "core-work/v1")?, 0);
     assert_eq!(
         pending_file_count_for(&ldgr_home, "research-workflow/v1")?,
+        0
+    );
+    assert_eq!(
+        pending_file_count_for(&ldgr_home, "evidence-workflow/v1")?,
         0
     );
     Ok(())

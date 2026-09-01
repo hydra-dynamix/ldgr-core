@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 
 pub mod adapter_conformance;
+pub mod adapter_protocols;
 pub mod automation;
 pub mod buffer;
 pub mod command_experience;
@@ -23,12 +24,28 @@ pub const NUMERICAL_SEQUENCE_PROTOCOLS_V1: &[&str] = &[
     "core-work/v1",
     "research-workflow/v1",
     "command-experience/v1",
+    "conduct-orchestration/v1",
+    "example-adapter-lifecycle/v1",
+    "programbench-reproduction/v1",
+    "code-workflow/v1",
+    "security-workflow/v1",
+    "explore-workflow/v1",
+    "bench-workflow/v1",
+    "evidence-workflow/v1",
 ];
 pub const DEFAULT_TELEMETRY_COLLECTOR_ORIGIN: &str = "https://ldgr.run";
 pub const RELEASED_NUMERICAL_PROTOCOLS_V1: &[&transition::NumericalProtocol] = &[
     &transition::CORE_WORK_V1,
     &transition::RESEARCH_WORKFLOW_V1,
     &command_experience::COMMAND_EXPERIENCE_V1,
+    &adapter_protocols::CONDUCT_ORCHESTRATION_V1,
+    &adapter_protocols::EXAMPLE_ADAPTER_LIFECYCLE_V1,
+    &adapter_protocols::PROGRAMBENCH_REPRODUCTION_V1,
+    &adapter_protocols::CODE_WORKFLOW_V1,
+    &adapter_protocols::SECURITY_WORKFLOW_V1,
+    &adapter_protocols::EXPLORE_WORKFLOW_V1,
+    &adapter_protocols::BENCH_WORKFLOW_V1,
+    &adapter_protocols::EVIDENCE_WORKFLOW_V1,
 ];
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -266,6 +283,15 @@ fn sync_parent_directory(_directory: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn released_protocol_names_match_the_transport_registry() {
+        let registered = RELEASED_NUMERICAL_PROTOCOLS_V1
+            .iter()
+            .map(|protocol| protocol.endpoint().trim_start_matches("/sequences/"))
+            .collect::<Vec<_>>();
+        assert_eq!(registered, NUMERICAL_SEQUENCE_PROTOCOLS_V1);
+    }
 
     #[test]
     fn missing_consent_uses_the_anonymous_opt_out_default() -> anyhow::Result<()> {

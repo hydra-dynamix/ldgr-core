@@ -738,7 +738,7 @@ fn telemetry_controls_report_override_and_disable_without_network() -> anyhow::R
         ))
         .stdout(predicate::str::contains("effective collection: enabled"))
         .stdout(predicate::str::contains(
-            "eligible numerical protocols: core-work/v1, research-workflow/v1, command-experience/v1",
+            "eligible numerical protocols: core-work/v1, research-workflow/v1, command-experience/v1, conduct-orchestration/v1, example-adapter-lifecycle/v1, programbench-reproduction/v1, code-workflow/v1, security-workflow/v1, explore-workflow/v1, bench-workflow/v1, evidence-workflow/v1",
         ));
     assert!(!consent_path.exists());
 
@@ -842,13 +842,17 @@ fn telemetry_preview_shows_exact_raw_arrays_and_protocol_without_network_or_clea
     let ldgr_home = home.join(".ldgr");
     let route = ldgr_home.join("telemetry-pending/core-work/v1");
     let research_route = ldgr_home.join("telemetry-pending/research-workflow/v1");
+    let evidence_route = ldgr_home.join("telemetry-pending/evidence-workflow/v1");
     fs::create_dir_all(&route)?;
     fs::create_dir_all(&research_route)?;
+    fs::create_dir_all(&evidence_route)?;
     let valid = route.join("valid");
     let research_valid = research_route.join("valid");
+    let evidence_valid = evidence_route.join("valid");
     let invalid = route.join("invalid");
     fs::write(&valid, "[0,1,3]")?;
     fs::write(&research_valid, "[0,1,4]")?;
+    fs::write(&evidence_valid, "[0,1,9,3]")?;
     fs::write(&invalid, r#"{"project":"secret","sequence":[0,1,3]}"#)?;
 
     let mut preview = isolated_command(project.path())?;
@@ -856,12 +860,15 @@ fn telemetry_preview_shows_exact_raw_arrays_and_protocol_without_network_or_clea
     preview
         .assert()
         .success()
-        .stdout(predicate::str::contains("pending telemetry payloads: 2"))
+        .stdout(predicate::str::contains("pending telemetry payloads: 3"))
         .stdout(predicate::str::contains(
             "destination protocol: /sequences/core-work/v1",
         ))
         .stdout(predicate::str::contains(
             "destination protocol: /sequences/research-workflow/v1",
+        ))
+        .stdout(predicate::str::contains(
+            "destination protocol: /sequences/evidence-workflow/v1",
         ))
         .stdout(predicate::str::contains("raw array: [0,1,3]"))
         .stdout(predicate::str::contains("raw array: [0,1,4]"))
@@ -870,6 +877,7 @@ fn telemetry_preview_shows_exact_raw_arrays_and_protocol_without_network_or_clea
 
     assert!(valid.exists());
     assert!(research_valid.exists());
+    assert!(evidence_valid.exists());
     assert!(invalid.exists());
     Ok(())
 }
@@ -882,12 +890,16 @@ fn telemetry_transmit_is_best_effort_and_retains_core_and_adapter_payloads_when_
     let ldgr_home = home.join(".ldgr");
     let core_route = ldgr_home.join("telemetry-pending/core-work/v1");
     let research_route = ldgr_home.join("telemetry-pending/research-workflow/v1");
+    let evidence_route = ldgr_home.join("telemetry-pending/evidence-workflow/v1");
     fs::create_dir_all(&core_route)?;
     fs::create_dir_all(&research_route)?;
+    fs::create_dir_all(&evidence_route)?;
     let core_payload = core_route.join("core");
     let research_payload = research_route.join("research");
+    let evidence_payload = evidence_route.join("evidence");
     fs::write(&core_payload, "[0,1,4]")?;
     fs::write(&research_payload, "[0,1,4]")?;
+    fs::write(&evidence_payload, "[0,1,9,4]")?;
 
     let mut enable = isolated_command(project.path())?;
     enable.args(["telemetry", "enable"]);
@@ -914,10 +926,14 @@ fn telemetry_transmit_is_best_effort_and_retains_core_and_adapter_payloads_when_
             "protocol /sequences/research-workflow/v1: attempted=1 accepted=0 retained=1 invalid_dropped=0 disabled=false",
         ))
         .stdout(predicate::str::contains(
-            "telemetry transmission: attempted=2 accepted=0 retained=2 invalid_dropped=0",
+            "protocol /sequences/evidence-workflow/v1: attempted=1 accepted=0 retained=1 invalid_dropped=0 disabled=false",
+        ))
+        .stdout(predicate::str::contains(
+            "telemetry transmission: attempted=3 accepted=0 retained=3 invalid_dropped=0",
         ));
     assert!(core_payload.exists());
     assert!(research_payload.exists());
+    assert!(evidence_payload.exists());
 
     let mut killed = isolated_command(project.path())?;
     killed.env("LDGR_TELEMETRY", "off").args([

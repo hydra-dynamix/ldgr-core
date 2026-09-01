@@ -12,10 +12,10 @@ An adapter publishes a fixed `NumericalProtocol` containing only:
 - its sequence-length bound.
 
 The request body never contains the endpoint. It selects the state machine
-locally and Core later sends only the validated bare integer array. Product
-preview and transmission currently process the released `core-work/v1` and
-`research-workflow/v1` protocols; a new adapter protocol must be registered in
-Core and the collector before it is eligible for upload.
+locally and Core later sends only the validated bare integer array. Preview,
+transmission, the site relay, and the collector process the Core protocols and
+all published adapter protocols from one released Core registry. A new adapter
+protocol must be added to that registry and the site validator before release.
 
 Start `CommittedSequence` only after the initial state commits to the adapter's
 local ledger. Call `submit_committed` only after each corresponding state change
