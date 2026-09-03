@@ -507,16 +507,12 @@ pub fn build_update_plan(
         let (target_agentctl, artifact) = resolved_core.as_ref().map_or_else(
             || (inventory.core.current_agentctl.clone(), None),
             |resolved| {
-                let mut release = resolved.release.clone();
-                release
-                    .platforms
-                    .sort_by(|left, right| left.platform.cmp(&right.platform));
                 (
                     resolved.release.agentctl.version.clone(),
                     Some(CoreBundleArtifact {
                         version: resolved.version.to_string(),
                         agentctl_version: resolved.release.agentctl.version.clone(),
-                        release,
+                        release: resolved.release.clone(),
                         platform: resolved.platform.clone(),
                     }),
                 )
@@ -1637,6 +1633,31 @@ mod tests {
         assert_eq!(result.status, UpdateResultStatus::Current);
         assert_eq!(serde_json::to_value(result)?["schema_version"], 1);
         plan.verify_plan_id()?;
+        Ok(())
+    }
+
+    #[test]
+    fn core_update_plan_preserves_authenticated_platform_order() -> anyhow::Result<()> {
+        let mut release = core_release("1.1.0", ReleaseChannel::Stable);
+        let mut alternate_platform = core_platform("1.1.0", true);
+        alternate_platform.platform = "linux-aarch64".to_owned();
+        release.platforms.push(alternate_platform);
+        let authenticated_release = release.clone();
+
+        let plan = plan(
+            UpdatePlanRequest::default(),
+            vec![release],
+            Vec::new(),
+            inventory(Vec::new()),
+        )?;
+        let UpdatePlanComponent::CoreBundle {
+            artifact: Some(artifact),
+            ..
+        } = &plan.components()[0]
+        else {
+            panic!("expected a Core update artifact");
+        };
+        assert_eq!(artifact.release, authenticated_release);
         Ok(())
     }
 
