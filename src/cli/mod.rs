@@ -319,7 +319,10 @@ fn should_run_startup_update_hook(cli: &Cli, args: &[OsString]) -> bool {
     }
     !matches!(
         cli.command,
-        None | Some(Command::Update(_))
+        None | Some(Command::Compatibility { .. })
+            | Some(Command::Install(_))
+            | Some(Command::Telemetry(_))
+            | Some(Command::Update(_))
             | Some(Command::UpdateCheckWorker { .. })
             | Some(Command::TelemetryFlushWorker)
             | Some(Command::RecordCoreInstallation { .. })
@@ -1347,7 +1350,9 @@ pub(crate) fn checked_limit(limit: i64) -> anyhow::Result<i64> {
 mod tests {
     use std::ffi::OsString;
 
-    use super::should_start_automatic_telemetry;
+    use clap::Parser;
+
+    use super::{should_run_startup_update_hook, should_start_automatic_telemetry, Cli};
 
     #[test]
     fn automatic_telemetry_wraps_normal_commands_only() {
@@ -1375,5 +1380,34 @@ mod tests {
             "--token",
             "token"
         ])));
+    }
+
+    #[test]
+    fn startup_update_hook_skips_installation_and_transport_commands() {
+        let parse = |values: &[&str]| {
+            let args = values.iter().map(OsString::from).collect::<Vec<_>>();
+            let cli = Cli::try_parse_from(args.clone()).expect("command must parse");
+            (cli, args)
+        };
+
+        for values in [
+            &["ldgr", "compatibility", "--agentctl-version", "0.1.2"][..],
+            &[
+                "ldgr",
+                "install",
+                "--harness",
+                "pi",
+                "--yes",
+                "--no-agentctl",
+            ][..],
+            &["ldgr", "telemetry", "status"][..],
+            &["ldgr", "update", "--check"][..],
+        ] {
+            let (cli, args) = parse(values);
+            assert!(!should_run_startup_update_hook(&cli, &args), "{values:?}");
+        }
+
+        let (status, args) = parse(&["ldgr", "status"]);
+        assert!(should_run_startup_update_hook(&status, &args));
     }
 }
