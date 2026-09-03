@@ -113,7 +113,7 @@ impl TransmissionClient {
         self.transmit_with(ldgr_home, protocol, &transport)
     }
 
-    /// Best-effort delivery of consented rich experience donations.
+    /// Best-effort delivery of consented sanitized LDGR work donations.
     pub fn transmit_pending_donations(&self, ldgr_home: &Path) -> TransmissionReport {
         let transport = HttpSequenceTransport {
             timeout: self.timeout,
@@ -647,8 +647,8 @@ mod tests {
     }
 
     #[test]
-    fn opted_in_donation_uses_the_rich_endpoint_and_removes_accepted_payload() -> anyhow::Result<()>
-    {
+    fn opted_in_donation_uses_the_separate_endpoint_and_removes_accepted_payload(
+    ) -> anyhow::Result<()> {
         let _guard = telemetry_environment_lock()
             .lock()
             .expect("environment lock poisoned");

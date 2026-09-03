@@ -31,12 +31,12 @@ pub fn validate_experience_donation_payload(payload: &[u8]) -> anyhow::Result<()
             && value["consent"]["policy_version"] == EXPERIENCE_DONATION_POLICY_VERSION,
         "invalid donation consent attestation"
     );
-    let episode_schema = value["episode"]["schema"].as_str().unwrap_or_default();
     anyhow::ensure!(
-        matches!(
-            episode_schema,
-            "ldgr-work-episode/v1" | "pi-harness-work-episode/v3"
-        ),
+        value["source"]["system"] == "ldgr-core",
+        "unsupported donation source"
+    );
+    anyhow::ensure!(
+        value["episode"]["schema"] == "ldgr-work-episode/v1",
         "unsupported donation episode schema"
     );
     let digest = value["episode"]["source_sha256"]
@@ -369,4 +369,45 @@ fn hex_digest(bytes: &[u8]) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn donation(source: &str, episode_schema: &str) -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "schema": "experience-donation/v1",
+            "consent": {
+                "program": "experience-donation",
+                "decision": "enabled",
+                "policy_version": 1
+            },
+            "source": {"system": source, "system_version": "0.1.18"},
+            "episode": {
+                "schema": episode_schema,
+                "source_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }
+        }))
+        .expect("fixture must serialize")
+    }
+
+    #[test]
+    fn donation_boundary_accepts_only_core_ledger_episodes() {
+        assert!(validate_experience_donation_payload(&donation(
+            "ldgr-core",
+            "ldgr-work-episode/v1"
+        ))
+        .is_ok());
+        assert!(validate_experience_donation_payload(&donation(
+            "pi-ldgr-memory",
+            "pi-harness-work-episode/v3"
+        ))
+        .is_err());
+        assert!(validate_experience_donation_payload(&donation(
+            "pi-ldgr-memory",
+            "ldgr-work-episode/v1"
+        ))
+        .is_err());
+    }
 }

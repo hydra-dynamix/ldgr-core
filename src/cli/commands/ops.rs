@@ -138,11 +138,11 @@ pub fn handle_install(args: InstallArgs) -> anyhow::Result<()> {
     print_installer_header();
     let home = home_dir()?;
     let ldgr_home = home.join(".ldgr");
-    let telemetry_consent = resolve_install_telemetry_consent(&args, &ldgr_home)?;
     let harnesses = select_harnesses(&args)?;
     if harnesses.is_empty() {
         return Ok(());
     }
+    let telemetry_consent = resolve_install_telemetry_consent(&args, &ldgr_home)?;
     let interview_depth = select_interview_depth(&args)?;
     println!(
         "√ Harnesses: {}",
@@ -284,7 +284,7 @@ pub fn handle_telemetry(args: TelemetryArgs) -> anyhow::Result<()> {
             match donation.command {
                 TelemetryDonationCommand::Status => {}
                 TelemetryDonationCommand::Enable => {
-                    print_experience_donation_scope();
+                    print_experience_donation_scope(&mut io::stdout().lock())?;
                     consent = consent.with_donation(TelemetryConsentDecision::Enabled);
                     save_telemetry_consent(&ldgr_home, &consent)?;
                 }
@@ -315,10 +315,11 @@ pub fn handle_telemetry(args: TelemetryArgs) -> anyhow::Result<()> {
     }
 }
 
-fn print_experience_donation_scope() {
-    println!("experience donation includes exact work titles, descriptions, commands, notes, observations, artifact paths and descriptions, decisions, linked errors, timestamps, project identity, and provenance");
-    println!("after opt-in, completed runs are captured and sent automatically until `ldgr telemetry donation disable`");
-    println!("experience donation is non-anonymous and can contain private or identifying content; do not record credentials in opted-in runs");
+fn print_experience_donation_scope(output: &mut impl Write) -> anyhow::Result<()> {
+    writeln!(output, "Experience donation sends model-sanitized LDGR work records: task summaries, generic commands, observations, artifact metadata, decisions, errors, timestamps, project identifiers, and provenance.")?;
+    writeln!(output, "LDGR agent instructions prohibit credentials, secrets, PII, raw prompts, raw tool output, environment values, and identifying absolute paths in ledger records. Direct Pi conversations and session events are not donated.")?;
+    writeln!(output, "After opt-in, completed runs are captured and sent automatically until `ldgr telemetry donation disable`.")?;
+    Ok(())
 }
 
 fn print_telemetry_status(ldgr_home: &Path) -> anyhow::Result<()> {
@@ -3365,19 +3366,80 @@ fn resolve_install_telemetry_consent_with_io(
     input: &mut impl BufRead,
     output: &mut impl Write,
 ) -> anyhow::Result<TelemetryConsent> {
-    let existing = load_telemetry_consent(ldgr_home)?;
+    let mut consent = load_telemetry_consent(ldgr_home)?;
     if let Some(choice) = args.telemetry {
-        let decision = match choice {
+        consent.decision = match choice {
             TelemetryInstallChoice::Enable => TelemetryConsentDecision::Enabled,
             TelemetryInstallChoice::Disable => TelemetryConsentDecision::Disabled,
         };
-        let mut consent = existing;
-        consent.decision = decision;
-        save_telemetry_consent(ldgr_home, &consent)?;
+    }
+
+    if args.yes || !stdin_is_interactive {
+        if args.telemetry.is_some() {
+            save_telemetry_consent(ldgr_home, &consent)?;
+        }
         return Ok(consent);
     }
-    let _ = (stdin_is_interactive, input, output);
-    Ok(existing)
+
+    writeln!(output, "◇ Telemetry choices")?;
+    print_telemetry_scope(output)?;
+    consent.decision = if args.telemetry.is_some() {
+        writeln!(
+            output,
+            "Basic anonymous telemetry selected by --telemetry: {}.",
+            consent.decision.as_str()
+        )?;
+        consent.decision
+    } else {
+        prompt_telemetry_decision(
+            input,
+            output,
+            "Enable basic anonymous telemetry?",
+            consent.decision,
+        )?
+    };
+
+    writeln!(output)?;
+    print_experience_donation_scope(output)?;
+    consent.donation_decision = prompt_telemetry_decision(
+        input,
+        output,
+        "Enable detailed experience donation?",
+        consent.donation_decision,
+    )?;
+    save_telemetry_consent(ldgr_home, &consent)?;
+    writeln!(output, "│")?;
+    Ok(consent)
+}
+
+fn prompt_telemetry_decision(
+    input: &mut impl BufRead,
+    output: &mut impl Write,
+    question: &str,
+    default: TelemetryConsentDecision,
+) -> anyhow::Result<TelemetryConsentDecision> {
+    let default_enabled = default == TelemetryConsentDecision::Enabled;
+    let options = if default_enabled { "Y/n" } else { "y/N" };
+    loop {
+        write!(output, "{question} [{options}] ")?;
+        output.flush()?;
+        let mut answer = String::new();
+        if input.read_line(&mut answer)? == 0 {
+            bail!("input closed while waiting for telemetry choice: {question}");
+        }
+        match answer.trim().to_ascii_lowercase().as_str() {
+            "" => {
+                return Ok(if default_enabled {
+                    TelemetryConsentDecision::Enabled
+                } else {
+                    TelemetryConsentDecision::Disabled
+                });
+            }
+            "y" | "yes" => return Ok(TelemetryConsentDecision::Enabled),
+            "n" | "no" => return Ok(TelemetryConsentDecision::Disabled),
+            _ => writeln!(output, "Please answer yes or no.")?,
+        }
+    }
 }
 
 fn print_telemetry_scope(output: &mut impl Write) -> anyhow::Result<()> {
@@ -4609,6 +4671,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn every_core_agent_prompt_enforces_the_ldgr_pii_boundary() {
+        for (name, prompt) in [
+            ("installed skill", LDGR_SKILL),
+            ("loop prompt", LDGR_CORE_LOOP_PROMPT),
+            ("init prompt", INIT_PROJECT_SETUP_PROMPT),
+            ("workflow", CORE_WORKFLOW),
+        ] {
+            let normalized = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(
+                normalized.contains("personally identifiable information (PII)"),
+                "{name}"
+            );
+            assert!(normalized.contains("credentials, secrets"), "{name}");
+            assert!(normalized.contains("raw user prompts"), "{name}");
+            assert!(normalized.contains("internal reasoning"), "{name}");
+            assert!(normalized.contains("tool output"), "{name}");
+            assert!(normalized.contains("project-relative paths"), "{name}");
+            assert!(normalized.contains("sanitized summary"), "{name}");
+        }
+    }
+
+    #[test]
     fn transactional_temp_paths_use_the_canonical_system_directory() -> anyhow::Result<()> {
         let root = fs::canonicalize(std::env::temp_dir())?;
         let path = canonical_temp_path("ldgr-canonical-temp-test")?;
@@ -4633,45 +4717,11 @@ mod tests {
     }
 
     #[test]
-    fn first_interactive_install_uses_anonymous_default_without_prompt() -> anyhow::Result<()> {
+    fn first_interactive_install_discloses_separate_opt_out_and_opt_in_choices(
+    ) -> anyhow::Result<()> {
         let ldgr_home = tempfile::tempdir()?;
         let args = install_args_for_telemetry(false, None);
-        let mut input = std::io::Cursor::new(b"Yes\n");
-        let mut output = Vec::new();
-
-        let consent = resolve_install_telemetry_consent_with_io(
-            &args,
-            ldgr_home.path(),
-            true,
-            &mut input,
-            &mut output,
-        )?;
-
-        assert_eq!(consent.decision, TelemetryConsentDecision::Enabled);
-        let output = String::from_utf8(output)?;
-        assert!(output.is_empty());
-        assert!(!ldgr_home.path().join("telemetry-consent.json").exists());
-
-        let mut later_input = std::io::Cursor::new(b"");
-        let mut later_output = Vec::new();
-        let later = resolve_install_telemetry_consent_with_io(
-            &args,
-            ldgr_home.path(),
-            true,
-            &mut later_input,
-            &mut later_output,
-        )?;
-
-        assert_eq!(later.decision, TelemetryConsentDecision::Enabled);
-        assert!(String::from_utf8(later_output)?.is_empty());
-        Ok(())
-    }
-
-    #[test]
-    fn explicit_install_disable_overrides_anonymous_default() -> anyhow::Result<()> {
-        let ldgr_home = tempfile::tempdir()?;
-        let args = install_args_for_telemetry(false, Some(TelemetryInstallChoice::Disable));
-        let mut input = std::io::Cursor::new(b"\nNo\n");
+        let mut input = std::io::Cursor::new(b"n\ny\n");
         let mut output = Vec::new();
 
         let consent = resolve_install_telemetry_consent_with_io(
@@ -4683,11 +4733,63 @@ mod tests {
         )?;
 
         assert_eq!(consent.decision, TelemetryConsentDecision::Disabled);
+        assert_eq!(consent.donation_decision, TelemetryConsentDecision::Enabled);
+        let output = String::from_utf8(output)?;
+        assert!(output.contains("◇ Telemetry choices"));
+        assert!(output.contains("privacy-minimized anonymous construction telemetry"));
+        assert!(output.contains("Enable basic anonymous telemetry? [Y/n]"));
+        assert!(output.contains("Experience donation sends model-sanitized LDGR work records"));
+        assert!(output.contains("agent instructions prohibit credentials, secrets, PII"));
+        assert!(output.contains("Direct Pi conversations and session events are not donated"));
+        assert!(output.contains("Enable detailed experience donation? [y/N]"));
         assert_eq!(
-            load_telemetry_consent(ldgr_home.path())?.decision,
-            TelemetryConsentDecision::Disabled
+            load_telemetry_consent(ldgr_home.path())?,
+            consent,
+            "both choices must be persisted together"
         );
-        assert!(String::from_utf8(output)?.is_empty());
+
+        let mut later_input = std::io::Cursor::new(b"\n\n");
+        let mut later_output = Vec::new();
+        let later = resolve_install_telemetry_consent_with_io(
+            &args,
+            ldgr_home.path(),
+            true,
+            &mut later_input,
+            &mut later_output,
+        )?;
+
+        assert_eq!(
+            later, consent,
+            "reinstall defaults must preserve both choices"
+        );
+        let later_output = String::from_utf8(later_output)?;
+        assert!(later_output.contains("Enable basic anonymous telemetry? [y/N]"));
+        assert!(later_output.contains("Enable detailed experience donation? [Y/n]"));
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_anonymous_choice_still_offers_interactive_donation_opt_in() -> anyhow::Result<()> {
+        let ldgr_home = tempfile::tempdir()?;
+        let args = install_args_for_telemetry(false, Some(TelemetryInstallChoice::Disable));
+        let mut input = std::io::Cursor::new(b"y\n");
+        let mut output = Vec::new();
+
+        let consent = resolve_install_telemetry_consent_with_io(
+            &args,
+            ldgr_home.path(),
+            true,
+            &mut input,
+            &mut output,
+        )?;
+
+        assert_eq!(consent.decision, TelemetryConsentDecision::Disabled);
+        assert_eq!(consent.donation_decision, TelemetryConsentDecision::Enabled);
+        let output = String::from_utf8(output)?;
+        assert!(output.contains("Basic anonymous telemetry selected by --telemetry: disabled"));
+        assert!(!output.contains("Enable basic anonymous telemetry?"));
+        assert!(output.contains("Enable detailed experience donation? [y/N]"));
+        assert_eq!(load_telemetry_consent(ldgr_home.path())?, consent);
         Ok(())
     }
 
@@ -4707,6 +4809,10 @@ mod tests {
         )?;
         assert_eq!(default.decision, TelemetryConsentDecision::Enabled);
         assert!(!ldgr_home.path().join("telemetry-consent.json").exists());
+        save_telemetry_consent(
+            ldgr_home.path(),
+            &default.with_donation(TelemetryConsentDecision::Enabled),
+        )?;
 
         let explicit_disable =
             install_args_for_telemetry(false, Some(TelemetryInstallChoice::Disable));
@@ -4720,6 +4826,11 @@ mod tests {
             &mut flag_output,
         )?;
         assert_eq!(disabled.decision, TelemetryConsentDecision::Disabled);
+        assert_eq!(
+            disabled.donation_decision,
+            TelemetryConsentDecision::Enabled,
+            "--telemetry must not change the separate donation choice"
+        );
         assert!(String::from_utf8(flag_output)?.is_empty());
 
         let explicit_enable =

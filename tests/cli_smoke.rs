@@ -808,7 +808,10 @@ fn experience_donation_is_separate_and_requires_explicit_opt_in() -> anyhow::Res
             "completed runs are captured and sent automatically",
         ))
         .stdout(predicate::str::contains(
-            "non-anonymous and can contain private or identifying content",
+            "agent instructions prohibit credentials, secrets, PII",
+        ))
+        .stdout(predicate::str::contains(
+            "Direct Pi conversations and session events are not donated",
         ));
     let enabled: serde_json::Value = serde_json::from_str(&fs::read_to_string(&consent_path)?)?;
     assert_eq!(enabled["decision"], "enabled");

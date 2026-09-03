@@ -23,7 +23,7 @@ pub enum TelemetryCommand {
     Enable,
     /// Immediately opt out and delete unsent numerical sequences.
     Disable,
-    /// Control the separate, non-anonymous experience-donation program.
+    /// Control the separate, sanitized LDGR work-episode donation program.
     Donation(TelemetryDonationArgs),
 }
 
@@ -37,9 +37,9 @@ pub struct TelemetryDonationArgs {
 pub enum TelemetryDonationCommand {
     /// Show whether experience donation has been explicitly enabled.
     Status,
-    /// Opt in to automatic rich episode donation and durable delivery.
+    /// Opt in to automatic sanitized LDGR work-episode donation and delivery.
     Enable,
-    /// Disable donation and delete unsent rich episodes. Anonymous telemetry is unchanged.
+    /// Disable donation and delete unsent work episodes. Anonymous telemetry is unchanged.
     Disable,
 }
 

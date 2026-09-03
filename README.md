@@ -93,20 +93,23 @@ retained adapter.
 
 LDGR can share privacy-minimized numerical constructions for research.
 Anonymous construction telemetry is enabled by default and can be opted out at
-any time. Installation never prompts for telemetry. `ldgr telemetry disable`
-records an opt-out. Experience donation is separate, non-anonymous, disabled by
-default, and requires `ldgr telemetry donation enable`. After opt-in, Core
-captures completed rich work episodes automatically. The detached shutdown and
-startup-retry worker drains both queues. Donation disablement removes unsent
-rich episodes without changing anonymous consent.
+any time. Interactive `ldgr install` discloses anonymous telemetry as an
+opt-out. `ldgr telemetry disable` also records an opt-out. Experience donation
+is separate, disabled by default, and requires an explicit interactive choice
+or `ldgr telemetry donation enable`. Agent prompts require credentials, secrets,
+and PII to be removed before LDGR writes. After opt-in, Core sends only
+model-sanitized LDGR work episodes; direct Pi conversations and session events
+are not donated. The detached shutdown and startup-retry worker drains both
+queues. Donation disablement removes unsent work episodes without changing
+anonymous consent.
 
 Core maps raw local command/run data immediately into a finite ontology and
 stores only consolidated numerical construction keys and bucketed counts. A
 `command-experience/v1` construction is suppressed below local support five,
 released once per seven-day window, and subject to a 20-construction window cap.
 Pending anonymous payloads remain bare JSON integer arrays under
-`~/.ldgr/telemetry-pending/<protocol>/`. Opted-in rich episodes use the separate
-`~/.ldgr/experience-donation-pending/experiences/v1/` queue.
+`~/.ldgr/telemetry-pending/<protocol>/`. Opted-in sanitized LDGR work episodes
+use the separate `~/.ldgr/experience-donation-pending/experiences/v1/` queue.
 
 ```sh
 ldgr telemetry status

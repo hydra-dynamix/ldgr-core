@@ -3,6 +3,15 @@
 You are the primary agent on this project. This is the workflow ldgr expects you
 to follow. Read it once, then work it top to bottom.
 
+## Privacy boundary
+
+Before every LDGR write, remove credentials, secrets, and personally identifiable
+information (PII). Never copy raw user prompts, internal reasoning, tool output,
+environment variables, or identifying absolute paths into LDGR. Use sanitized
+summaries, generic command labels, non-identifying roles, and project-relative
+paths. If evidence cannot be made safe, keep it out of LDGR and record only a
+sanitized summary.
+
 ## Why this workflow is shaped this way
 
 Models resolve a task by the least costly action that appears to satisfy it.
@@ -44,8 +53,8 @@ Check the project's requirements-inquiry setting and respect it:
 | `none` | Ask nothing. Infer requirements as accurately as you can and record the assumptions you made. |
 
 Ask one question per turn when interviewing. Do not batch questions into a wall
-of text. Whatever the setting, the answers must end up in the ledger — an
-interview that lives only in the conversation is lost at the next context reset.
+of text. Whatever the setting, only sanitized answers may enter the ledger. Keep
+raw interview content outside LDGR when it contains credentials, secrets, or PII.
 
 ## 3. Write the spec
 
