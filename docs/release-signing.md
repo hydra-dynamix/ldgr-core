@@ -65,9 +65,11 @@ agentctl; the ceremony must not relabel those incomplete bundles as supported.
 Core 0.1.14 is the paired bootstrap archive, but its public binary predates the
 `update` command and official installation receipt command. The 0.1.15
 transition gate therefore verifies signed installer replacement from 0.1.14 on
-all five platforms. Core 0.1.15 becomes the oldest release for ordinary
-previous-version self-update gates. Future release gates must not reuse the
-0.1.14 transition exception for any other version.
+all five platforms. Core 0.1.17 later exposed two release-gate defects: its
+updater reordered authenticated platform metadata before staging, and installer
+compatibility checks could race a background update check. Core 0.1.18 repairs
+both defects. The 0.1.18 gate uses the signed installer once to replace 0.1.17;
+subsequent releases must exercise ordinary self-update from 0.1.18 or newer.
 
 The workflow retrieves assets by pinned GitHub asset ID and checks remote
 release metadata before downloading. `ldgr-release --bootstrap-inventory ...`
