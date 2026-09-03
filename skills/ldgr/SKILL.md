@@ -8,6 +8,19 @@ license: Apache-2.0
 
 Use ldgr to track work provenance.
 
+## Privacy boundary
+
+Sanitize every value before writing it to LDGR. Never put credentials, secrets,
+or personally identifiable information (PII) in any LDGR field. This applies to
+work titles and descriptions, commands, notes, observations, errors,
+validations, decisions, artifact metadata, labels, and follow-up work.
+
+Do not copy raw user prompts, internal reasoning, tool output, environment
+variables, or identifying absolute paths into LDGR. Use non-identifying roles, concise sanitized
+summaries, stable generic command labels, and project-relative paths. If useful
+evidence contains credentials, secrets, or PII, keep that evidence out of LDGR
+and record only a sanitized summary.
+
 If no `.ldgr/ldgr.db` exists:
 
 ```sh

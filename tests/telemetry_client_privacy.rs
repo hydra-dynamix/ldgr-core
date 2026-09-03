@@ -242,7 +242,7 @@ fn automatic_worker_sends_sequence_queued_during_normal_shutdown() -> anyhow::Re
 }
 
 #[test]
-fn opted_in_rich_episode_is_captured_and_sent_automatically_after_shutdown() -> anyhow::Result<()> {
+fn opted_in_sanitized_work_episode_is_sent_automatically_after_shutdown() -> anyhow::Result<()> {
     let project = tempfile::tempdir()?;
     let ldgr_home = cli_ldgr_home(project.path());
     enable_donation(&ldgr_home)?;
@@ -255,9 +255,9 @@ fn opted_in_rich_episode_is_captured_and_sent_automatically_after_shutdown() -> 
             "create",
             "automatic-donation",
             "--title",
-            "Automatic rich donation",
+            "Validate the sanitized donation boundary",
             "--description",
-            "Preserve exact evidence for memory research.",
+            "Preserve model-sanitized evidence for research.",
         ],
     )?;
     let start = run_cli(
@@ -267,7 +267,7 @@ fn opted_in_rich_episode_is_captured_and_sent_automatically_after_shutdown() -> 
             "start",
             "automatic-donation",
             "--command",
-            "capture rich episode",
+            "capture sanitized work episode",
         ],
     )?;
     let run_id = String::from_utf8(start.stdout)?
@@ -282,7 +282,7 @@ fn opted_in_rich_episode_is_captured_and_sent_automatically_after_shutdown() -> 
             "add",
             &run_id,
             "--body",
-            "Exact opted-in evidence",
+            "Sanitized opted-in evidence",
         ],
     )?;
 
@@ -299,7 +299,7 @@ fn opted_in_rich_episode_is_captured_and_sent_automatically_after_shutdown() -> 
         "--outcome",
         "stop",
         "--rationale",
-        "rich fixture complete",
+        "sanitized fixture complete",
     ]);
     let output = close.output()?;
     let requests = server.finish()?;
@@ -316,11 +316,11 @@ fn opted_in_rich_episode_is_captured_and_sent_automatically_after_shutdown() -> 
     assert_eq!(donation["episode"]["schema"], "ldgr-work-episode/v1");
     assert_eq!(
         donation["episode"]["material"]["work_item"]["title"],
-        "Automatic rich donation"
+        "Validate the sanitized donation boundary"
     );
     assert_eq!(
         donation["episode"]["material"]["observations"][0]["body"],
-        "Exact opted-in evidence"
+        "Sanitized opted-in evidence"
     );
     wait_for_empty_donation_queue(&ldgr_home)?;
     Ok(())

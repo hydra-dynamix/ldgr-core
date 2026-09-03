@@ -4,6 +4,8 @@
 
 Initialize LDGR around the smallest useful loop: one work item, one run, observations/artifacts from that run, and one decision about what happens next. Capture only enough context for the next agent or human to continue without guessing.
 
+Before every LDGR write, remove credentials, secrets, and personally identifiable information (PII). Never copy raw user prompts, internal reasoning, tool output, environment variables, or identifying absolute paths into LDGR fields. Use sanitized summaries, generic command labels, non-identifying roles, and project-relative paths. If evidence cannot be made safe, keep it out of LDGR and record only a sanitized summary.
+
 LDGR-owned agent profiles require a paired launcher/Core release. Before
 starting a loop, `agentctl discover --json` should report
 `core_compatibility.compatible` as true. Agentctl 0.1.2 requires LDGR Core
