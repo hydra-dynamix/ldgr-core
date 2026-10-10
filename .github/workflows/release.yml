@@ -420,9 +420,31 @@ jobs:
               Write-Host "--- $($report.FullName)"
               Get-Content -Raw $report.FullName
             }
+            # Print the lock, staging state, and rollback journal with handoff tokens redacted.
+            $records = @(Get-ChildItem -File $updates -Filter update.lock -ErrorAction SilentlyContinue)
+            $records += @(Get-ChildItem -Recurse -File (Join-Path $updates "staging") -Include state.json, journal.json -ErrorAction SilentlyContinue)
+            foreach ($record in $records) {
+              Write-Host "--- $($record.FullName)"
+              (Get-Content -Raw $record.FullName) -replace '("[a-z_]*token"\s*:\s*")[^"]*', '$1<redacted>'
+            }
+            # Replay the detached finalizer in the foreground so its error is visible.
+            foreach ($state in @(Get-ChildItem -Recurse -File (Join-Path $updates "staging") -Filter state.json)) {
+              $stage = $state.Directory.FullName
+              $token = (Get-Content -Raw $state.FullName | ConvertFrom-Json).internal_token
+              Write-Host "::add-mask::$token"
+              $staged = Get-ChildItem -Recurse -File (Join-Path $stage "artifacts") -Filter ldgr.exe | Select-Object -First 1
+              $exited = Start-Process -FilePath cmd.exe -ArgumentList "/c", "exit" -PassThru -Wait -WindowStyle Hidden
+              $env:HOME = Join-Path $env:RUNNER_TEMP "ldgr-release-gate\home"
+              $env:USERPROFILE = $env:HOME
+              $env:LDGR_INTERNAL_UPDATE_CHECK = "1"
+              Write-Host "--- replaying finalizer from $($staged.FullName)"
+              & $staged.FullName __update-finalizer --parent-pid $exited.Id --plan (Join-Path $stage "plan.json") --token $token
+              Write-Host "finalizer replay exit code: $LASTEXITCODE"
+            }
           } else {
             Write-Host "No update state directory at $updates"
           }
+          exit 0
 
   publish:
     name: Publish signed catalog last
