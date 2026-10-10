@@ -205,7 +205,13 @@ pub(crate) fn acquire_delivery_lock(ldgr_home: &Path) -> anyhow::Result<Option<F
     restrict_lock_permissions(&path)?;
     match FileExt::try_lock_exclusive(&file) {
         Ok(()) => Ok(Some(file)),
-        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        // Windows reports contention as ERROR_LOCK_VIOLATION, which is not `WouldBlock`.
+        Err(error)
+            if error.kind() == std::io::ErrorKind::WouldBlock
+                || error.raw_os_error() == fs2::lock_contended_error().raw_os_error() =>
+        {
+            Ok(None)
+        }
         Err(error) => Err(error)
             .with_context(|| format!("failed to lock telemetry worker state {}", path.display())),
     }
