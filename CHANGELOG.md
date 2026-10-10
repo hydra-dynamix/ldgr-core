@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Let the Windows update finalizer accept its own staged binary: it compared a verbatim canonical path against the recorded staging path, exited before applying or rolling back, and left self-update from 0.1.18 permanently pending.
+
 ## [0.1.19] - 2026-10-10
 
 ### Changed
