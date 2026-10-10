@@ -60,6 +60,111 @@ fn record_structured(
 }
 
 #[test]
+fn clap_command_graph_accepts_the_documented_error_shorthand() -> anyhow::Result<()> {
+    for args in [
+        vec![
+            "ldgr",
+            "error",
+            "cargo-test",
+            "validation",
+            "focused",
+            "test",
+            "still",
+            "fails",
+        ],
+        vec![
+            "ldgr",
+            "error",
+            "--db",
+            "custom.db",
+            "cargo-test",
+            "validation",
+            "focused test still fails",
+        ],
+        vec!["ldgr", "error", "focused test still fails"],
+        vec![
+            "ldgr",
+            "error",
+            "fixed after config change",
+            "--resolve",
+            "7",
+        ],
+        vec!["ldgr", "error", "failed again", "--update=7"],
+        vec!["ldgr", "error", "list", "--state", "open"],
+    ] {
+        ldgr_core::cli::command().try_get_matches_from(args)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn raw_text_error_report_update_and_resolution_need_only_message_and_id() -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    command(&project)?.arg("init").assert().success();
+
+    let first = json_output(command(&project)?.args([
+        "error",
+        "the build stopped unexpectedly",
+        "--json",
+    ]))?;
+    let error_id = first["error"]["id"].as_i64().unwrap();
+    assert_eq!(first["error"]["domain"], "agent.report");
+    assert_eq!(first["error"]["code"], "unclassified");
+    assert_eq!(
+        first["occurrence"]["summary"],
+        "the build stopped unexpectedly"
+    );
+    assert_eq!(first["error"]["occurrence_count"], 1);
+
+    let independent = json_output(command(&project)?.args([
+        "error",
+        "the build stopped unexpectedly",
+        "--json",
+    ]))?;
+    assert_ne!(independent["error"]["id"].as_i64().unwrap(), error_id);
+
+    let updated = json_output(
+        command(&project)?
+            .args(["error", "it failed again after restart", "--update"])
+            .arg(error_id.to_string())
+            .arg("--json"),
+    )?;
+    assert_eq!(updated["error"]["id"], error_id);
+    assert_eq!(updated["error"]["occurrence_count"], 2);
+    assert_eq!(
+        updated["occurrence"]["summary"],
+        "it failed again after restart"
+    );
+
+    let resolved = json_output(
+        command(&project)?
+            .args([
+                "error",
+                "the configuration repair was verified",
+                "--resolve",
+            ])
+            .arg(error_id.to_string())
+            .arg("--json"),
+    )?;
+    assert_eq!(resolved["id"], error_id);
+    assert_eq!(resolved["state"], "resolved");
+    assert_eq!(resolved["disposition_pending"], false);
+
+    let shown = json_output(
+        command(&project)?
+            .args(["error", "show"])
+            .arg(error_id.to_string())
+            .arg("--json"),
+    )?;
+    assert_eq!(shown["occurrences"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        shown["dispositions"][0]["rationale"],
+        "the configuration repair was verified"
+    );
+    Ok(())
+}
+
+#[test]
 fn shorthand_error_report_generates_metadata_and_links_the_active_run() -> anyhow::Result<()> {
     let project = TempDir::new()?;
     command(&project)?.arg("init").assert().success();
@@ -132,6 +237,14 @@ fn shorthand_error_report_generates_metadata_and_links_the_active_run() -> anyho
         |row| row.get(0),
     )?;
     assert_eq!(relation_count, 2);
+    drop(connection);
+
+    command(&project)?
+        .args(["error", "cargo-test", "validation", "it failed again"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("recurrence: true"))
+        .stdout(predicates::str::contains("next: ldgr error context "));
     Ok(())
 }
 
@@ -416,6 +529,103 @@ fn structured_fingerprints_group_recurrence_and_support_context_override_and_spl
     )?;
     assert_eq!(split_events, 1);
     assert_eq!(override_events, 1);
+    Ok(())
+}
+
+#[test]
+fn only_explicitly_blocking_error_relations_gate_remediation_work() -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    command(&project)?.arg("init").assert().success();
+    for (slug, title) in [
+        ("repair-error", "Repair error"),
+        ("blocked-work", "Blocked work"),
+    ] {
+        command(&project)?
+            .args(["work", "create", slug, "--title", title])
+            .args(["--description", "Exercise typed error relation readiness."])
+            .assert()
+            .success();
+    }
+
+    let repair_error = record_structured(
+        &project,
+        "relation-repair",
+        "relation-repair",
+        "repair relation",
+        "2026-08-01T00:00:00Z",
+        &[],
+    )?;
+    let blocking_error = record_structured(
+        &project,
+        "relation-block",
+        "relation-block",
+        "blocking relation",
+        "2026-08-01T00:00:01Z",
+        &[],
+    )?;
+    let connection = Connection::open(project.path().join(".ldgr/ldgr.db"))?;
+    let repair_work_id: i64 = connection.query_row(
+        "SELECT id FROM work_item WHERE slug='repair-error'",
+        [],
+        |row| row.get(0),
+    )?;
+    let blocked_work_id: i64 = connection.query_row(
+        "SELECT id FROM work_item WHERE slug='blocked-work'",
+        [],
+        |row| row.get(0),
+    )?;
+    drop(connection);
+    let repair_error_id = repair_error["error"]["id"].as_i64().unwrap().to_string();
+    let blocking_error_id = blocking_error["error"]["id"].as_i64().unwrap().to_string();
+    let repair_work_id_text = repair_work_id.to_string();
+    let blocked_work_id_text = blocked_work_id.to_string();
+
+    command(&project)?
+        .args(["error", "link", &repair_error_id])
+        .args(["--kind", "fixed-by", "--entity-type", "work_item"])
+        .args(["--entity-id", &repair_work_id_text, "--source", "cli-test"])
+        .assert()
+        .success();
+    command(&project)?
+        .args(["error", "link", &blocking_error_id])
+        .args(["--kind", "blocks", "--entity-type", "work_item"])
+        .args(["--entity-id", &blocked_work_id_text, "--source", "cli-test"])
+        .assert()
+        .success();
+
+    let status = json_output(command(&project)?.args(["status", "--full", "--json"]))?;
+    let queue = status["queue"].as_array().unwrap();
+    let repair = queue
+        .iter()
+        .find(|item| item["slug"] == "repair-error")
+        .unwrap();
+    let blocked = queue
+        .iter()
+        .find(|item| item["slug"] == "blocked-work")
+        .unwrap();
+    assert_eq!(repair["ready"], true);
+    assert_eq!(blocked["ready"], false);
+
+    command(&project)?
+        .args(["run", "start", "blocked-work"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("blocked by: error:"));
+    command(&project)?
+        .args(["run", "start", "repair-error"])
+        .assert()
+        .success();
+    let connection = Connection::open(project.path().join(".ldgr/ldgr.db"))?;
+    let run_id: i64 = connection.query_row(
+        "SELECT id FROM run WHERE work_item_id=?1",
+        [repair_work_id],
+        |row| row.get(0),
+    )?;
+    drop(connection);
+    command(&project)?
+        .args(["run", "finish", &run_id.to_string(), "--status", "success"])
+        .assert()
+        .success();
     Ok(())
 }
 

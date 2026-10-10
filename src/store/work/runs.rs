@@ -37,7 +37,7 @@ pub fn claim_next_pending_run(
     in_write_transaction(connection, |connection| {
         let work_item = connection
             .query_row(
-                "UPDATE work_item
+                &format!("UPDATE work_item
                  SET status = 'running', updated_at = datetime('now')
                  WHERE id = (
                      SELECT id
@@ -73,6 +73,7 @@ pub fn claim_next_pending_run(
                                    )
                                )
                            )
+                           AND {BLOCKING_ERROR_RELATION_PREDICATE}
                            AND (
                                (
                                    relation.entity_type='work_item'
@@ -95,7 +96,7 @@ pub fn claim_next_pending_run(
                      LIMIT 1
                  )
                    AND status = 'pending'
-                 RETURNING *",
+                 RETURNING *"),
                 [],
                 WorkItem::from_row,
             )
@@ -115,7 +116,7 @@ fn claim_pending_run_by_slug(
     in_write_transaction(connection, |connection| {
         let work_item = connection
             .query_row(
-                "UPDATE work_item
+                &format!("UPDATE work_item
                  SET status = 'running', updated_at = datetime('now')
                  WHERE slug = ?1
                    AND status = 'pending'
@@ -149,6 +150,7 @@ fn claim_pending_run_by_slug(
                                )
                            )
                        )
+                       AND {BLOCKING_ERROR_RELATION_PREDICATE}
                        AND (
                            (
                                relation.entity_type='work_item'
@@ -157,7 +159,7 @@ fn claim_pending_run_by_slug(
                            OR related_run.work_item_id=work_item.id
                        )
                    )
-                 RETURNING *",
+                 RETURNING *"),
                 params![work_slug],
                 WorkItem::from_row,
             )

@@ -15,10 +15,11 @@ the failure must survive handoff. Inspect recurrence with `ldgr error context
 <error-id>` and record an explicit disposition only before repeating an
 unchanged recorded attempt.
 
-The normal recording surface is `ldgr error <command> <type> <msg>`, where type
-is `task`, `validation`, `infrastructure`, `interruption`, or `cancellation`.
-Core supplies durable metadata and links the active run and work item. Reserve
-the detailed `ldgr error record` form for integrations with caller-owned IDs.
+The normal surface accepts plain text. Use `ldgr error "<explanation>"` to
+record, add `--resolve <error-id>` when the cause is fixed, or add `--update
+<error-id>` for a later occurrence. Core supplies durable metadata and links
+the active run and work item. Reserve `error record` and detailed dispositions
+for integrations or exceptional audited retry decisions.
 
 Require a durable checkpoint:
 

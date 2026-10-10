@@ -171,12 +171,21 @@ derived identity under `structured-v1+split-v1`, leaving the base aggregate
 unchanged. Reusing a digest with different recorded structured inputs fails
 closed and directs the caller to the split control.
 
-For agent and operator use, the preferred surface is `ldgr error <command>
-<type> <msg>`. It accepts a stable command label and one of `task`, `validation`,
-`infrastructure`, `interruption`, or `cancellation`; Core generates the UUIDv7
-identities, structured fingerprint, timestamp, default policy, and active
-run/work relations. The detailed `error record` surface remains available to
-integrations that own explicit occurrence metadata.
+For agent and operator use, the preferred surface is plain text:
+
+```text
+ldgr error "<explanation>"
+ldgr error "<resolution>" --resolve <error-id>
+ldgr error "<later occurrence>" --update <error-id>
+```
+
+Core generates the UUIDv7 identities, classification, fingerprint, timestamp,
+and active run/work relations. Because a raw report has no trustworthy
+structured causal identity, each new report starts a distinct aggregate;
+`--update` explicitly selects an existing aggregate. The previous
+`<command> <type> <message>` shorthand remains compatible. The detailed `error
+record` surface remains available to integrations that own explicit occurrence
+metadata.
 
 ### Causal relations
 
@@ -189,11 +198,14 @@ An occurrence or aggregate can have audited, typed relations to:
 - external supervisor or adapter records.
 
 Relations use `(relation_kind, entity_type, entity_id)` and include their
-creation source and timestamp. Core-owned entity references MUST be validated
-before insertion. External textual references MUST include a namespace.
-Deleting a related entity MUST NOT erase error history; normal Core lifecycle
-already restricts deletion where needed, and otherwise the relation is retained
-as a tombstoned reference.
+creation source and timestamp. Only `affected`, `affects`, `affected-work`,
+`blocks`, `interrupted`, and `observed-during` gate related work. Evidence,
+remediation (`fixed-by` or `recovery-work`), decision, and other audit relations
+MUST NOT become readiness blockers. Core-owned entity references MUST be
+validated before insertion. External textual references MUST include a
+namespace. Deleting a related entity MUST NOT erase error history; normal Core
+lifecycle already restricts deletion where needed, and otherwise the relation
+is retained as a tombstoned reference.
 
 ## Lifecycle and decisions
 
@@ -231,14 +243,15 @@ Every occurrence requires a rationale-backed disposition:
 - `cancel`
 - `resolve`
 
-Record the disposition explicitly:
+Ordinary resolution uses the plain-text path:
 
 ```text
-ldgr error disposition <error-id> --action defer \
-  --actor operator --source cli --rationale "Waiting for the dependency"
+ldgr error "the corrected operation now passes" --resolve <error-id>
 ```
 
-`--decision-id` links the disposition to an existing causal decision. The
+Exceptional retry, defer, acceptance, or escalation decisions use the detailed
+`error disposition` command. `--decision-id` links the disposition to an
+existing causal decision. The
 append-only disposition event also records the selected action, responsible
 occurrence, actor/source, rationale, evidence relation IDs, retry basis, prior
 disposition, and the resulting work transition. `ldgr error show` returns the
