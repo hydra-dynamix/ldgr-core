@@ -403,6 +403,26 @@ jobs:
           if ((& "$env:LDGR_INSTALL_DIR/ldgr.exe" --version).Trim() -ne "ldgr $env:TARGET_VERSION") {
             throw "Current signed installer version check failed."
           }
+      - name: Report Windows update state after a failed gate
+        if: failure() && matrix.platform == 'windows-x86_64'
+        shell: powershell
+        run: |
+          # The finalizer runs detached with no output, so surface its recorded result.
+          $updates = Join-Path $env:RUNNER_TEMP "ldgr-release-gate\home\.ldgr\updates"
+          Get-Process -Name ldgr, agentctl -ErrorAction SilentlyContinue |
+            Select-Object Id, Name, StartTime, Path | Format-List
+          if (Test-Path $updates) {
+            Get-ChildItem -Recurse -File $updates |
+              ForEach-Object { "{0,10} {1}" -f $_.Length, $_.FullName }
+            $reports = @(Get-ChildItem -File (Join-Path $updates "history") -Filter *.json -ErrorAction SilentlyContinue)
+            $reports += @(Get-ChildItem -File $updates -Filter pending-report.json -ErrorAction SilentlyContinue)
+            foreach ($report in $reports) {
+              Write-Host "--- $($report.FullName)"
+              Get-Content -Raw $report.FullName
+            }
+          } else {
+            Write-Host "No update state directory at $updates"
+          }
 
   publish:
     name: Publish signed catalog last
