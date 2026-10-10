@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.19] - 2026-10-10
+
 ### Changed
 
 - Make `ldgr error "<explanation>"` the agent-first path, with optional `--resolve <id>` and `--update <id>` actions that need no classification or metadata flags.
