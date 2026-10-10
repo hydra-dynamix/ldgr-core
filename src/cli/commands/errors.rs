@@ -183,7 +183,7 @@ fn record_simple_error(
         serde_json::json!({})
     };
     let environment = serde_json::json!({});
-    let result = record_error(
+    let mut result = record_error(
         connection,
         &RecordErrorInput {
             occurrence_id: &occurrence_id,
@@ -208,7 +208,7 @@ fn record_simple_error(
             recovery_origin: RecoveryOrigin::Database,
         },
     )?;
-    link_active_error_context(connection, &result, active.as_ref())?;
+    link_active_error_context(connection, &mut result, active.as_ref())?;
 
     emit(args.json, &result, |result| {
         if let Some(active) = &active {
@@ -259,7 +259,7 @@ fn update_simple_error(
     let observed_at = current_error_time(connection)?;
     let details = serde_json::json!({"updated_error_id": error_id});
     let environment = serde_json::json!({});
-    let result = record_error(
+    let mut result = record_error(
         connection,
         &RecordErrorInput {
             occurrence_id: &occurrence_id,
@@ -285,7 +285,7 @@ fn update_simple_error(
         },
     )?;
     let active = oldest_active_run(connection)?;
-    link_active_error_context(connection, &result, active.as_ref())?;
+    link_active_error_context(connection, &mut result, active.as_ref())?;
     emit(args.json, &result, |result| {
         println!(
             "updated error {} occurrence={}",
@@ -297,7 +297,7 @@ fn update_simple_error(
 
 fn link_active_error_context(
     connection: &rusqlite::Connection,
-    result: &RecordErrorResult,
+    result: &mut RecordErrorResult,
     active: Option<&crate::store::ClaimedRun>,
 ) -> anyhow::Result<()> {
     let Some(active) = active else {
@@ -313,6 +313,15 @@ fn link_active_error_context(
             &entity_id.to_string(),
             "ldgr-cli:raw",
         )?;
+    }
+    // The store built the recurrence context before these relations existed.
+    if result.context.is_some() {
+        result.context = Some(error_context_packet(
+            connection,
+            result.error.id,
+            Some(&result.occurrence.occurrence_id),
+            ErrorContextBounds::default(),
+        )?);
     }
     Ok(())
 }

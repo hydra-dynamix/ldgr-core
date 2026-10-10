@@ -39,7 +39,9 @@ pub(crate) const CLI_DEFAULT_HELP_SECTIONS: &str = r#"Core loop:
   artifact add <run-id-or-work-slug> --path <file> --description <why-it-matters>
   artifact show <artifact-id>
   validation record <run-id-or-work-slug> --outcome <pass|fail|error|skipped> --rationale <why-if-skipped>
-  error <command> <task|validation|infrastructure|interruption|cancellation> <message>
+  error "<explanation>"
+  error "<why it is fixed>" --resolve <error-id>
+  error "<later occurrence>" --update <error-id>
   error list
   error context <error-id> [--occurrence-id <id>] [--limit 5]
   decision record <work-slug> --outcome continue --rationale <why> --next-slug <slug> --next-title <title> --next-description <description>

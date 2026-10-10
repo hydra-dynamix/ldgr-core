@@ -249,6 +249,40 @@ fn shorthand_error_report_generates_metadata_and_links_the_active_run() -> anyho
 }
 
 #[test]
+fn raw_text_update_context_includes_the_newly_linked_active_run() -> anyhow::Result<()> {
+    let project = TempDir::new()?;
+    command(&project)?.arg("init").assert().success();
+    let first = json_output(command(&project)?.args(["error", "the build stopped", "--json"]))?;
+    let error_id = first["error"]["id"].as_i64().unwrap();
+
+    command(&project)?
+        .args(["work", "create", "fix-build", "--title", "Fix build"])
+        .args(["--description", "Repair the stopped build"])
+        .assert()
+        .success();
+    command(&project)?
+        .args(["run", "start", "fix-build", "--command", "repair build"])
+        .assert()
+        .success();
+
+    let updated = json_output(
+        command(&project)?
+            .args(["error", "it stopped again", "--update"])
+            .arg(error_id.to_string())
+            .arg("--json"),
+    )?;
+    assert_eq!(
+        updated["context"]["related_runs"].as_array().unwrap().len(),
+        1
+    );
+    assert_eq!(
+        updated["context"]["related_work_items"][0]["slug"],
+        "fix-build"
+    );
+    Ok(())
+}
+
+#[test]
 fn durable_error_cli_covers_classes_replay_lifecycle_and_relations() -> anyhow::Result<()> {
     let project = TempDir::new()?;
     command(&project)?.arg("init").assert().success();
