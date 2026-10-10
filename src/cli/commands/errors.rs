@@ -1,19 +1,21 @@
+use std::ffi::OsString;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context};
+use clap::ValueEnum;
 
 use crate::store::{
-    check_error_retry_authorization, error_context_packet, get_error_occurrence, link_error,
-    list_error_occurrences, list_errors, oldest_active_run, record_error, record_error_disposition,
-    resolve_fingerprint, show_error, transition_error, ErrorContextBounds, ErrorContextPacket,
-    ErrorDisposition, ErrorOccurrence, ErrorRecord, ErrorRetryAuthorization, ErrorState, ErrorView,
-    FingerprintRequest, RecordErrorDispositionInput, RecordErrorInput, RecordErrorResult,
-    RecoveryOrigin,
+    check_error_retry_authorization, error_context_packet, error_fingerprint_inputs, get_error,
+    get_error_occurrence, link_error, list_error_occurrences, list_errors, oldest_active_run,
+    record_error, record_error_disposition, resolve_fingerprint, show_error, transition_error,
+    ErrorContextBounds, ErrorContextPacket, ErrorDisposition, ErrorOccurrence, ErrorRecord,
+    ErrorRetryAuthorization, ErrorState, ErrorView, FingerprintRequest,
+    RecordErrorDispositionInput, RecordErrorInput, RecordErrorResult, RecoveryOrigin,
 };
 
 use super::super::args::{
-    ErrorArgs, ErrorCommand, ErrorDispositionArgs, ErrorLifecycleArgs, ErrorOccurrenceCommand,
-    RecordErrorArgs, SimpleErrorArgs,
+    CliSimpleErrorType, ErrorArgs, ErrorCommand, ErrorDispositionArgs, ErrorLifecycleArgs,
+    ErrorOccurrenceCommand, RecordErrorArgs,
 };
 use super::super::checked_limit;
 use super::super::render::emit;
@@ -90,49 +92,98 @@ pub fn handle_error(connection: &rusqlite::Connection, args: ErrorArgs) -> anyho
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum SimpleErrorAction {
+    Record,
+    Resolve(i64),
+    Update(i64),
+}
+
+struct SimpleErrorArgs {
+    action: SimpleErrorAction,
+    message: String,
+    legacy_identity: Option<(String, CliSimpleErrorType)>,
+    json: bool,
+}
+
 fn handle_simple_report(
     connection: &rusqlite::Connection,
-    args: SimpleErrorArgs,
+    external_args: Vec<OsString>,
 ) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        (1..=128).contains(&args.failed_command.len())
-            && args.failed_command.chars().all(|character| {
-                character.is_ascii_alphanumeric() || "-_.:".contains(character)
-            }),
-        "<command> must be a 1-128 character stable label using only letters, numbers, -, _, ., or :; omit command arguments"
-    );
-    let message = args.message.join(" ");
-    anyhow::ensure!(
-        !message.trim().is_empty() && message.len() <= 4096,
-        "<msg> must contain 1-4096 characters"
-    );
+    let args = parse_simple_report(external_args)?;
+    match args.action {
+        SimpleErrorAction::Record => record_simple_error(connection, &args),
+        SimpleErrorAction::Resolve(error_id) => {
+            let error = transition_error(
+                connection,
+                error_id,
+                ErrorState::Resolved,
+                "agent",
+                "ldgr-cli:raw",
+                &args.message,
+            )?;
+            emit(args.json, &error, |error| {
+                println!("resolved error {}: {}", error.id, args.message)
+            })
+        }
+        SimpleErrorAction::Update(error_id) => update_simple_error(connection, error_id, &args),
+    }
+}
 
+fn record_simple_error(
+    connection: &rusqlite::Connection,
+    args: &SimpleErrorArgs,
+) -> anyhow::Result<()> {
     let active = oldest_active_run(connection)?;
-    let (class, severity, retryability) = args.error_type.policy();
+    let occurrence_id = simple_uuid_v7()?;
+    let operation_id = simple_uuid_v7()?;
+    let attempt_id = simple_uuid_v7()?;
+    let (failed_command, error_type, domain, code, boundary, split_key, split_rationale) =
+        if let Some((failed_command, error_type)) = &args.legacy_identity {
+            (
+                failed_command.as_str(),
+                *error_type,
+                "agent.command",
+                error_type.as_str(),
+                "cli-shorthand",
+                None,
+                None,
+            )
+        } else {
+            (
+                "agent",
+                CliSimpleErrorType::Task,
+                "agent.report",
+                "unclassified",
+                "raw-text",
+                Some(occurrence_id.as_str()),
+                Some("raw reports remain distinct unless --update explicitly selects an aggregate"),
+            )
+        };
+    validate_command_label(failed_command)?;
+    let (class, severity, retryability) = error_type.policy();
     let fingerprint = resolve_fingerprint(FingerprintRequest {
         version: "structured-v1",
         supplied_fingerprint: None,
         override_rationale: None,
-        split_key: None,
-        split_rationale: None,
+        split_key,
+        split_rationale,
         class,
-        domain: "agent.command",
-        code: args.error_type.as_str(),
-        boundary: Some("cli-shorthand"),
-        component: Some(&args.failed_command),
+        domain,
+        code,
+        boundary: Some(boundary),
+        component: Some(failed_command),
         subject: active.as_ref().map(|run| run.work_item.slug.as_str()),
     })?;
-    let occurrence_id = simple_uuid_v7()?;
-    let operation_id = simple_uuid_v7()?;
-    let attempt_id = simple_uuid_v7()?;
-    let idempotency_key = format!("{occurrence_id}:{}", args.failed_command);
-    let observed_at: String =
-        connection.query_row("SELECT strftime('%Y-%m-%dT%H:%M:%SZ', 'now')", [], |row| {
-            row.get(0)
-        })?;
-    let details = serde_json::json!({"command": args.failed_command});
+    let idempotency_key = format!("{occurrence_id}:{failed_command}");
+    let observed_at = current_error_time(connection)?;
+    let details = if args.legacy_identity.is_some() {
+        serde_json::json!({"command": failed_command})
+    } else {
+        serde_json::json!({})
+    };
     let environment = serde_json::json!({});
-    let result = record_error(
+    let mut result = record_error(
         connection,
         &RecordErrorInput {
             occurrence_id: &occurrence_id,
@@ -145,60 +196,244 @@ fn handle_simple_report(
             fingerprint_inputs: Some(&fingerprint.inputs),
             fingerprint_provenance: Some(&fingerprint.provenance),
             class,
-            domain: "agent.command",
-            code: args.error_type.as_str(),
+            domain,
+            code,
             severity,
             retryability,
-            source: "ldgr-cli:shorthand",
-            summary: &message,
+            source: "ldgr-cli:raw",
+            summary: &args.message,
             details: &details,
             environment: &environment,
             observed_at: &observed_at,
             recovery_origin: RecoveryOrigin::Database,
         },
     )?;
+    link_active_error_context(connection, &mut result, active.as_ref())?;
 
-    if let Some(active) = &active {
+    emit(args.json, &result, |result| {
+        if let Some(active) = &active {
+            if args.legacy_identity.is_some() {
+                println!(
+                    "recorded error {} command={} type={} run={} work={}",
+                    result.error.id,
+                    failed_command,
+                    error_type.as_str(),
+                    active.run.id,
+                    active.work_item.slug
+                );
+            } else {
+                println!(
+                    "recorded error {} run={} work={}",
+                    result.error.id, active.run.id, active.work_item.slug
+                );
+            }
+        } else if args.legacy_identity.is_some() {
+            println!(
+                "recorded error {} command={} type={}",
+                result.error.id,
+                failed_command,
+                error_type.as_str()
+            );
+        } else {
+            println!("recorded error {}", result.error.id);
+        }
+        println!("message: {}", args.message);
+        if result.recurrent {
+            println!("recurrence: true");
+            println!("next: ldgr error context {}", result.error.id);
+        }
+    })
+}
+
+fn update_simple_error(
+    connection: &rusqlite::Connection,
+    error_id: i64,
+    args: &SimpleErrorArgs,
+) -> anyhow::Result<()> {
+    let error = get_error(connection, error_id)?;
+    let fingerprint_inputs = error_fingerprint_inputs(connection, error_id)?;
+    let occurrence_id = simple_uuid_v7()?;
+    let operation_id = simple_uuid_v7()?;
+    let attempt_id = simple_uuid_v7()?;
+    let idempotency_key = format!("{occurrence_id}:update:{error_id}");
+    let observed_at = current_error_time(connection)?;
+    let details = serde_json::json!({"updated_error_id": error_id});
+    let environment = serde_json::json!({});
+    let mut result = record_error(
+        connection,
+        &RecordErrorInput {
+            occurrence_id: &occurrence_id,
+            producer: "ldgr-cli",
+            idempotency_key: &idempotency_key,
+            operation_id: &operation_id,
+            attempt_id: &attempt_id,
+            fingerprint_version: &error.fingerprint_version,
+            fingerprint: &error.fingerprint,
+            fingerprint_inputs: fingerprint_inputs.as_ref(),
+            fingerprint_provenance: None,
+            class: error.class,
+            domain: &error.domain,
+            code: &error.code,
+            severity: error.severity,
+            retryability: error.retryability,
+            source: "ldgr-cli:raw-update",
+            summary: &args.message,
+            details: &details,
+            environment: &environment,
+            observed_at: &observed_at,
+            recovery_origin: RecoveryOrigin::Database,
+        },
+    )?;
+    let active = oldest_active_run(connection)?;
+    link_active_error_context(connection, &mut result, active.as_ref())?;
+    emit(args.json, &result, |result| {
+        println!(
+            "updated error {} occurrence={}",
+            result.error.id, result.occurrence.occurrence_id
+        );
+        println!("message: {}", args.message);
+    })
+}
+
+fn link_active_error_context(
+    connection: &rusqlite::Connection,
+    result: &mut RecordErrorResult,
+    active: Option<&crate::store::ClaimedRun>,
+) -> anyhow::Result<()> {
+    let Some(active) = active else {
+        return Ok(());
+    };
+    for (entity_type, entity_id) in [("run", active.run.id), ("work_item", active.work_item.id)] {
         link_error(
             connection,
             result.error.id,
-            Some(&occurrence_id),
+            Some(&result.occurrence.occurrence_id),
             "affected",
-            "run",
-            &active.run.id.to_string(),
-            "ldgr-cli:shorthand",
+            entity_type,
+            &entity_id.to_string(),
+            "ldgr-cli:raw",
         )?;
-        link_error(
-            connection,
-            result.error.id,
-            Some(&occurrence_id),
-            "affected",
-            "work_item",
-            &active.work_item.id.to_string(),
-            "ldgr-cli:shorthand",
-        )?;
-        println!(
-            "recorded error {} command={} type={} run={} work={}",
-            result.error.id,
-            args.failed_command,
-            args.error_type.as_str(),
-            active.run.id,
-            active.work_item.slug
-        );
-    } else {
-        println!(
-            "recorded error {} command={} type={}",
-            result.error.id,
-            args.failed_command,
-            args.error_type.as_str()
-        );
     }
-    println!("message: {message}");
-    if result.recurrent {
-        println!("recurrence: true");
-        println!("next: ldgr error context {}", result.error.id);
+    // The store built the recurrence context before these relations existed.
+    if result.context.is_some() {
+        result.context = Some(error_context_packet(
+            connection,
+            result.error.id,
+            Some(&result.occurrence.occurrence_id),
+            ErrorContextBounds::default(),
+        )?);
     }
     Ok(())
+}
+
+fn current_error_time(connection: &rusqlite::Connection) -> anyhow::Result<String> {
+    connection
+        .query_row("SELECT strftime('%Y-%m-%dT%H:%M:%SZ', 'now')", [], |row| {
+            row.get(0)
+        })
+        .map_err(Into::into)
+}
+
+fn validate_command_label(failed_command: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        (1..=128).contains(&failed_command.len())
+            && failed_command.chars().all(|character| {
+                character.is_ascii_alphanumeric() || "-_.:".contains(character)
+            }),
+        "<command> must be a 1-128 character stable label using only letters, numbers, -, _, ., or :; omit command arguments"
+    );
+    Ok(())
+}
+
+fn parse_simple_report(external_args: Vec<OsString>) -> anyhow::Result<SimpleErrorArgs> {
+    let values = external_args
+        .into_iter()
+        .map(|value| {
+            value
+                .into_string()
+                .map_err(|_| anyhow!("error text must be valid UTF-8"))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let mut positional = Vec::new();
+    let mut action = SimpleErrorAction::Record;
+    let mut action_selected = false;
+    let mut json = false;
+    let mut parse_options = true;
+    let mut index = 0;
+    while index < values.len() {
+        let value = &values[index];
+        if parse_options && value == "--" {
+            parse_options = false;
+            index += 1;
+            continue;
+        }
+        if parse_options && value == "--json" {
+            json = true;
+            index += 1;
+            continue;
+        }
+        let parsed_action = if parse_options && matches!(value.as_str(), "--resolve" | "--update") {
+            let flag = value.as_str();
+            index += 1;
+            let id = values
+                .get(index)
+                .with_context(|| format!("{flag} requires an error ID"))?;
+            Some((flag, id.as_str()))
+        } else if parse_options {
+            value
+                .split_once('=')
+                .filter(|(flag, _)| matches!(*flag, "--resolve" | "--update"))
+        } else {
+            None
+        };
+        if let Some((flag, id)) = parsed_action {
+            anyhow::ensure!(!action_selected, "use only one of --resolve or --update");
+            let id = id
+                .parse::<i64>()
+                .with_context(|| format!("{flag} requires an integer error ID"))?;
+            anyhow::ensure!(id > 0, "{flag} requires a positive error ID");
+            action = if flag == "--resolve" {
+                SimpleErrorAction::Resolve(id)
+            } else {
+                SimpleErrorAction::Update(id)
+            };
+            action_selected = true;
+            index += 1;
+            continue;
+        }
+        if parse_options && value.starts_with("--") {
+            anyhow::bail!("unknown raw error option `{value}`; expected --resolve <id>, --update <id>, --json, or --");
+        }
+        positional.push(value.clone());
+        index += 1;
+    }
+    anyhow::ensure!(
+        !positional.is_empty(),
+        "usage: ldgr error <message> [--resolve <id> | --update <id>]"
+    );
+
+    let legacy_identity = if matches!(action, SimpleErrorAction::Record) && positional.len() >= 3 {
+        CliSimpleErrorType::from_str(&positional[1], true)
+            .ok()
+            .map(|error_type| (positional[0].clone(), error_type))
+    } else {
+        None
+    };
+    let message = if legacy_identity.is_some() {
+        positional[2..].join(" ")
+    } else {
+        positional.join(" ")
+    };
+    anyhow::ensure!(
+        !message.trim().is_empty() && message.len() <= 4096,
+        "error explanation must contain 1-4096 characters"
+    );
+    Ok(SimpleErrorArgs {
+        action,
+        message,
+        legacy_identity,
+        json,
+    })
 }
 
 fn simple_uuid_v7() -> anyhow::Result<String> {

@@ -39,7 +39,9 @@ pub(crate) const CLI_DEFAULT_HELP_SECTIONS: &str = r#"Core loop:
   artifact add <run-id-or-work-slug> --path <file> --description <why-it-matters>
   artifact show <artifact-id>
   validation record <run-id-or-work-slug> --outcome <pass|fail|error|skipped> --rationale <why-if-skipped>
-  error <command> <task|validation|infrastructure|interruption|cancellation> <message>
+  error "<explanation>"
+  error "<why it is fixed>" --resolve <error-id>
+  error "<later occurrence>" --update <error-id>
   error list
   error context <error-id> [--occurrence-id <id>] [--limit 5]
   decision record <work-slug> --outcome continue --rationale <why> --next-slug <slug> --next-title <title> --next-description <description>
@@ -387,46 +389,6 @@ fn normalize_command_aliases(mut args: Vec<OsString>) -> Vec<OsString> {
         return args;
     };
     if command == "error" {
-        let known_subcommands = [
-            "report",
-            "record",
-            "list",
-            "show",
-            "context",
-            "occurrence",
-            "disposition",
-            "retry-check",
-            "acknowledge",
-            "resolve",
-            "accept",
-            "link",
-        ];
-        let error_type = args
-            .get(command_index + 2)
-            .and_then(|argument| argument.to_str());
-        let simple_types = [
-            "task",
-            "validation",
-            "infrastructure",
-            "infra",
-            "interruption",
-            "cancellation",
-            "cancel",
-        ];
-        let is_simple_type = error_type.is_some_and(|error_type| {
-            simple_types
-                .iter()
-                .any(|known| known.eq_ignore_ascii_case(error_type))
-        });
-        let first_argument = args
-            .get(command_index + 1)
-            .and_then(|argument| argument.to_str());
-        if first_argument.is_some_and(|argument| !known_subcommands.contains(&argument))
-            && is_simple_type
-            && args.get(command_index + 3).is_some()
-        {
-            args.insert(command_index + 1, OsString::from("report"));
-        }
         return args;
     }
     if command != "observation" {

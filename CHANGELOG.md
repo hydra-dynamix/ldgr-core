@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- Make `ldgr error "<explanation>"` the agent-first path, with optional `--resolve <id>` and `--update <id>` actions that need no classification or metadata flags.
+- Keep the former `<command> <type> <message>` form compatible and preserve detailed management commands for structured integrations.
+
+### Fixed
+
+- Restrict readiness gates to explicit blocking error relations so evidence and remediation links cannot block the work intended to resolve an error.
+- Treat Windows lock contention on the telemetry delivery lock as "another worker holds it" instead of failing the automatic worker.
+
 ## [0.1.18] - 2026-09-01
 
 ### Added

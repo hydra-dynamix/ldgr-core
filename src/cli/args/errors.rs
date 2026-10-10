@@ -1,3 +1,5 @@
+use std::ffi::OsString;
+
 use clap::{Args, Subcommand, ValueEnum};
 
 use crate::store::{
@@ -6,22 +8,20 @@ use crate::store::{
 };
 
 const ERROR_HELP: &str = "Examples:
-  ldgr error cargo-test validation \"focused test still fails\"
-  ldgr error deploy infrastructure \"remote host is unavailable\"
+  ldgr error \"focused test still fails\"
+  ldgr error \"the configuration change fixed the failure\" --resolve 7
+  ldgr error \"the failure happened again after restart\" --update 7
   ldgr error record --occurrence-id 0198... --producer agentctl --idempotency-key 0198...:pre-spawn --operation-id 0198... --attempt-id 0198... --class infrastructure-error --domain agentctl.bootstrap --code home-unavailable --boundary config-discovery --component agentctl --subject ldgr-config --severity error --retryability after-change --source agentctl:pre-spawn --summary \"Home unavailable\" --observed-at 2026-07-31T00:00:00Z
   ldgr error list --state open --json
   ldgr error show 7
-  ldgr error context 7 --limit 5 --json
-  ldgr error occurrence list --error-id 7
-  ldgr error disposition 7 --action retry --actor operator --source cli --rationale \"Retry after config change\"
-  ldgr error acknowledge 7 --actor operator --source cli --rationale \"Investigating\"
-  ldgr error resolve 7 --actor operator --source cli --rationale \"Verified fixed\"
-  ldgr error link 7 --kind affected --entity-type run --entity-id 495 --source cli
 
-Occurrences are immutable. Reusing an occurrence ID or producer idempotency key is safe only when the complete canonical payload is identical.";
+The raw-text form generates all metadata. Use --resolve or --update with an error ID; integrations that already own structured metadata may use the management commands.";
 
 #[derive(Debug, Args)]
 #[command(after_help = ERROR_HELP)]
+#[command(
+    override_usage = "ldgr error [OPTIONS] <message>... [--resolve <id> | --update <id>]\n       ldgr error [OPTIONS] <management-command>"
+)]
 pub struct ErrorArgs {
     #[command(subcommand)]
     pub command: ErrorCommand,
@@ -29,9 +29,9 @@ pub struct ErrorArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum ErrorCommand {
-    /// Internal target for `ldgr error <command> <type> <message>`.
-    #[command(hide = true)]
-    Report(SimpleErrorArgs),
+    /// Record, update, or resolve an error from a plain-text explanation.
+    #[command(external_subcommand)]
+    Report(Vec<OsString>),
     /// Record one immutable occurrence and create or update its aggregate.
     Record(Box<RecordErrorArgs>),
     /// List error aggregates.
@@ -54,18 +54,6 @@ pub enum ErrorCommand {
     Accept(ErrorLifecycleArgs),
     /// Add an audited relation to a Core or namespace-qualified external entity.
     Link(LinkErrorArgs),
-}
-
-#[derive(Debug, Args)]
-pub struct SimpleErrorArgs {
-    /// Stable command label without arguments, such as `cargo-test` or `deploy`.
-    pub failed_command: String,
-    /// Broad error type used to derive the durable error policy.
-    #[arg(value_enum, ignore_case = true)]
-    pub error_type: CliSimpleErrorType,
-    /// Concise error message. Quotes are optional when it is the final argument.
-    #[arg(num_args = 1.., trailing_var_arg = true)]
-    pub message: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]

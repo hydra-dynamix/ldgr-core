@@ -16,16 +16,23 @@ remains blocked after one reasonable correction, is interrupted after crossing
 an execution boundary, or must remain unresolved at handoff. A failed test can
 still be recorded as a validation result without becoming a first-class error.
 
-Use `ldgr error context <error-id>` and an explicit disposition only before an
-unchanged retry of a recorded substantive error. A successful corrected retry
-needs no separate error narrative when the run and validation already prove the
-outcome.
+For a substantive error, record only the explanation:
 
-For a substantive error, prefer the short form `ldgr error <command> <type>
-<msg>`, for example `ldgr error cargo-test validation "focused test still
-fails"`. Use a stable command label without arguments. Core generates the
-identities, policy fields, timestamp, fingerprint, and active run/work links.
-Use `ldgr error record` only for producers that already own that metadata.
+```text
+ldgr error "focused test still fails"
+```
+
+Core generates all metadata and active run/work links. Do not classify the
+error or supply IDs. When the cause is fixed, resolve it with one extra flag:
+
+```text
+ldgr error "the corrected test now passes" --resolve <error-id>
+```
+
+Use `--update <error-id>` to append a later occurrence. Inspect context or use
+the detailed disposition commands only when an unchanged retry of a repeated
+error genuinely needs that audit trail. `ldgr error record` is for integrations
+that already own structured metadata.
 
 Checkpoint when durable state or task scope changes, or when unresolved work is
 being handed off. Do not run status or create ledger records merely because a

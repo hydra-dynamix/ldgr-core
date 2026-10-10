@@ -39,9 +39,10 @@ integrity-relevant impact. Correct transient command, quoting, path, discovery,
 and expected-test failures inline. A validation result does not also need an
 error record unless the cause remains blocking or may have unsafe partial
 effects. Checkpoint changed durable state and unresolved handoffs; repeated
-substantive errors require surfaced prior context and an explicit disposition
-before an unchanged retry. Record a substantive error with `ldgr error
-<command> <type> <msg>`; Core supplies its identities and active run/work links.
+substantive errors require surfaced prior context before an unchanged retry.
+Record a substantive error with `ldgr error "<explanation>"`; Core supplies all
+metadata and active run/work links. Resolve it with the same text-first form and
+one `--resolve <error-id>` flag.
 
 ### 2. Identify the first loop
 

@@ -13,6 +13,9 @@ const OCCURRENCE_SELECT: &str = "
            environment_json, observed_at, recorded_at, recovery_origin, payload_digest
     FROM error_occurrence";
 
+pub(crate) const BLOCKING_ERROR_RELATION_PREDICATE: &str =
+    "relation.relation_kind IN ('affected', 'affects', 'affected-work', 'blocks', 'interrupted', 'observed-during')";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ErrorClass {
@@ -529,7 +532,7 @@ pub fn record_error(
             previous.class
         );
         if let (Some(existing_inputs), Some(supplied_inputs)) = (
-            existing_fingerprint_inputs(connection, error_id)?,
+            error_fingerprint_inputs(connection, error_id)?,
             input.fingerprint_inputs,
         ) {
             anyhow::ensure!(
@@ -642,7 +645,7 @@ pub fn record_error(
     Ok(result)
 }
 
-fn existing_fingerprint_inputs(
+pub(crate) fn error_fingerprint_inputs(
     connection: &Connection,
     error_id: i64,
 ) -> anyhow::Result<Option<serde_json::Value>> {
@@ -932,6 +935,7 @@ pub fn blocking_errors_for_work_item(
                ON relation.entity_type='run'
               AND CAST(relation.entity_id AS INTEGER)=related_run.id
              WHERE relation.error_id=error_record.id
+               AND {BLOCKING_ERROR_RELATION_PREDICATE}
                AND (
                    (relation.entity_type='work_item'
                     AND CAST(relation.entity_id AS INTEGER)=?1)

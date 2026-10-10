@@ -9,9 +9,8 @@ pub fn next_ready_work_item(
 ) -> anyhow::Result<Option<WorkItem>> {
     let program = program.map(|value| value.trim().to_ascii_lowercase());
     let priority = normalize_priority(priority)?;
-    connection
-        .query_row(
-            "SELECT * FROM work_item
+    let sql = format!(
+        "SELECT * FROM work_item
              WHERE status = 'pending'
                AND (?1 IS NULL OR lower(program) = ?1)
                AND (?2 IS NULL OR priority = ?2)
@@ -38,6 +37,7 @@ pub fn next_ready_work_item(
                            AND blocking_error.severity IN ('error', 'critical')
                        )
                    )
+                   AND {BLOCKING_ERROR_RELATION_PREDICATE}
                    AND (
                        (
                            relation.entity_type = 'work_item'
@@ -57,10 +57,10 @@ pub fn next_ready_work_item(
                     ELSE 2147483647
                END,
                created_at, id
-             LIMIT 1",
-            params![program, priority],
-            WorkItem::from_row,
-        )
+             LIMIT 1"
+    );
+    connection
+        .query_row(&sql, params![program, priority], WorkItem::from_row)
         .optional()
         .context("failed to read next pending work item")
 }

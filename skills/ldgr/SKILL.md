@@ -50,10 +50,11 @@ operation may have partial effects, remains blocked after one reasonable
 correction, or must survive handoff. Repeated substantive errors require prior
 context and an explicit disposition before an unchanged retry.
 
-Record ordinary substantive failures with `ldgr error <command> <type> <msg>`.
-Use a stable command label without arguments; Core supplies identities,
-fingerprints, timestamps, policy fields, and active run/work links. Use the
-detailed `ldgr error record` command only when an integration owns that metadata.
+Record a substantive failure with `ldgr error "<explanation>"`. Core supplies
+all metadata and active run/work links. Resolve it with `ldgr error "<why it is
+fixed>" --resolve <error-id>`, or append a later occurrence with `--update
+<error-id>`. Use `error record` only when an integration owns structured
+metadata.
 
 ## Do not run these
 
