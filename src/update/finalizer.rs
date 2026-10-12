@@ -282,11 +282,9 @@ fn load_context(
         supplied.file_name().and_then(|name| name.to_str()) == Some("plan.json"),
         "Windows finalizer plan path is not durable plan state"
     );
-    let stage_root = supplied
+    let plan_id = supplied
         .parent()
         .context("Windows finalizer plan has no staging root")?
-        .to_path_buf();
-    let plan_id = stage_root
         .file_name()
         .and_then(|name| name.to_str())
         .context("Windows finalizer staging root has no plan id")?;
@@ -296,6 +294,9 @@ fn load_context(
         paths_equal(&supplied, &expected),
         "Windows finalizer plan path differs from recorded state"
     );
+    // Canonical Windows paths carry a verbatim prefix, but the staging manifest and
+    // rollback journal record the store's own path form, so compare against that.
+    let stage_root = store.stage_dir(plan_id)?;
     let envelope = store.load_staged_update_plan(plan_id)?;
     let state = store.load_staging_state(plan_id)?;
     ensure!(

@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-## [0.1.19] - 2026-10-10
+## [0.1.19] - 2026-10-12
 
 ### Changed
 
@@ -18,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - Restrict readiness gates to explicit blocking error relations so evidence and remediation links cannot block the work intended to resolve an error.
 - Treat Windows lock contention on the telemetry delivery lock as "another worker holds it" instead of failing the automatic worker.
+- Let the Windows update finalizer accept its own staged binary: it compared a verbatim canonical path against the recorded staging path, exited before applying or rolling back, and left self-update from 0.1.18 permanently pending.
 
 ## [0.1.18] - 2026-09-01
 
